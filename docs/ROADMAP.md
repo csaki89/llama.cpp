@@ -9,6 +9,23 @@ Kiindulás: a dual-buffer ma minden CPU-n maradó repackelhető súlyhoz tart eg
 
 A zónahatárok a VRAM- és RAM-keretből, a modell méretéből és a kontextushossztól jönnek; kezdetben kézi paraméter (`--dual-buffer-limit` kiterjesztése), később automatikus.
 
+### Cél és zónák (részletesen)
+Cél: a GPU-ra kerülő rész a kontextus hosszához igazodjon, **újratöltés nélkül**. Ma a KV-cache a betöltéskor a teljes beállított kontextusra foglalódik le, és a kontextusméret változása teljes újratöltést okoz.
+
+| zóna | tartalom | hol van |
+|---|---|---|
+| 1. mindig GPU | ami a legnagyobb KV mellett is elfér | csak VRAM, RAM-másolat nélkül |
+| 2. rugalmas sáv | ami csak rövid kontextusnál fér a GPU-ra | VRAM-ban, amíg van hely; mellette a RAM-ban repackelt tartalék, hogy a CPU azonnal átvehesse. A GPU-formájú példány a modellfájlból töltődik vissza |
+| 3. mindig CPU | a hideg súlyok | csak RAM-ban, repackelve; a prompt-gyorsításhoz opcionálisan eredeti formájú másolat a host-pufferben (ez a mostani dual-buffer) |
+
+Becslés a qwen3-coder:30b-re (32K kontextus): 1. zóna ~5,7 GB, 2. zóna ~3 GB, 3. zóna ~8,3 GB. RAM-igény ~11,3 GB (3. zóna + a 2. zóna repackelt tartaléka), a 3. zóna host-másolatával (dual-buffer) több.
+
+### Dinamikus KV-foglalás: lehetőségek
+- **(a) Átméretezés küszöböknél, másolással.** A KV a használt hossz szerint lépcsőzetesen nő; átméretezéskor új puffer, másolás, régi felszabadítása. Egyszerű, de a másolás és a csúcs-memóriahasználat (régi + új egyszerre) költsége van, és a gráf-újrahasznosítást érinti.
+- **(b) Lapozott, blokkokban foglalt KV** (a vLLM PagedAttention mintájára). Rugalmas, de a figyelemszámító kernelek módosítását igényli minden backenden, ami nagy és invazív változtatás.
+- **(c) Virtuális memória.** A teljes kontextus címtartománya előre le van foglalva, fizikai memória csak a használt részhez van hozzárendelve (CUDA/HIP virtuális memória API), így a KV egybefüggő marad, a kernelek változatlanok. **Ez a jelölt.** Ellenőrizendő: a ROCm támogatása gfx1030-on (RX 6700), és a Vulkan megfelelője (sparse binding), ha a megoldás backend-független marad.
+
+
 ### Szükséges építőkockák
 - **Dinamikus KV-foglalás.** Ma a KV-cache a context létrehozásakor fix méretben foglalódik. A rugalmas sáv akkor ér valamit, ha a KV növekedhet (vagy zsugorodhat) futás közben, és a felszabaduló/lefoglalt VRAM a sávval kiegyenlíthető. Kérdés: szegmentált KV vagy újrafoglalás; a `llama_kv_cache` és a `--fit` kölcsönhatása.
 - **Rétegek áthelyezése futás közben.** Egy réteg súlyai VRAM-ból RAM-ba (a repackelt tartalék már ott van, tehát csak a VRAM-példányt kell felszabadítani) és vissza (feltöltés a host-példányból). Szinkronizáció a futó gráffal, a forgalom és a kiköltöztetés ütemezése (pl. csak kérések között).
@@ -25,3 +42,9 @@ A zónahatárok a VRAM- és RAM-keretből, a modell méretéből és a kontextus
 - **MoE és nézetként használt súlyok.** A dual-buffert MoE-vel (`MUL_MAT_ID`, szeletelt expertek) még nem teszteltük: a nézetként átadott súlyokra nincs iker-csere (DECISIONS.md 7.). A NAS-on a qwen3-coder:30b méri meg a hatást. Ha a nézet a gyakori eset, az ikerkeresést a nézet forrástenzorára kell kiterjeszteni.
 - **Több GPU tesztelése.** A host-puffer az első olyan eszközé, amelynek van (DECISIONS.md 5.). Többeszközös gépen ellenőrizendő: melyik eszköz kapja az offloadot, a tensor split és a host-puffer kapcsolata, a `--split-mode row` hatása.
 - **cgroup/NAS-ellenőrzés.** A cgroup-alapú RAM-keret (DECISIONS.md 13.) valódi konténerkorláttal (`docker --memory`) még nem lett kipróbálva.
+
+## 3. Tételek a NAS-os mérések alapján (Ollama 0.40.2, RX 6700, PCIe)
+- **A prompt-sebesség a PCIe-átvitelhez kötött.** Adagonként a duplikált súlyok teljes mérete átmegy a GPU-ra (qwen3-coder:30b: ~12 GB, ~516 tok/s; gpt-oss:120b: ~43 GB, ~140 tok/s). Mérendő: nagyobb adagméret (`num_batch` / `-ub 2048`) hatása a promptra és a VRAM-ra, mert a nagyobb adag több tokenre osztja el ugyanazt az átvitelt.
+- **Költségalapú op-offload döntés.** Csak akkor küldje át a súlyt, ha a másolás ideje kisebb, mint a CPU-n megspórolt számítás. MoE-nél egy 512 tokenes adagban szakértőnként átlagosan kb. 16 token jut, ami kevés az átvitel megtérüléséhez.
+- **Az op offload VRAM-igénye.** Az átküldött súlyoknak helyet kell foglalni a VRAM-ban (gpt-oss:120b: számítási puffer 607 MiB, repack módban 91 MiB). Lehetőség: a GPU közvetlenül olvassa a rögzített host-memóriát, másolás nélkül.
+- **gpt-oss:120b, azonos rétegelosztással:** dual a promptban +22%, a generálásban -3% (szóráson belül), +43 GB rögzített RAM áron. Nagy modelleknél a `--dual-buffer-limit` javasolt.
