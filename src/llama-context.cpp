@@ -194,6 +194,28 @@ llama_context::llama_context(
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
+    if (const char * env = getenv("LLAMA_FLEX_TEST")) {
+        const std::string spec = env;
+        for (size_t pos = 0; pos < spec.size(); ) {
+            size_t end = spec.find(',', pos);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            const std::string item = spec.substr(pos, end - pos);
+            pos = end + 1;
+            unsigned long long at = 0;
+            char op[8] = {};
+            int layer = -1;
+            if (sscanf(item.c_str(), "%llu:%7[a-z]:%d", &at, op, &layer) == 3 && (strcmp(op, "take") == 0 || strcmp(op, "put") == 0)) {
+                flex_test.push_back({ (uint64_t) at, strcmp(op, "put") == 0, layer, false });
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_FLEX_TEST: ignoring '%s'\n", __func__, item.c_str());
+            }
+        }
+        const char * env_res = getenv("LLAMA_FLEX_TEST_RESERVE");
+        flex_test_reserve = env_res && atoi(env_res) != 0;
+    }
+
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -2100,6 +2122,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    for (auto & s : flex_test) {
+        if (!s.done && flex_test_tokens >= s.at) {
+            s.done = true;
+            synchronize();
+            if (model.flex_move(s.layer, s.to_gpu)) {
+                // the weight placement changed: build the next graph again
+                gf_res_prev_active = nullptr;
+                if (flex_test_reserve) {
+                    sched_need_reserve = true;
+                }
+            }
+        }
+    }
+    flex_test_tokens += n_tokens_all;
 
     sched_reserve();
 

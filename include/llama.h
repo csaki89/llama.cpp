@@ -352,6 +352,9 @@ extern "C" {
         const char * dual_buffer_pattern;
         uint32_t     dual_buffer_limit_mib;
 
+        // flex layers: the last N GPU layers get a per-layer buffer and a repacked CPU twin, so they can move to the CPU at runtime (0 = off)
+        uint32_t     flex_layers;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

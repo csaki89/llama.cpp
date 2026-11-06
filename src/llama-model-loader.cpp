@@ -1132,8 +1132,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int flex = -1) -> ggml_context * {
+        const ctx_key key { buft, is_lazy, flex };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1166,6 +1166,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // set by buft_for_tensor() when the weight also needs an original-format copy (dual-buffer)
     ggml_backend_buffer_type_t dual_buft = nullptr;
+
+    // set by buft_for_tensor() for a GPU weight in the flex layer range: buffer type of its CPU twin
+    ggml_backend_buffer_type_t flex_cpu_buft = nullptr;
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1316,6 +1319,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // flex layers: a GPU weight in the range also gets a CPU twin (repacked if possible), so the layer can move to the CPU at runtime
+        if (flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
+            auto * dev_w = ggml_backend_buft_get_device(buft);
+            if (dev_w && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_ACCEL &&
+                    !ggml_backend_buft_is_host(buft) && strstr(ggml_backend_buft_name(buft), "Split") == nullptr) {
+                // only the CPU device's own buffer types (extra/repack, then CPU), not the GPU host buffer
+                buft_list_t cpu_only;
+                for (const auto & e : *buft_list_cpu) {
+                    if (ggml_backend_dev_type(e.first) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        cpu_only.push_back(e);
+                    }
+                }
+                flex_cpu_buft = select_weight_buft(hparams, t_meta, op, &cpu_only);
+            }
+        }
+
         return buft;
     };
 
@@ -1395,7 +1414,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(buft, flex_cpu_buft ? tn.bid : -1);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1421,6 +1440,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(copy, ggml_get_name(&t_meta));
         size_data += ggml_nbytes(&t_meta);
         dual_pairs.emplace_back(tensor, copy);
+    }
+
+    if (flex_cpu_buft) {
+        struct ggml_tensor * twin = ggml_dup_tensor(ctx_for_buft(flex_cpu_buft), &t_meta);
+        ggml_set_name(twin, ggml_get_name(&t_meta));
+        size_data += ggml_nbytes(&t_meta);
+        const auto it_w = weights_map.find(tn.str());
+        GGML_ASSERT(it_w != weights_map.end());
+        flex_pairs.push_back({ tensor, twin, tn.bid, buft, it_w->second.idx, it_w->second.offs });
     }
 
     return tensor;

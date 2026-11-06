@@ -379,6 +379,17 @@ private:
 
     bool sched_need_reserve = true;
 
+    // debug: LLAMA_FLEX_TEST="<tokens>:<take|put>:<layer>,..." moves a flex layer once that many tokens were decoded
+    struct flex_test_step {
+        uint64_t at;
+        bool     to_gpu;
+        int      layer;
+        bool     done;
+    };
+    std::vector<flex_test_step> flex_test;
+    uint64_t flex_test_tokens  = 0;
+    bool     flex_test_reserve = false; // LLAMA_FLEX_TEST_RESERVE=1: also re-reserve the scheduler after a move
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

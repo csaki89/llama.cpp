@@ -593,6 +593,7 @@ struct common_params {
     bool dual_buffer       = false; // keep repacked CPU weights also in the host buffer (original format) for op offload
     std::string dual_buffer_pattern;      // regex on tensor names to duplicate with --dual-buffer (empty = all)
     int32_t     dual_buffer_limit_mib = 0; // max extra host memory for --dual-buffer in MiB (0 = no limit)
+    int32_t     flex_layers           = 0; // last N GPU layers can move to the CPU at runtime (0 = off)
     bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation

@@ -2400,6 +2400,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DUAL_BUFFER_PATTERN"));
     add_opt(common_arg(
+        {"--flex-layers"}, "N",
+        "the last N GPU layers get a per-layer buffer and a repacked CPU copy, so they can move to the CPU at runtime (default: 0 = off, requires --load-mode none)",
+        [](common_params & params, int value) {
+            params.flex_layers = value;
+        }
+    ).set_env("LLAMA_ARG_FLEX_LAYERS"));
+    add_opt(common_arg(
         {"--dual-buffer-limit"}, "MiB",
         "with --dual-buffer: max extra host memory for the copies, in tensor order (default: 0 = no limit)",
         [](common_params & params, int value) {

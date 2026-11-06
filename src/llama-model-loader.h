@@ -149,12 +149,16 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        int  flex; // flex layer number (own context and buffer), -1 = none
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.flex != rhs.flex) {
+                return lhs.flex < rhs.flex;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
@@ -169,6 +173,19 @@ struct llama_model_loader {
     std::string dual_pattern;     // only duplicate tensors with a matching name (empty = all)
     size_t      dual_max_bytes = SIZE_MAX; // limit for the total size of the copies
     size_t      dual_bytes     = 0;
+
+    // flex layers: GPU weights of layers in [flex_lo, flex_hi] get a per-layer buffer and a CPU twin (repacked reserve)
+    struct flex_pair {
+        ggml_tensor * gpu;  // the model tensor
+        ggml_tensor * cpu;  // twin in the CPU buffer
+        int           layer;
+        ggml_backend_buffer_type_t buft; // GPU buffer type
+        uint16_t      file_idx;
+        size_t        offs;
+    };
+    int flex_lo = -1;
+    int flex_hi = -1;
+    std::vector<flex_pair> flex_pairs;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
