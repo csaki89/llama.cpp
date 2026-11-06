@@ -8,6 +8,15 @@ IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file b
 - A gh alapértelmezett repója a saját fork (csaki89/llama.cpp).
 - A munka a `dual-buffer` branchben folyik, a master tiszta marad.
 
+## Viszony az AGENTS.md-hez
+Ez egy privát fork, nem a ggml-org/llama.cpp-be szánt hozzájárulás. Az AGENTS.md szerint a privát forkok mentesek ("Private forks are exempt"), ezért ebben a repóban:
+- A dual-buffer branchen a commitok előre jóvá vannak hagyva, nem kell egyenként rákérdezni. A commit üzenetet te írod: rövid, és tartalmazza: `Assisted-by: Claude`. Upstream PR esetén az üzeneteket a felhasználó írja újra.
+- A `docs/DESIGN.md`-ben rögzített terv megvalósításához nem kell külön megerősítés, akkor sem, ha a változás nagy vagy új mintát hoz be.
+- Az önálló (felügyelet nélküli) munka ebben a forkban engedélyezett, mert nem az upstreambe történik hozzájárulás.
+- Továbbra is tilos: git push az upstreambe, PR nyitása, issue vagy komment írása a ggml-org/llama.cpp-ben. A saját forkba (origin) pusholni csak kifejezett kérésre lehet.
+
+Az AGENTS.md kódolási előírásai (ASCII-karakterek, rövid kommentek, a meglévő infrastruktúra újrahasznosítása, minimális és nem invazív változtatás, a `skills/code-review/SKILL.md` elolvasása kódírás előtt) érvényesek.
+
 ## Cél
 Dual-buffer a llama.cpp-ben hibrid (CPU+GPU split) futtatáshoz. Ma minden súlytenzornak egy helye és formája van, ezért a CPU-n maradó súlyoknál választani kell:
 - **CPU_REPACK** (AVX2-re átrendezve): gyors CPU-s generálás, de az op offload nem tudja a GPU-ra küldeni, így a prompt lassú.
