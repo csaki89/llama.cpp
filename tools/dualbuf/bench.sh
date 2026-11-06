@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Buffer/speed baseline for the hybrid CPU+GPU modes. Works in Git Bash and on Linux.
-# Usage: tools/dualbuf/bench.sh [-b BIN_DIR] [-m MODEL.gguf] [-o OUT_DIR] [-c MODES.conf] [-n NGEN]
-# Env:   NGL (gpu layers for the partial modes, default 14), THREADS (optional -t), REPS (default 3)
+# Usage: tools/dualbuf/bench.sh [-b BIN_DIR] [-m MODEL.gguf] [-o OUT_DIR] [-c MODES.conf] [-g NGL] [-n NGEN] [-r REPS]
+# Measures every mode in modes.conf (repack, host, host_noopoff, repack_noopoff, cpu_only, gpu_full, dual, dual_noopoff) on one model.
+# Env:   NGL / REPS (defaults for -g / -r), THREADS (optional -t). GPU layers: -g or NGL (default 14), generated tokens: -n (default 200)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BIN="$ROOT/build/bin"; MODEL="$ROOT/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 OUT="$ROOT/bench-out"; CONF="$HERE/modes.conf"; NGEN=200; NGL="${NGL:-14}"; REPS="${REPS:-3}"
-while getopts "b:m:o:c:n:" o; do
-  case $o in b) BIN=$OPTARG;; m) MODEL=$OPTARG;; o) OUT=$OPTARG;; c) CONF=$OPTARG;; n) NGEN=$OPTARG;; *) exit 2;; esac
+while getopts "b:m:o:c:n:g:r:" o; do
+  case $o in b) BIN=$OPTARG;; m) MODEL=$OPTARG;; o) OUT=$OPTARG;; c) CONF=$OPTARG;; n) NGEN=$OPTARG;; g) NGL=$OPTARG;; r) REPS=$OPTARG;; *) exit 2;; esac
 done
 EXE="$BIN/llama-completion"; [ -x "$EXE" ] || EXE="$BIN/llama-completion.exe"
 [ -x "$EXE" ] || { echo "llama-completion not found in $BIN" >&2; exit 1; }

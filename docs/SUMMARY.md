@@ -32,15 +32,58 @@ Részletek: `test-results.md`. Minden elfogadási feltétel teljesült:
 4. A `--dual-buffer --no-host` együtt: a dual-buffer nyer (DECISIONS.md 3.). Kell-e erről külön figyelmeztetés?
 
 ## NAS-on teendő (ROCm build és mérés)
-1. **Letöltés:** `git clone -b dual-buffer https://github.com/csaki89/llama.cpp.git` (vagy meglévő klónban `git fetch origin dual-buffer`). A branchet a felhasználónak kell az `origin`-re pusholnia, mert a push nem engedélyezett nekem.
-2. **Build (ROCm):** a repóban lévő HIP build leírás szerint (`docs/build.md`), pl. `cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1031 -DCMAKE_BUILD_TYPE=Release` (a gfx1031-et a gfx1030 kerülőút miatt `HSA_OVERRIDE_GFX_VERSION=10.3.0`-val futtatjuk). A `-DGGML_AVX2=ON` kell, ha a `GGML_NATIVE` nem detektál.
-3. **Környezet ellenőrzése:** `env | grep ^LLAMA_` legyen üres (különösen `LLAMA_ARG_NO_HOST`, `LLAMA_ARG_DUAL_BUFFER*`); a `bench.sh` törli és jelzi őket.
-4. **Mérés:** a `tools/dualbuf/bench.sh` Linuxon is fut, de a `modes.conf` a laptopra van hangolva (`-ngl @NGL@` = a rétegek fele, a modellből). A NAS-os sorozathoz (30 / 18 / 6 GPU-réteg, qwen3-vl:8b) háromszor kell futtatni `NGL=30`, `NGL=18`, `NGL=6`-tal, a referencia-kapcsolókkal (`--load-mode none --flash-attn auto -b 512 -ub 512 --log-verbosity 4`, `HSA_OVERRIDE_GFX_VERSION=10.3.0`). A `bench.sh` kapcsolói most fixen `-fa auto -b 512 -ub 512 --load-mode none`-t adnak, ezek egyeznek a referenciával; a NAS-os promptok (98 token, 300 generált token) a `bench.sh` promptjaitól (110 / 1611 token, 200 token) eltérnek, ezt a promptfájlokkal és `-n 300`-zal lehet egyeztetni (`-n` kapcsoló van). Hogy a korábbi NAS-os mérések milyen programmal készültek (`llama-server` vagy más), nem tudom; a `bench.sh` a `llama-completion`-t használja, ezért a számok összevetésekor ezt érdemes tisztázni.
-5. **Várt eredmény:** generálás a `repack` szintjén, prompt a host-puffer szintjén (CLAUDE.md: +23% / +59% / +64% a repackhez képest 30 / 18 / 6 rétegnél). Ha a prompt a host szintjén van, de a generálás ott marad a host-pufferes (lassú) szinten, akkor a CPU nem az elsődleges (repack) példányt használja: ezt a naplóban a `CPU_REPACK` jelenléte és a `--dual-buffer --no-op-offload` md5-je (= repack + no-op-offload) mutatja.
-6. **RAM:** a duplikált rész a repackelt CPU-s súlyok mérete; 8B Q4_K_M modellnél 30 / 18 / 6 GPU-rétegnél a CPU-s rész növekszik, ezt a naplóbeli `Vulkan_Host`/`ROCm_Host` sor mutatja.
+Cél: RX 6700 (gfx1031), TrueNAS, Docker. A build a `tools/dualbuf/Dockerfile`-lal és a `build-nas.sh`-val megy; a kártya gfx1031, de a kódot **gfx1030**-ra fordítjuk, és futtatáskor `HSA_OVERRIDE_GFX_VERSION=10.3.0` kell (az image-ben alapból be van állítva).
+
+### 1. Előfeltétel: a branch az origin-en
+A branchet neked kell pusholnod az `origin`-re (nekem csak kifejezett kérésre szabad). Az image a forkból klónozza a `dual-buffer` branchet (`https://github.com/csaki89/llama.cpp.git`). Ha a fork privát: `export GH_TOKEN=...` a build előtt (BuildKit secret, nem kerül az image-be).
+
+### 2. Build
+```
+git clone -b dual-buffer https://github.com/csaki89/llama.cpp.git && cd llama.cpp   # vagy: git pull
+tools/dualbuf/build-nas.sh                 # kimenet: llama-dualbuf:rocm
+```
+- Alap: `rocm/dev-ubuntu-24.04:7.0-complete` (`ROCM_TAG=...` felülírja, ha más 7.x tag kell), `GPU_TARGET=gfx1030`, `BRANCH=dual-buffer`. A tag létezését a pull-nál ellenőrizni kell (nem tudtam letölteni).
+- A CPU-kód Broadwellre (AVX2/FMA/F16C/BMI2, AVX512 nélkül) van fordítva, `GGML_NATIVE=OFF`; az AVX2 kell a Q4_K repackhez.
+- Az image tartalmazza: `llama-completion`, `llama-server`, `llama-cli`, `llama-bench`, és a `bench.sh`-t (`/opt/llama.cpp/tools/dualbuf`, a PATH-on).
+
+### 3. Indítás
+```
+docker run --rm -it --device /dev/kfd --device /dev/dri/renderD129 --group-add video \
+  -v /mnt/nvme/ollama/models:/models:ro -v /mnt/nvme/dualbuf:/work llama-dualbuf:rocm
+```
+Az image-ben: `env | grep ^LLAMA_` legyen üres (a `bench.sh` törli és jelzi őket). Gyors próba: `llama-completion --list-devices` (ROCm0 látszik) és `-m ... -ngl 99 -n 16 -p hi`.
+
+Az Ollama GGUF-ja a `blobs/sha256-...` fájl. Megkeresése a manifestből:
+```
+M=/models/manifests/registry.ollama.ai/library/qwen3-vl/8b      # modell/tag szerint
+BLOB=/models/blobs/$(jq -r '.layers[]|select(.mediaType|endswith("image.model"))|.digest' $M | tr : -)
+```
+Figyelem: az Ollama saját motoros modelljeinél (különösen a `qwen3-vl`) a GGUF tenzornevei eltérhetnek a llama.cpp-étől; ha a betöltés hibázik, a modell szokásos GGUF-ját kell használni `/mnt/nvme/dualbuf`-ból. A `qwen3-vl` multimodális: a mérés csak a szöveges részt használja (`mmproj` nélkül).
+
+### 4. Mérés (egy futás = egy modell, a teljes módlista)
+A `bench.sh` a `modes.conf` módjait méri végig: `repack`, `host`, `host_noopoff`, `repack_noopoff`, `dual`, `dual_noopoff`, `cpu_only`, `gpu_full`. Kapcsolók: `-m MODELL`, `-g NGL`, `-n GENERÁLT_TOKENEK`, `-r ISMÉTLÉS` (alap 3), `-o KIMENETI_MAPPA`. A fix beállítások: `--load-mode none -fa auto -b 512 -ub 512 --log-verbosity 4`. Az eredmény `OUT/results.tsv`, összegzés: `tools/dualbuf/summarize.sh`.
+
+**qwen3-vl:8b** (30 / 18 / 6 GPU-réteg, 300 token):
+```
+for g in 30 18 6; do bench.sh -m $BLOB_QWEN3VL -g $g -n 300 -o /work/qwen3vl-ngl$g; done
+```
+**Qwen2.5-1.5B** (NGL 14; a GGUF-ot másold a `/mnt/nvme/dualbuf`-ba):
+```
+bench.sh -m /work/qwen2.5-1.5b-instruct-q4_k_m.gguf -g 14 -n 200 -o /work/qwen25-ngl14
+```
+**qwen3-coder:30b** (MoE):
+```
+bench.sh -m $BLOB_CODER30B -g <rétegek> -n 300 -o /work/coder30b -r 1
+```
+- A dual-buffer RAM-többlete itt kb. **9 GB** (a repackelt CPU-s rész másolata; a naplóban a `Vulkan_Host`/`ROCm_Host` sor és a `dual-buffer: N weights also stored in ... (X MiB)` mutatja). Ellenőrizd a szabad RAM-ot a futás előtt; szükség esetén `--dual-buffer-limit MiB` / `--dual-buffer-pattern` (a `modes.conf`-ban a `dual` sorokhoz fűzhető).
+- **MoE: nem tesztelt**. Az expert tenzorok (`MUL_MAT_ID`) ikerképzése és offloadja a laptopon nem volt kipróbálható. Az első futásnál nézd meg: (a) a `dual-buffer: ... weights` sor nem nulla; (b) a `dual` kimenet md5-je = `repack`-é (`dual_noopoff` esetén biztosan egyeznie kell a `repack_noopoff`-fal); (c) a prompt-sebesség a `host` szintjén van. Nagy MoE-nél a lassú mérés miatt `-r 1` elég az első körben, a végső számokhoz 3 ismétlés kell.
+- A korábbi NAS-os mérések programja ismeretlen (`llama-server`?), a `bench.sh` a `llama-completion`-t használja; az összevetésnél ezt tisztázni kell. A promptok is eltérnek (a `bench.sh`: 110 / 1611 token; a korábbi: 98 token).
+
+### 5. Várt eredmény
+Generálás a `repack` szintjén, prompt a host-puffer szintjén (CLAUDE.md: +23% / +59% / +64% a repackhez képest 30 / 18 / 6 rétegnél). Ha a prompt a host szintjén van, de a generálás a lassú host-pufferes szinten marad, akkor a CPU nem az elsődleges (repack) példányt használja: ezt a naplóban a `CPU_REPACK` jelenléte és a `dual_noopoff` md5-je mutatja.
 
 ## Folyamat közben észrevettek
-- A settings.json `Bash(cmd //c tools/dualbuf/build-vulkan.bat)` szabálya nem működik, mert a `cmd` perjeles útvonalat nem ért; a használható forma `cmd //c "tools\\dualbuf\\build-vulkan.bat"`. Ezt a szabályt javítani kell.
+- A settings.json `Bash(cmd //c tools/dualbuf/build-vulkan.bat)` szabálya nem működik, mert a `cmd` perjeles útvonalat nem ért; a használható forma `cmd //c "tools\\dualbuf\\build-vulkan.bat"`. Ez javítva (a szabály most ebben az alakban van a settings.json-ban).
 - Az éjszaka során egyetlen parancs sem várt engedélyre. A munkamenet engedélyezési módja megengedőbb lehetett, mint a settings.json; a használt, de az allow listán nem szereplő parancsok: `sed`, `awk`, `grep`, `cat`, `cmp`, `md5sum`, `od`, `wc`, `ls`, `ctest`, `env`, `seq`, `rm -rf bench-out`.
 - Md5-összehasonlításnál a stderr-t fájlba kell irányítani; `/dev/null`-ra (Windows NUL) ANSI színkódok kerülnek a kimenetbe (lásd `test-results.md`).
 - A `ctest` ebből a környezetből `BAD_COMMAND`-ot ad (msys2-s cmake); a `test-arg-parser` közvetlen futtatással átmegy.
