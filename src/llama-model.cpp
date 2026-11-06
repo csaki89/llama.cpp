@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1224,6 +1225,72 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
     return fallback;
 }
 
+// free memory under a cgroup limit (v2 memory.max/current, v1 limit/usage_in_bytes); walks up the hierarchy and takes the tightest limit
+// returns false if there is no limit (or no cgroup, e.g. non-Linux)
+static bool read_cgroup_u64(const std::string & path, uint64_t & val) {
+    std::ifstream f(path);
+    std::string s;
+    if (!f || !(f >> s) || s == "max") {
+        return false;
+    }
+    char * end = nullptr;
+    val = strtoull(s.c_str(), &end, 10);
+    return end != s.c_str();
+}
+
+static bool get_cgroup_free(size_t & free_bytes, size_t & limit_bytes, const std::string & root = "/sys/fs/cgroup", const std::string & self = "/proc/self/cgroup") {
+    std::ifstream f(self);
+    std::string line;
+    bool found = false;
+    while (std::getline(f, line)) {
+        // "0::/path" (v2) or "N:memory:/path" (v1)
+        const size_t p1 = line.find(':');
+        const size_t p2 = p1 == std::string::npos ? p1 : line.find(':', p1 + 1);
+        if (p2 == std::string::npos) {
+            continue;
+        }
+        const std::string ctrl = line.substr(p1 + 1, p2 - p1 - 1);
+        const bool v2 = ctrl.empty();
+        if (!v2 && (',' + ctrl + ',').find(",memory,") == std::string::npos) {
+            continue;
+        }
+        std::string dir = root + (v2 ? "" : "/memory");
+        std::string rel = line.substr(p2 + 1);
+        while (true) {
+            uint64_t lim = 0, use = 0;
+            const bool ok = v2
+                ? read_cgroup_u64(dir + rel + "/memory.max", lim) && read_cgroup_u64(dir + rel + "/memory.current", use)
+                : read_cgroup_u64(dir + rel + "/memory.limit_in_bytes", lim) && read_cgroup_u64(dir + rel + "/memory.usage_in_bytes", use);
+            if (ok && lim < ((uint64_t) 1 << 60)) {
+                // reclaimable page cache does not count as used
+                uint64_t cache = 0;
+                std::ifstream st(dir + rel + "/memory.stat");
+                std::string key;
+                uint64_t v;
+                while (st >> key >> v) {
+                    if (key == (v2 ? "inactive_file" : "total_inactive_file")) {
+                        cache = v;
+                        break;
+                    }
+                }
+                use = use > cache ? use - cache : 0;
+                const size_t fr = lim > use ? (size_t) (lim - use) : 0;
+                if (!found || fr < free_bytes) {
+                    free_bytes  = fr;
+                    limit_bytes = (size_t) lim;
+                }
+                found = true;
+            }
+            const size_t slash = rel.rfind('/');
+            if (rel.empty() || slash == std::string::npos) {
+                break;
+            }
+            rel.erase(slash);
+        }
+    }
+    return found;
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, bool host_after_extra = false) {
     buft_list_t buft_list;
@@ -1751,14 +1818,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ml.dual_max_bytes = (size_t) params.dual_buffer_limit_mib * 1024 * 1024;
                 } else {
                     // no manual limit: keep the copies within the free RAM minus the CPU part of the model and a reserve
-                    size_t ram_free = 0, ram_total = 0;
+                    size_t ram_free = 0, ram_total = 0, cg_free = 0, cg_limit = 0;
+                    const char * ram_src = "system";
                     ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                     if (ram_dev) {
                         ggml_backend_dev_memory(ram_dev, &ram_free, &ram_total);
                     }
+                    // a cgroup memory limit applies instead of the system memory
+                    if (get_cgroup_free(cg_free, cg_limit)) {
+                        ram_free  = cg_free;
+                        ram_total = cg_limit;
+                        ram_src   = "cgroup limit";
+                    }
                     if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
                         ram_free  = (size_t) atoll(env) * 1024 * 1024;
                         ram_total = std::max(ram_total, ram_free);
+                        ram_src   = "env override";
                     }
                     if (ram_total > 0) {
                         const int n_gpu = std::min(this->n_gpu_layers(), hparams.n_layer_all + 1);
@@ -1767,8 +1842,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         const size_t reserve  = std::max((size_t) 1 << 30, ram_total / 20);
                         const size_t need     = cpu_part + reserve;
                         const size_t budget   = ram_free > need ? ram_free - need : 0;
-                        LLAMA_LOG_INFO("%s: dual-buffer: free RAM %.0f MiB, CPU part ~%.0f MiB, reserve %.0f MiB, copy budget %.0f MiB\n", __func__,
-                            ram_free / 1024.0 / 1024.0, cpu_part / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0, budget / 1024.0 / 1024.0);
+                        LLAMA_LOG_INFO("%s: dual-buffer: free RAM %.0f MiB (%s), CPU part ~%.0f MiB, reserve %.0f MiB, copy budget %.0f MiB\n", __func__,
+                            ram_free / 1024.0 / 1024.0, ram_src, cpu_part / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0, budget / 1024.0 / 1024.0);
                         if (budget == 0) {
                             LLAMA_LOG_WARN("%s: dual-buffer: not enough free RAM for the copies, disabling it\n", __func__);
                             ml.dual_host_buft = nullptr;

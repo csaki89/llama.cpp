@@ -76,3 +76,8 @@ Laptop, Qwen2.5-1.5B, `-ngl 14`, a bench.sh teljes sorozata (3 ismétlés).
   - szabad 1500 / 1300 MiB: keret 0, figyelmeztetés "not enough free RAM ... disabling it", normál host-puffer lista (`Vulkan_Host` 533,33, nincs `CPU_REPACK`);
   - szabad 1300 MiB + `--dual-buffer-limit 100`: a kézi limit nyer, 35 súly (99,98 MiB).
 - **Nem tesztelt:** MoE modell és a NAS (ROCm); a qwen3-coder:30b prompt-különbség (438 vs 515 tok/s) javulását ott kell mérni.
+
+## v3: cgroup-korlát
+- Laptop (Windows, nincs cgroup): a naplóban `free RAM 2270 MiB (system)`, 87 súly duplikálva (308,18 MiB), `Vulkan_Host` 533,33 MiB; `--dual-buffer-limit 100` -> 35 súly (99,98 MiB). A viselkedés a v2-vel azonos.
+- A `get_cgroup_free()` önálló programban, hamis cgroup-fán: v2 beágyazott (`a`: max 1000 MiB, használat 400 MiB, inaktív cache 100 MiB; `a/b` korlátlan) -> szabad 700 MiB, korlát 1000 MiB; v1 (500 MiB korlát, 200 MiB használat) -> 300 MiB; gyökér cgroup / nincs memory vezérlő / nem létező fájl -> nincs korlát.
+- Nem tesztelt: valódi cgroup (Docker `--memory`) a NAS-on.
