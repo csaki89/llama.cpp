@@ -3043,12 +3043,10 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
             const size_t len = n_rows*t->nb[1];
             const bool src_host = ggml_backend_buffer_is_host(old.buffer);
             const bool dst_host = ggml_backend_buffer_is_host(t->buffer);
+            // to the GPU: a synchronous set (the backend picks DMA from pinned memory or a direct write on UMA)
+            // from the GPU: asynchronous into pinned memory, a synchronous read can be a slow CPU read of device memory (DECISIONS.md 19)
             if (src_host) {
-                if (backend && !dst_host) {
-                    ggml_backend_tensor_set_async(backend, t, (const char *) old.data + off, off, len);
-                } else {
-                    ggml_backend_tensor_set(t, (const char *) old.data + off, off, len);
-                }
+                ggml_backend_tensor_set(t, (const char *) old.data + off, off, len);
             } else if (dst_host) {
                 if (backend) {
                     ggml_backend_tensor_get_async(backend, &old, (char *) t->data + off, off, len);

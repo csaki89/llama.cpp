@@ -2163,7 +2163,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     }
                 }
             }
-            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file, backend_gpu)) {
+            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file)) {
                 if (sched) {
                     flex_set_alts(s.layer);
                 }

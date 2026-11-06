@@ -2471,7 +2471,7 @@ std::vector<int> llama_model::flex_layers() const {
     return res;
 }
 
-bool llama_model::flex_move(int il, bool to_gpu, bool from_file, ggml_backend_t backend) const {
+bool llama_model::flex_move(int il, bool to_gpu, bool from_file) const {
     auto it = pimpl->flex.find(il);
     if (it == pimpl->flex.end() || it->second.buf_idx == SIZE_MAX) {
         LLAMA_LOG_WARN("%s: layer %d is not a flex layer\n", __func__, il);
@@ -2529,7 +2529,7 @@ bool llama_model::flex_move(int il, bool to_gpu, bool from_file, ggml_backend_t 
         for (auto & p : fl.pairs) {
             const size_t n = ggml_nbytes(p.cpu);
             // p.gpu holds the CPU storage while the layer is off
-            // from host memory: asynchronously on the GPU backend if given (DMA from pinned memory), synchronized below
+            // a synchronous set: the backend picks its path (DMA from pinned memory, or a direct write on UMA), see DECISIONS.md 19
             const void * src = nullptr;
             if (!from_file && p.host) {
                 src = p.host->data;
@@ -2539,11 +2539,7 @@ bool llama_model::flex_move(int il, bool to_gpu, bool from_file, ggml_backend_t 
                 n_cpu++;
             }
             if (src) {
-                if (backend) {
-                    ggml_backend_tensor_set_async(backend, p.cpu, src, 0, n);
-                } else {
-                    ggml_backend_tensor_set(p.cpu, src, 0, n);
-                }
+                ggml_backend_tensor_set(p.cpu, src, 0, n);
             } else {
                 tmp.resize(n);
                 auto & file = pimpl->flex_files.at(p.file_idx);
@@ -2553,9 +2549,6 @@ bool llama_model::flex_move(int il, bool to_gpu, bool from_file, ggml_backend_t 
                 n_file++;
             }
             nbytes += n;
-        }
-        if (backend) {
-            ggml_backend_synchronize(backend);
         }
         for (auto & p : fl.pairs) {
             flex_swap_storage(p.gpu, p.cpu);
