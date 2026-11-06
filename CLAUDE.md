@@ -4,7 +4,6 @@ IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file b
 
 ## Szabályok
 - Soha ne nyiss pull requestet és ne tölts fel semmit a ggml-org/llama.cpp repóba. Az upstream remote csak frissítések lehúzására való (a push URL `DISABLED`).
-- Feltöltés csak a saját forkba (origin), és előtte mindig kérdezz rá.
 - A gh alapértelmezett repója a saját fork (csaki89/llama.cpp).
 - A munka a `dual-buffer` branchben folyik, a master tiszta marad.
 
