@@ -14,4 +14,5 @@
 ## 4. fázis (korlátozás): kész
 - `--dual-buffer-pattern`, `--dual-buffer-limit` (docs/test-results.md, 4. fázis szakasz). Alapviselkedés újraellenőrizve.
 
-## Következő: 5. fázis (docs/SUMMARY.md)
+## 5. fázis (zárás): kész
+- `docs/SUMMARY.md` megírva. Az éjszakai munka vége; a branch nincs pusholva.
