@@ -82,6 +82,21 @@ bench.sh -m $BLOB_CODER30B -g <rétegek> -n 300 -o /work/coder30b -r 1
 ### 5. Várt eredmény
 Generálás a `repack` szintjén, prompt a host-puffer szintjén (CLAUDE.md: +23% / +59% / +64% a repackhez képest 30 / 18 / 6 rétegnél). Ha a prompt a host szintjén van, de a generálás a lassú host-pufferes szinten marad, akkor a CPU nem az elsődleges (repack) példányt használja: ezt a naplóban a `CPU_REPACK` jelenléte és a `dual_noopoff` md5-je mutatja.
 
+### 6. Rugalmas sáv (`--flex-layers`) a NAS-on
+A laptopon (Vulkan, iGPU, közös memória) a másolási idők nem mutatják a PCIe-t, és a HIP-gráfok nem futnak, ezért ezeket a NAS-on kell megmérni. A teszt: `tools/dualbuf/flex-test.sh` (a modell, `-ngl` és a sáv a szkript elején; a hosszú prompthoz előbb a `bench.sh` kell). A mozgatást a `LLAMA_FLEX_TEST="<token>:take|put"` váltja ki, a naplóban a `flex_move: layer ... moved to ...` sorok adják a szétbontott időket.
+
+Mérendő (qwen3-vl:8b vagy qwen2.5-1.5b, majd qwen3-coder:30b; `--flex-layers 2..4`):
+- **Egyezés:** egy végig levett réteg (`0:take`) kimenete bájtra egyezzen a `-ngl (N-1) --dual-buffer` futással (laptopon teljesül); opció nélkül a `bench.sh` md5-jei változatlanok.
+- **Felszabaduló VRAM:** a `common_memory_breakdown_print` ROCm0 sorában a model és a context oszlop rétegenként a réteg súlyaival és K/V-jével csökken; **dedikált GPU-n az eszközmemória-lekérdezés is** (`flex_move ... device free memory`), mert az iGPU-n ez nem mozdult.
+- **Másolási sebesség a PCIe-n:** a K/V GPU -> CPU (`copy+sync`) és CPU -> GPU, a súlyok visszatétele a host-példányból és a fájlból (`LLAMA_FLEX_TEST_FILE=1`), rövid (`-c 4096`) és hosszú (`-c 32768`) kontextussal, kitöltött prompttal. Elvárás: a másolás a PCIe sávszélesség közelében (a Xeon E5 v4 PCIe 3.0 x16, ~12 GB/s), a foglalás külön látszik (`alloc`). A régi út összehasonlításhoz: `LLAMA_FLEX_TEST_COPY_LEGACY=1`.
+- **Prompt-sebesség** 0, 1, 2 levett réteggel, host-példánnyal és nélküle (`LLAMA_FLEX_TEST_HOST=0`); a generálás a levett rétegekkel a `-ngl (N-k) --dual-buffer` szintjén.
+- **Gráfhasítások:** `LLAMA_FLEX_TEST_RESERVE=1` mellett a `sched_reserve: graph (pp ..., tg ...) ... splits = A / B` sorok; a generálási (B) érték levett rétegekkel se nőjön.
+
+Mire kell figyelni:
+- **HIP-gráfok:** a ROCm backend a decode-gráfot HIP-gráfként rögzítheti; a súlyok és a K/V címe a mozgatáskor változik. Ellenőrizni: a kimenet a mozgatás után helyes-e, és egyezik-e a `GGML_CUDA_DISABLE_GRAPHS=1`-es futással; nincs-e hiba vagy összeomlás a felszabadított puffer miatt (a le/vissza ciklus többször: `LLAMA_FLEX_TEST="1700:take,1750:put,1800:take,1850:put"`).
+- **Rögzített memória:** a 2. zóna host-példánya és a levett rétegek K/V-je a `ROCm_Host` pufferbe kerül (rögzített RAM); a `LLAMA_ARG_NO_HOST` ezt nem érinti, de a RAM-védelem naplósorát (`flex: free RAM ...`) nézni kell, főleg cgroup-korláttal.
+- **Aszinkron olvasás:** a K/V GPU -> CPU másolása a backend aszinkron `get`-jét használja; ha a ROCm-on a kimenet a K/V mozgatása után eltér a `LLAMA_FLEX_TEST_COPY_LEGACY=1`-es futástól, az a hiba forrása.
+
 ## Folyamat közben észrevettek
 - A settings.json `Bash(cmd //c tools/dualbuf/build-vulkan.bat)` szabálya nem működik, mert a `cmd` perjeles útvonalat nem ért; a használható forma `cmd //c "tools\\dualbuf\\build-vulkan.bat"`. Ez javítva (a szabály most ebben az alakban van a settings.json-ban).
 - Az éjszaka során egyetlen parancs sem várt engedélyre. A munkamenet engedélyezési módja megengedőbb lehetett, mint a settings.json; a használt, de az allow listán nem szereplő parancsok: `sed`, `awk`, `grep`, `cat`, `cmp`, `md5sum`, `od`, `wc`, `ls`, `ctest`, `env`, `seq`, `rm -rf bench-out`.

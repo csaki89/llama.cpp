@@ -151,3 +151,64 @@ Laptop, ugyanaz a beállítás (`-ngl 14`, `--flex-layers 2`, hosszú prompt 161
 
 ## Baseline a K/V-mozgatás után (opció nélkül)
 `bench.sh -r 1` (8 mód x 2 prompt, 1 ismétlés; az md5 determinisztikus), a `a6dd34d00` kódon. Mind a 16 futás md5-je és puffere egyezik a korábbiakkal: rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`. Ezzel a korábban kimaradt `dual_noopoff` hosszú eset is ellenőrizve (`2be92339`). Opció nélkül a naplóban nincs `flex` sor, a KV-pufferek a megszokottak (rétegenkénti KV-puffer csak `--flex-layers` mellett keletkezik).
+
+## A rugalmas sáv befejezése (sáv a határon, host-példány, DMA-másolás)
+Laptop (Vulkan, Iris Xe iGPU, közös memória), Qwen2.5-1.5B, `-ngl 14 --flex-layers 2` (a sáv most a **15. és 16.** réteg, a CPU-s rétegek mellett), hosszú prompt 1611 token, 200 generált token, `n_ctx` 32768, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (esetenként 1 futás; a mátrix a `ddfd52fd6`, a visszatételi idők az `aba2179ec` kódon).
+
+### Opció nélkül
+`bench.sh -r 1` az `aba2179ec` kódon: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pl. dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer viselkedése nem változott; a keret naplósorában új a `flex copies 0 MiB` mező.
+
+### Mátrix
+"VRAM" = a futás végi `common_memory_breakdown_print` Vulkan0 sora (self = model + K/V + compute; a compute mindenhol 308). "Hasítás" = a `sched_reserve` gráfjai (prompt / generálás) a mozgatás után.
+
+| eset | prompt tok/s | gen tok/s | md5 | VRAM self (model + K/V) | hasítás pp / tg |
+|---|---|---|---|---|---|
+| flex, mozgatás nélkül | 220,2* | 11,4 | 0063c4c5 (= host) | 1251 (526 + 416) | 212 / 2 |
+| 1 levéve, host-példánnyal | 260,1 | 15,5 | 3721153f | 1194 (501 + 384) | 226 / 2 |
+| 1 levéve, host-példány nélkül (`LLAMA_FLEX_TEST_HOST=0`) | 220,1 | 13,0 | 3721153f | 1194 (501 + 384) | 224 / 2 |
+| 2 levéve, host-példánnyal | 252,6 | 14,6 | c2356003 | 1133 (472 + 352) | 240 / 2 |
+| 2 levéve, host-példány nélkül | 215,6 | 15,4 | 35969901 | 1133 (472 + 352) | 237 / 2 |
+| 2 le +19, vissza +39 tokennél (host-példányból) | 267,6 | 15,2 | 0063c4c5 | 1251 (526 + 416) | 212 / 2 -> 240 / 2 -> 212 / 2 |
+| ugyanez, visszatétel a fájlból | 266,2 | 15,2 | 0063c4c5 | 1251 (526 + 416) | ugyanaz |
+| prompt a GPU-n, 2 levéve a generálásra | 273,7 | 15,4 | a8939715 | 1133 (472 + 352) | 212 / 2 -> 240 / 2 |
+| `-ngl 14 --dual-buffer` (referencia) | 271,9 | 15,0 | 35969901 | 1251 (526 + 416) | 212 / 2 |
+| `--dual-buffer`, flex, mozgatás nélkül | 271,7 | 16,1 | **35969901** | 1251 (526 + 416) | 212 / 2 |
+| `-ngl 13 --dual-buffer` (referencia: a 15. réteg CPU-s) | 248,3 | 13,3 | 2e66983a | 1194 (501 + 384) | 226 / 2 |
+| `--dual-buffer`, flex, 1 levéve | 263,1 | 13,5 | **2e66983a** | **1194 (501 + 384)** | **226 / 2** |
+| `-ngl 12 --dual-buffer` (referencia: a 15-16. réteg CPU-s) | 254,6 | 15,4 | 8934babb | 1133 (472 + 352) | 240 / 2 |
+| `--dual-buffer`, flex, 2 levéve | 256,8 | 17,1 | **8934babb** | **1133 (472 + 352)** | **240 / 2** |
+
+\* az első futás, bemelegítés nélkül; a többi prompt-érték után nem összevethető (a `bench.sh`-ban a mozgatás nélküli flex 241,7, illetve 285-298 volt).
+
+- **Egy levett réteg pontosan úgy viselkedik, mint egy eleve CPU-s dual-bufferes réteg:** 1 és 2 levett réteggel a kimenet bájtra, a VRAM-foglalás és a gráfhasítások száma egyezik a `-ngl 13` / `-ngl 12 --dual-buffer` futással.
+- **Gráfhasítások** (generálás) 0, 1, 2 levett réteggel: **2 / 2 / 2** (a sáv középről levett rétegeivel korábban 14 / 10). A prompt-gráf 212 / 226 / 240, ugyanannyi, mint a referenciáké (a CPU-s rétegek op offloadja rétegenként +14 hasítás).
+- **Felszabaduló VRAM rétegenként** (pufferelszámolás): a 15. réteg 57 MiB (25 súly + 32 K/V), a 16. réteg 61 MiB (29 + 32); kettő együtt 118 MiB.
+- **Prompt-sebesség levett rétegekkel:** a host-példány 1 levett rétegnél 220 -> 260, 2-nél 216 -> 253 tok/s; a referenciák (eleve CPU-s dual-bufferes réteg) 248 / 255. A laptopon a szórás nagy (lásd a csillagot), a generálás itt nem mérvadó.
+- **Kimenet:** minden esetben értelmes. Ahol a réteg a prompt és a generálás alatt ugyanott van, bájtra egyezik a megfelelő eredetivel (mozgatás nélkül a host/dual alapfutással, végig levéve az eleve CPU-s dual-bufferes futással; a le-vissza ciklus után is az eredetivel). Ahol a prompt és a generálás más elhelyezésben fut, az első eltérés a 397-660. bájtnál van, a szöveg értelmes.
+
+### Másolási idők
+**Visszatétel (súlyok)**, rétegenként 25-29 MiB, `-c 32768`:
+
+| forrás | idő (foglalás + másolás) |
+|---|---|
+| host-példány + CPU-iker, szinkron `set` (`aba2179ec`) | 6,1-9,7 ms (0,6-1,9 + 4,8-8,6), ~3,5-5,5 GB/s |
+| host-példány, aszinkron `set` (`ddfd52fd6`) | 8,8-15,9 ms |
+| modellfájl (tartalék, meleg page cache) | 19,6-41,2 ms |
+
+**Levétel (súlyok):** 0,2-2,4 ms (mező-csere + a GPU-puffer felszabadítása).
+
+**K/V (rétegenként), szétbontva** (alloc / clear / copy+sync / free, ms). A prompt után 1628 (levételkor) / 1648 (visszatételkor) cella használt. A szinkronizálás a mozgatás előtt minden esetben 0,0 ms (a decode végén már megtörtént).
+
+| irány | kontextus | előtte (`LLAMA_FLEX_TEST_COPY_LEGACY=1`: CPU-puffer, teljes szinkron másolás) | utána (rögzített host-puffer, csak a használt cellák, DMA) |
+|---|---|---|---|
+| GPU -> CPU | 4096 (4 MiB) | 17,0-17,5 = 0 / 0,8 / 16,1-16,6 / 0,2 | 1,7-2,3 = 0,4 / 0,5 / 0,5-1,3 / 0-0,3 |
+| GPU -> CPU | 32768 (32 MiB) | 143-155 = 0 / 9,6-11,1 / 134-144 / 0,2-0,3 | 9,9-20,5 = 6,7-17,6 / 2,2-2,4 / 0,5-0,6 / 0-0,5 |
+| CPU -> GPU | 4096 | 1,4-1,5 = 0,3-0,6 / 0,2 / 0,3-0,5 / 0,4-0,5 | 1,4 = 0,7-1,1 / 0,1-0,6 / 0,2 / 0 |
+| CPU -> GPU | 32768 | 8,7-63,5 = 1,0-51,7 / 1,1-1,5 / 2,6-5,9 / 4,0-4,3 | 5,7-34,5 = 1,1-31,5 / 2,1-4,1 / 0,2-0,8 / 0-0,2 |
+
+- **Az ok** (GPU -> CPU): a Vulkan backend UMA-eszközön a szinkron olvasást a leképezett, gyorsítótár nélküli eszközmemóriából `memcpy`-vel végzi (~0,23 GB/s: 32 MiB 134-144 ms alatt). Az aszinkron olvasás rögzített memóriába a GPU másolóparancsát használja: 1,59 MiB 0,5 ms alatt (DECISIONS.md 19-20).
+- **A maradék** a foglalás: rögzített host-memória 32 MiB-ra 5-18 ms, Vulkan eszközmemória 1-52 ms (erősen szór). A másolás maga 0,2-1,3 ms. Ezt a hardver sebességére a pufferek újrafoglalásának elkerülése hozná le (Következő lépések, DESIGN-3zone.md).
+- A kimenet a régi és az új úton is bájtra azonos (`964b3996`, 60 token, mindkét kontextusmérettel).
+
+### Nem tesztelt
+ROCm/HIP (HIP-gráfok a címváltozás után, PCIe-sebesség), dedikált GPU eszközmemória-lekérdezése, MoE, több context, iSWA/hibrid memória, `llama-server`, transzponált V (flash attention nélkül), a RAM-védelem kiváltása (`flex_no_host`, a sáv kikapcsolása) valódi RAM-hiánnyal.

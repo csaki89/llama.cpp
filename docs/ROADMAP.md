@@ -5,7 +5,7 @@
 2. **zóna, rugalmas sáv:** a RAM-ban mindig két formában van meg: GPU-formájú (eredeti) példány a host-pufferben és CPU-ra repackelt tartalék; amikor a réteg a GPU-n van, a VRAM-ban is.
 3. **zóna, mindig CPU:** a RAM-ban CPU-ra repackelve, és ha a dual-buffer be van kapcsolva, mellette a GPU-formájú példány a prompt op offloadhoz.
 
-Állapot: lásd DESIGN-3zone.md (a 2. zóna host-példánya még hiányzik).
+Állapot: a rugalmas sáv (`--flex-layers N`) kész: a GPU-s rétegek első N rétege, repackelt tartalék + host-példány a RAM-ban, futás közbeni le- és visszatétel a K/V-vel együtt; egy levett réteg úgy viselkedik, mint egy eleve CPU-s dual-bufferes réteg (DESIGN-3zone.md, test-results.md). Hiányzik: a zónaváltási szabály, a dinamikus KV, a NAS-os (ROCm, PCIe) mérés.
 
 Kiindulás: a dual-buffer ma minden CPU-n maradó repackelhető súlyhoz tart egy host-puffer másolatot (RAM-többlet), a limit és a minta csak durva szabályozás (DESIGN.md, DECISIONS.md). A cél a súlyok tudatos elhelyezése három zónában.
 
@@ -54,8 +54,8 @@ Következmények a tervre:
 
 ### Szükséges építőkockák
 - **Dinamikus KV-foglalás.** Ma a KV-cache a context létrehozásakor fix méretben foglalódik. A rugalmas sáv akkor ér valamit, ha a KV növekedhet (vagy zsugorodhat) futás közben, és a felszabaduló/lefoglalt VRAM a sávval kiegyenlíthető. Kérdés: szegmentált KV vagy újrafoglalás; a `llama_kv_cache` és a `--fit` kölcsönhatása.
-- **Rétegek áthelyezése futás közben.** Egy réteg súlyai VRAM-ból RAM-ba (a repackelt tartalék már ott van, tehát csak a VRAM-példányt kell felszabadítani) és vissza (feltöltés a host-példányból). Szinkronizáció a futó gráffal, a forgalom és a kiköltöztetés ütemezése (pl. csak kérések között).
-- **A számítási terv újraépítése.** Az áthelyezés megváltoztatja, melyik backendre kerül az adott réteg: a scheduler hasítását (`ggml_backend_sched_split_graph`), a gráf-újrahasznosítást és a dual-buffer ikerhozzárendelést (`ggml_backend_sched_set_weight_alt`) újra kell építeni. Mérni kell az újraépítés költségét, és a váltásokat ritkává kell tenni (hiszterézis).
+- **Rétegek áthelyezése futás közben: kész** (`--flex-layers`, DESIGN-3zone.md). Levétel: mező-csere + a GPU-puffer felszabadítása (~1 ms) + a K/V átmásolása (csak a használt cellák, DMA; a laptopon 1-20 ms, a foglalás dominál). Visszatétel: a host-példányból (6-10 ms/réteg a laptopon). A kiváltás ma csak hibakereső környezeti változóval megy; a szabály (mikor, hány réteg, hiszterézis) hiányzik.
+- **A számítási terv újraépítése: kész.** A mozgatás után a gráf újraépül, a scheduler nem kell újrafoglalni; a host-példányok `weight_alt`-ként be- és kijegyződnek. A határ melletti levétel a generálási gráfot nem bontja tovább (2 hasítás 0, 1 és 2 levett réteggel).
 
 ### Lépések
 1. Mérés: mekkora nyereséget ad egy kézi háromzónás elosztás a NAS-on (a 30/18/6 rétegsorozaton), mielőtt a dinamikát megírjuk.
