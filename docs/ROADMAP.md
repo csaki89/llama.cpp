@@ -1,5 +1,12 @@
 # Ütemterv: háromzónás súlyelhelyezés és nyitott tételek
 
+## A zónák értelmezése (érvényes, az alábbi korábbi leírásokat felülírja)
+1. **zóna, mindig GPU:** ami a maximális kontextus KV-cache-e mellett is elfér; csak a VRAM-ban.
+2. **zóna, rugalmas sáv:** a RAM-ban mindig két formában van meg: GPU-formájú (eredeti) példány a host-pufferben és CPU-ra repackelt tartalék; amikor a réteg a GPU-n van, a VRAM-ban is.
+3. **zóna, mindig CPU:** a RAM-ban CPU-ra repackelve, és ha a dual-buffer be van kapcsolva, mellette a GPU-formájú példány a prompt op offloadhoz.
+
+Állapot: lásd DESIGN-3zone.md (a 2. zóna host-példánya még hiányzik).
+
 Kiindulás: a dual-buffer ma minden CPU-n maradó repackelhető súlyhoz tart egy host-puffer másolatot (RAM-többlet), a limit és a minta csak durva szabályozás (DESIGN.md, DECISIONS.md). A cél a súlyok tudatos elhelyezése három zónában.
 
 ## 1. Háromzónás súlyelhelyezés
@@ -15,10 +22,10 @@ Cél: a GPU-ra kerülő rész a kontextus hosszához igazodjon, **újratöltés 
 | zóna | tartalom | hol van |
 |---|---|---|
 | 1. mindig GPU | ami a legnagyobb KV mellett is elfér | csak VRAM, RAM-másolat nélkül |
-| 2. rugalmas sáv | ami csak rövid kontextusnál fér a GPU-ra | VRAM-ban, amíg van hely; mellette a RAM-ban repackelt tartalék, hogy a CPU azonnal átvehesse. A GPU-formájú példány a modellfájlból töltődik vissza |
-| 3. mindig CPU | a hideg súlyok | csak RAM-ban, repackelve; a prompt-gyorsításhoz opcionálisan eredeti formájú másolat a host-pufferben (ez a mostani dual-buffer) |
+| 2. rugalmas sáv | ami csak rövid kontextusnál fér a GPU-ra | a RAM-ban mindig két formában: GPU-formájú (eredeti) példány a host-pufferben és CPU-ra repackelt tartalék; amikor a réteg a GPU-n van, a VRAM-ban is. A visszatétel a host-példányból tölt |
+| 3. mindig CPU | a hideg súlyok | a RAM-ban repackelve; dual-bufferrel mellette a GPU-formájú példány a prompt op offloadhoz |
 
-Becslés a qwen3-coder:30b-re (32K kontextus): 1. zóna ~5,7 GB, 2. zóna ~3 GB, 3. zóna ~8,3 GB. RAM-igény ~11,3 GB (3. zóna + a 2. zóna repackelt tartaléka), a 3. zóna host-másolatával (dual-buffer) több.
+Becslés a qwen3-coder:30b-re (32K kontextus): 1. zóna ~5,7 GB, 2. zóna ~3 GB, 3. zóna ~8,3 GB. RAM-igény: 3. zóna repackelve ~8,3 GB + 2. zóna két példánya ~2 x 3 GB = ~14,3 GB; a 3. zóna host-példányával (dual-buffer) további ~8,3 GB.
 
 ### Dinamikus KV-foglalás: lehetőségek
 - **(a) Átméretezés küszöböknél, másolással.** A KV a használt hossz szerint lépcsőzetesen nő; átméretezéskor új puffer, másolás, régi felszabadítása. Egyszerű, de a másolás és a csúcs-memóriahasználat (régi + új egyszerre) költsége van, és a gráf-újrahasznosítást érinti.

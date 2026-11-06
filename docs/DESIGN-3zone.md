@@ -1,5 +1,14 @@
 # Háromzónás elhelyezés, 1. építőkocka: rétegek áthelyezése futás közben
 
+## A zónák értelmezése (érvényes)
+1. **zóna, mindig GPU:** ami a maximális kontextus KV-cache-e mellett is elfér; csak a VRAM-ban.
+2. **zóna, rugalmas sáv:** a RAM-ban mindig két formában van meg: GPU-formájú (eredeti) példány a host-pufferben és CPU-ra repackelt tartalék; amikor a réteg a GPU-n van, a VRAM-ban is.
+3. **zóna, mindig CPU:** a RAM-ban CPU-ra repackelve, és ha a dual-buffer be van kapcsolva, mellette a GPU-formájú példány a prompt op offloadhoz.
+
+A levett 2. zónás réteg ugyanúgy viselkedjen, mint egy eleve CPU-n lévő dual-bufferes réteg: a súlyai és a K/V-je a CPU-n, a prompt op offloadja a host-példányból.
+
+**A megvalósítás állapota ehhez képest** (`--flex-layers`, lásd 2. és 5.): a repackelt tartalék és a K/V követése kész. **Hiányzik a 2. zóna host-példánya:** a visszatétel ma a modellfájlból tölt, és a levett réteghez nincs eredeti formájú példány, ezért a levett réteg promptját az op offload nem tudja a GPU-ra küldeni (a "Következő lépések" első pontja). A host-példánnyal a visszatétel is onnan töltene, fájlolvasás nélkül.
+
 Hatókör: egy GPU-n lévő réteg súlyai futás közben, újratöltés nélkül a CPU-ra kerülhessenek és vissza. A KV-cache-hez és a zónaváltási szabályhoz (mikor mozogjon egy réteg) ez a lépés nem nyúl. Lásd ROADMAP.md.
 
 ## 1. A jelenlegi pufferkezelés
