@@ -54,3 +54,9 @@ A rugalmas sáv rétegei **kimaradnak a dual-buffer ikrekből** (azok eleve GPU-
 - **Nézetek:** ha egy réteg tenzorát nézetként használja a gráf, a nézet `data` mutatója a gráfépítéskor jön a szülőből, ezért újraépítés után helyes.
 - **Teljesítmény:** a visszatétel egy rétegnyi fájlolvasás + feltöltés; mérjük.
 - **Rebase:** `llama-model-loader.cpp/.h`, `llama-model.cpp/.h`, `llama-context.cpp`, `llama.h`, `common/arg.cpp`, `common/common.cpp/.h`.
+
+## 5. Megvalósítás: eltérések és mért eredmény
+- **Az iker puffertípusa:** a CPU-s pufferlistában alapból a GPU host-puffere áll elöl (repack előtt), ezért a `select_weight_buft(buft_list_cpu)` az ikreket a host-pufferbe tette volna, repack nélkül. Az iker ezért csak a CPU-eszköz saját puffertípusai közül választ (extra/repack, majd CPU).
+- **Scheduler:** a 2.4 pont feltevése igaz: a gráf újraépítése elég, a CPU compute-puffert a `ggml_gallocr` magától átméretezi; a teljes újrafoglalás (`LLAMA_FLEX_TEST_RESERVE=1`) ugyanazt a kimenetet adja, ezért nem kell.
+- **Fájlok:** a loader `files` listája a betöltés végén a modellhez kerül (a loadert a betöltés után semmi nem használja), a visszatétel ezekből olvas.
+- **Mért értékek** (laptop, részletek: test-results.md): levétel 0,6-3,2 ms/réteg, visszatétel 20-67 ms/réteg (~27 MiB), a modell VRAM-foglalása a levett rétegek méretével csökken (526 -> 472 MiB két réteggel).

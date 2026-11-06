@@ -93,3 +93,34 @@ Laptop, Qwen2.5-1.5B, `LLAMA_DUAL_BUFFER_FREE_MIB=6000`. "becslés" = a naplóbe
 | `-ngl 99 -ot "blk\.1[0-9]\..*=CPU"` | 390 | 390 |
 | `-ngl 99 -ot "ffn_.*=Vulkan0"` | 125 | 125 |
 A javítás előtti bináris `-ngl 99 -ot` mellett `CPU part ~0 MiB`-ot adott (a hiba reprodukálva). A NAS-os Ollama + MoE esetet ott kell újramérni.
+
+## Háromzónás elhelyezés, 1. építőkocka: `--flex-layers` (rétegek áthelyezése futás közben)
+Laptop (Vulkan, Iris Xe iGPU), Qwen2.5-1.5B (28 réteg), `-ngl 14`, `--flex-layers 2` (a 26. és 27. réteg), hosszú prompt (1611 token), 200 generált token, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (2 ismétlés, a dual-buffer esetek 1). Kiváltás: `LLAMA_FLEX_TEST="<token>:<take|put>:<réteg>,..."`.
+
+### Opció nélkül (baseline)
+`bench.sh`, 8 mód x 2 prompt x 3 ismétlés. Az utolsó 3 futás (`dual_noopoff`, hosszú prompt) nem futott le, mert a rendszer kevés memória miatt leállította a mérést; nem indítottam újra. A lefutott 45 futásban minden md5 és puffer egyezik a korábbiakkal: rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pufferek pl. repack `CPU=225,15 CPU_REPACK=308,18 Vulkan0=526,55`, host `Vulkan0=526,55 Vulkan_Host=533,33`, dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`. Opció nélkül a naplóban nincs `flex` sor.
+
+### Pufferek `--flex-layers 2` mellett
+`Vulkan0=472,83` (a többi GPU-s réteg) + `Vulkan0=25,12` (26. réteg) + `Vulkan0=28,60` (27. réteg) = 526,55, mint opció nélkül; a CPU-s ikrek: `CPU_REPACK=42,61` + `CPU=11,11` (a nem repackelhető normák stb.) = 53,72 MiB (`flex layers 26-27: 24 weights with a CPU copy (53.72 MiB)`). A `Vulkan_Host` 533,33 változatlan. Mozgatás nélkül a kimenet azonos az opció nélkülivel (`0063c4c5`).
+
+### Eredmények
+| eset | prompt tok/s (r1 / r2) | gen tok/s (r1 / r2) | md5 | VRAM a futás végén (modell, MiB) |
+|---|---|---|---|---|
+| opció nélkül | 279,8 / 301,2 | 11,6 / 16,4 | 0063c4c5 | 526 |
+| flex, mozgatás nélkül | 285,3 / 297,9 | 15,3 / 16,6 | 0063c4c5 | 526 |
+| 26+27 végig levéve (`0:take`) | 208,7 / 252,3 | 11,4 / 16,1 | 0063c4c5 | **472** |
+| levéve a promptra, vissza a generálásra | 199,0 / 259,8 | 14,6 / 16,3 | 0063c4c5 | 526 |
+| prompt a GPU-n, levéve a generálásra | 236,9 / 301,4 | 13,6 / 16,8 | 35969901 | 472 |
+| ugyanez, scheduler-újrafoglalással | 207,8 / 294,9 | 14,8 / 17,1 | 35969901 | 472 |
+| 27. le +50 tokennél, vissza +100-nál | 238,1 / 297,2 | 14,2 / 16,3 | 0063c4c5 | 526 |
+| `--dual-buffer` | 288,3 | 16,6 | 35969901 | 526 |
+| `--dual-buffer` + 27. le/vissza | 294,0 | 16,5 | 35969901 | 526 |
+| `--dual-buffer` + 26+27 végig levéve | 245,5 | 15,6 | f773f5bc | 472 |
+
+- **VRAM:** a levétel után a modell VRAM-foglalása 526 -> 472 MiB (a `common_memory_breakdown_print` Vulkan0 "model" oszlopa), a két réteg mérete 53,72 MiB. Visszatétel után újra 526. A Vulkan által jelentett szabad eszközmemória az iGPU-n nem mozdul (megosztott memória, a budget nem követi), ezért a pufferelszámolás a mérvadó; dedikált GPU-n (NAS) az eszközmemóriát is ellenőrizni kell.
+- **A számítás tényleg áthelyeződik:** `GGML_SCHED_DEBUG=2` mellett a levétel után a `Qcur-27`, `ffn_up-27`, `ffn_out-27` csomópontok a CPU-n, a 26. réteg csomópontjai a Vulkanon futnak.
+- **Kimenet:** minden esetben értelmes, a generálás folytatódik. Ha a réteg a prompt és a generálás alatt ugyanott van (végig levéve, vagy le-fel 50 token alatt), a kimenet bájtra azonos az eredetivel. Ha a prompt a GPU-n, a generálás a CPU-n számol (ugyanaz a helyzet, mint a dual-buffernél), a kimenet `35969901`, az első eltérés a 421. bájtnál, ugyanúgy, mint a `dual` vs `host` esetben. A `dual + végig levéve` `f773f5bc`, az első eltérés a 32. bájtnál; a szöveg értelmes ("The text is a list of sections, each containing the same sentence with slight variations...").
+- **Sebesség:** levett rétegekkel a prompt lassabb (209-252 vs 280-301 tok/s), mert a repackelt tartalékot az op offload nem tudja átküldeni; visszatétel után (`levéve a promptra, vissza a generálásra`) a generálás az eredeti szintjén van (14,6 / 16,3 vs 11,6 / 16,4). A laptopon a generálás szórása nagy (r1 és r2 között 11,6 -> 16,4 az opció nélküli esetben is), ezért a generálási különbségek itt nem mérvadók.
+- **Időtartam:** levétel rétegenként 0,6-3,2 ms (mező-csere és a puffer felszabadítása; a második réteg ugyanabban a lépésben <0,1 ms). Visszatétel rétegenként 20-67 ms (25-29 MiB a modellfájlból, meleg page cache mellett, foglalás + olvasás + feltöltés), kb. 0,5-1,4 GB/s. Hideg cache-sel lassabb lehet.
+- **Scheduler:** a gráf újraépítése (`gf_res_prev_active = nullptr`) elég; a CPU-s compute-puffert a `ggml_gallocr` szükség esetén magától átméretezi. A `LLAMA_FLEX_TEST_RESERVE=1` (teljes újrafoglalás, ~190 ms) ugyanazt a kimenetet adja (`35969901`), ezért alapból nem fut.
+- **Nem tesztelt:** ROCm/CUDA (backend-gráfok címváltozása), dedikált GPU eszközmemória-lekérdezése, MoE, több context egy modellen, hideg page cache, `llama-server`.
