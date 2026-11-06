@@ -8,4 +8,7 @@
 - Füstpróba (Qwen2.5-1.5B, `-ngl 14`): `dual-buffer: 87 weights also stored in Vulkan_Host (308.18 MiB)`, hosszú prompt ~326 tok/s.
 - Megjegyzés: a settings.json `Bash(cmd //c tools/dualbuf/build-vulkan.bat)` allow-szabálya nem használható, mert a `cmd` perjeles útvonalat nem érti. Működő forma: `cmd //c "tools\dualbuf\build-vulkan.bat"` (ezt az allow-listán javítani kell).
 
-## Következő: 3. fázis (ellenőrzés a tesztkerettel, `docs/test-results.md`)
+## 3. fázis (ellenőrzés): kész
+- Minden elfogadási feltétel teljesül, részletek: `docs/test-results.md` (commit `e2bf5e847` kódon).
+
+## Következő: 4. fázis (duplikálás korlátozása: tenzorminta, RAM-keret)
