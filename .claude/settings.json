@@ -1,5 +1,57 @@
 {
   "permissions": {
+    "allow": [
+      "Read(/**)",
+      "Edit(/**)",
+
+      "Bash(cmake -B:*)",
+      "Bash(cmake --build:*)",
+      "Bash(ninja:*)",
+      "Bash(cmd //c tools/dualbuf/build-vulkan.bat)",
+      "Bash(./build/bin/llama-*:*)",
+      "Bash(build/bin/llama-*:*)",
+      "Bash(bash tools/dualbuf/*:*)",
+      "Bash(./tools/dualbuf/*:*)",
+      "PowerShell(cmake -B:*)",
+      "PowerShell(cmake --build:*)",
+      "PowerShell(& .\\tools\\dualbuf\\build-vulkan.bat)",
+      "PowerShell(.\\build\\bin\\llama-*:*)",
+
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "PowerShell(git add:*)",
+      "PowerShell(git commit:*)",
+      "PowerShell(git branch:*)",
+      "PowerShell(git diff:*)",
+      "PowerShell(git log:*)",
+      "PowerShell(git status:*)",
+      "PowerShell(git show:*)",
+      "PowerShell(git rev-parse:*)",
+
+      "Bash(gh search:*)",
+      "PowerShell(gh search:*)",
+
+      "Bash(sleep:*)",
+      "Bash(kill:*)",
+      "Bash(mkdir:*)",
+      "Bash(curl http://127.0.0.1:*)",
+      "Bash(curl http://localhost:*)",
+      "Bash(curl * http://127.0.0.1:*)",
+      "Bash(curl * http://localhost:*)",
+      "Bash(taskkill //F //IM llama-server.exe:*)",
+      "Bash(taskkill //IM llama-server.exe:*)",
+      "Bash(taskkill /F /IM llama-server.exe:*)",
+      "Bash(taskkill /IM llama-server.exe:*)",
+      "PowerShell(Start-Sleep:*)",
+      "PowerShell(taskkill /F /IM llama-server.exe:*)",
+      "PowerShell(taskkill /IM llama-server.exe:*)"
+    ],
     "deny": [
       "Bash(gh pr:*)",
       "Bash(gh issue:*)",
@@ -7,14 +59,26 @@
       "Bash(gh repo fork:*)",
       "Bash(git push upstream:*)",
       "Bash(git push * upstream:*)",
-      "Bash(git push * upstream *)",
       "PowerShell(gh pr:*)",
       "PowerShell(gh issue:*)",
       "PowerShell(gh api:*)",
       "PowerShell(gh repo fork:*)",
       "PowerShell(git push upstream:*)",
       "PowerShell(git push * upstream:*)",
-      "PowerShell(git push * upstream *)"
+
+      "Bash(winget:*)", "Bash(choco:*)", "Bash(scoop:*)",
+      "Bash(pip:*)", "Bash(pip3:*)", "Bash(npm install:*)", "Bash(npm i:*)",
+      "Bash(apt:*)", "Bash(apt-get:*)", "Bash(sudo:*)", "Bash(msiexec:*)",
+      "Bash(*setup.exe*)", "Bash(*vs_installer*)", "Bash(*vulkan-sdk*)",
+      "PowerShell(winget:*)", "PowerShell(choco:*)", "PowerShell(scoop:*)",
+      "PowerShell(msiexec:*)", "PowerShell(Install-*:*)",
+      "PowerShell(Start-Process:*)", "PowerShell(*setup.exe*)", "PowerShell(*vulkan-sdk*)",
+
+      "Edit(~/.ssh/**)",
+      "Edit(~/.claude/**)",
+      "Edit(//c/Windows/**)",
+      "Edit(//c/Program Files/**)",
+      "Edit(//c/Program Files (x86)/**)"
     ]
   }
 }
