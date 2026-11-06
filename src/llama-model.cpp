@@ -1714,8 +1714,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
 
+    // dual-buffer: find the host buffer type that holds the original-format copies (same choice as make_cpu_buft_list)
+    if (params.dual_buffer) {
+        if (ml.use_mmap) {
+            LLAMA_LOG_WARN("%s: --dual-buffer requires --load-mode none, disabling it\n", __func__);
+        } else if (!params.use_extra_bufts) {
+            LLAMA_LOG_WARN("%s: --dual-buffer requires weight repacking, disabling it\n", __func__);
+        } else {
+            for (const auto & dev : devices) {
+                ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
+                if (buft) {
+                    ml.dual_host_buft = buft;
+                    ml.dual_host_dev  = dev.dev;
+                    break;
+                }
+            }
+            if (!ml.dual_host_buft) {
+                LLAMA_LOG_WARN("%s: --dual-buffer needs a device host buffer, none available, disabling it\n", __func__);
+            }
+        }
+    }
+
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // with dual-buffer the weights use the extra (repack) buffers and the host buffer only holds the copies
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host || ml.dual_host_buft);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1975,10 +1997,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             (output_s || output_in_s)) {
         throw std::runtime_error("output scales require a separate output weight");
     }
+    // the dual-buffer copies are not looked up by name
+    std::unordered_set<const ggml_tensor *> dual_copies;
+    size_t dual_bytes = 0;
+    for (const auto & [w, copy] : ml.dual_pairs) {
+        dual_copies.insert(copy);
+        dual_bytes += ggml_nbytes(copy);
+    }
+    dual_weights = ml.dual_pairs;
+    if (ml.dual_host_buft) {
+        LLAMA_LOG_INFO("%s: dual-buffer: %zu weights also stored in %s (%.2f MiB)\n", __func__,
+            dual_weights.size(), ggml_backend_buft_name(ml.dual_host_buft), dual_bytes / 1024.0 / 1024.0);
+    }
+
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
-            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            if (dual_copies.count(cur) == 0) {
+                tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            }
         }
     }
 
@@ -3529,6 +3566,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.dual_buffer                 =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
     };

@@ -370,6 +370,10 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Register `alt` as an alternative copy of the weight `weight` (e.g. the original-format copy of a repacked
+    // weight, held in a host buffer). When an op using `weight` is offloaded to another backend, `alt` is used instead.
+    GGML_API void                 ggml_backend_sched_set_weight_alt(ggml_backend_sched_t sched, struct ggml_tensor * weight, struct ggml_tensor * alt);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

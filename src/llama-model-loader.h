@@ -162,6 +162,11 @@ struct llama_model_loader {
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
+    // dual-buffer: a weight placed in an extra (e.g. repack) buffer also gets an original-format copy in this host buffer
+    ggml_backend_buffer_type_t dual_host_buft = nullptr;
+    ggml_backend_dev_t         dual_host_dev  = nullptr;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> dual_pairs; // (weight, copy)
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;

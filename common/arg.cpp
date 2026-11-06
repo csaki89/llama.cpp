@@ -2385,6 +2385,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--dual-buffer"},
+        "keep CPU weights repacked and also in the host buffer (original format): the CPU uses the repacked copy,\n"
+        "op offload uses the host copy (needs --load-mode none, uses extra RAM)",
+        [](common_params & params) {
+            params.dual_buffer = true;
+        }
+    ).set_env("LLAMA_ARG_DUAL_BUFFER"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

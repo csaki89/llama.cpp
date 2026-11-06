@@ -941,6 +941,9 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // dual-buffer: (weight, original-format copy in a host buffer), registered with the scheduler
+    std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> dual_weights;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

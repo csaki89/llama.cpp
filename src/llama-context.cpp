@@ -784,6 +784,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
+    for (const auto & [w, copy] : model.dual_weights) {
+        ggml_backend_sched_set_weight_alt(sched.get(), w, copy);
+    }
+
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }

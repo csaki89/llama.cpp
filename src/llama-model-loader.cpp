@@ -1164,6 +1164,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return it->second.get();
     };
 
+    // set by buft_for_tensor() when the weight also needs an original-format copy (dual-buffer)
+    ggml_backend_buffer_type_t dual_buft = nullptr;
+
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
@@ -1299,6 +1302,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             n_tensors_moved++;
         }
 
+        // dual-buffer: weights in an extra buffer (e.g. repack) are not host-readable, so op offload cannot use them
+        // keep a copy in the original format in the host buffer too
+        if (dual_host_buft && !files.empty() && !ggml_backend_buft_is_host(buft)) {
+            auto * dev_w = ggml_backend_buft_get_device(buft);
+            if (!dev_w || ggml_backend_dev_type(dev_w) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(dev_w) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                if (weight_buft_supported(hparams, t_meta, op, dual_host_buft, dual_host_dev)) {
+                    dual_buft = dual_host_buft;
+                }
+            }
+        }
+
         return buft;
     };
 
@@ -1397,6 +1411,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+    }
+
+    if (dual_buft) {
+        struct ggml_tensor * copy = ggml_dup_tensor(ctx_for_buft(dual_buft), &t_meta);
+        ggml_set_name(copy, ggml_get_name(&t_meta));
+        size_data += ggml_nbytes(&t_meta);
+        dual_pairs.emplace_back(tensor, copy);
     }
 
     return tensor;

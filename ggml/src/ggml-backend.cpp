@@ -1237,6 +1237,9 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // weight -> alternative copy used when an op is offloaded (see ggml_backend_sched_set_weight_alt)
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> * weight_alt;
+
     int debug;
 
     // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
@@ -1374,14 +1377,28 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // a weight with an alternative (host buffer) copy can be offloaded as well, using the copy
+                struct ggml_tensor * src_orig = tensor->src[i];
+                struct ggml_tensor * alt = NULL;
+                if (sched->weight_alt) {
+                    auto it = sched->weight_alt->find(src);
+                    alt = it != sched->weight_alt->end() ? it->second : NULL;
+                }
                 // check if a backend with higher prio wants to offload the op
-                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && (alt || ggml_backend_buffer_is_host(src->buffer))) {
+                    if (alt) {
+                        tensor->src[i] = alt;
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            if (alt) {
+                                tensor_backend_id(alt) = src_backend_id;
+                            }
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
                     }
+                    tensor->src[i] = src_orig;
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);
                 return src_backend_id;
@@ -2289,6 +2306,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
+    delete sched->weight_alt;
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
         free(sched->splits[i].inputs);
@@ -2465,6 +2483,14 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
+}
+
+void ggml_backend_sched_set_weight_alt(ggml_backend_sched_t sched, struct ggml_tensor * weight, struct ggml_tensor * alt) {
+    GGML_ASSERT(sched);
+    if (!sched->weight_alt) {
+        sched->weight_alt = new std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *>();
+    }
+    (*sched->weight_alt)[weight] = alt;
 }
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
