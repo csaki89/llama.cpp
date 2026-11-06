@@ -223,6 +223,8 @@ llama_context::llama_context(
         flex_use_host = !env_host || atoi(env_host) != 0;
         const char * env_file = getenv("LLAMA_FLEX_TEST_FILE");
         flex_test_file = env_file && atoi(env_file) != 0;
+        const char * env_legacy = getenv("LLAMA_FLEX_TEST_COPY_LEGACY");
+        flex_test_copy_legacy = env_legacy && atoi(env_legacy) != 0;
     }
 
     const auto & hparams = model.hparams;
@@ -2146,18 +2148,29 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (auto & s : flex_test) {
         if (!s.done && flex_test_tokens >= s.at) {
             s.done = true;
+            const int64_t t_sync = ggml_time_us();
             synchronize();
+            LLAMA_LOG_INFO("%s: flex: synchronize before the move %.1f ms\n", __func__, (ggml_time_us() - t_sync) / 1000.0);
             if (s.layer < 0) {
                 s.layer = model.flex_next(s.to_gpu);
             }
-            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file)) {
+            // the GPU backend of the layer, for asynchronous (DMA) copies
+            ggml_backend_t backend_gpu = nullptr;
+            if (s.layer >= 0 && !flex_test_copy_legacy) {
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == model.flex_gpu_dev(s.layer)) {
+                        backend_gpu = b.get();
+                    }
+                }
+            }
+            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file, backend_gpu)) {
                 if (sched) {
                     flex_set_alts(s.layer);
                 }
                 // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
                 if (flex_test_kv) {
                     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
-                        kv->flex_move(s.layer, s.to_gpu);
+                        kv->flex_move(s.layer, s.to_gpu, backend_gpu, flex_test_copy_legacy);
                     } else {
                         LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
                     }

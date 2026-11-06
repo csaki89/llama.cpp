@@ -260,7 +260,9 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
     // flex layers: move the K/V of a layer between its GPU buffer and the CPU, copying the content (DESIGN-3zone.md)
-    bool flex_move(int32_t il, bool to_gpu);
+    // backend: the layer's GPU backend, for asynchronous (DMA) copies; NULL = synchronous copies
+    // legacy (test): CPU buffer and a full synchronous copy, the first implementation
+    bool flex_move(int32_t il, bool to_gpu, ggml_backend_t backend = nullptr, bool legacy = false);
 
 private:
     // flex layers: the K/V of the layer has its own buffer (index into ctxs_bufs)

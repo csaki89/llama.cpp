@@ -2966,7 +2966,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     }
 }
 
-bool llama_kv_cache::flex_move(int32_t il, bool to_gpu) {
+bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, bool legacy) {
     auto it = flex_kv_layers.find(il);
     if (it == flex_kv_layers.end()) {
         return false;
@@ -2976,15 +2976,23 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu) {
         return true;
     }
 
-    const int64_t t_start_us = ggml_time_us();
+    const int64_t t0 = ggml_time_us();
 
+    // CPU side: the device host buffer (pinned memory, the backend copies it with DMA), else the CPU buffer
+    // legacy (test): the CPU buffer, a full synchronous copy
     ggml_backend_buffer_type_t buft = fk.buft_gpu;
     if (!to_gpu) {
-        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (!cpu_dev) {
-            return false;
+        buft = legacy ? nullptr : ggml_backend_dev_host_buffer_type(ggml_backend_buft_get_device(fk.buft_gpu));
+        if (!buft) {
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                return false;
+            }
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
-        buft = ggml_backend_dev_buffer_type(cpu_dev);
+    }
+    if (legacy) {
+        backend = nullptr;
     }
 
     auto & layer = layers[map_layer_ids.at(il)];
@@ -3005,17 +3013,60 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu) {
         LLAMA_LOG_ERROR("%s: layer %d: failed to allocate %zu bytes in %s\n", __func__, il, size, ggml_backend_buft_name(buft));
         return false;
     }
+    const int64_t t1 = ggml_time_us();
     ggml_backend_buffer_clear(buf, 0);
+    const int64_t t2 = ggml_time_us();
+
+    // only the used cells hold data: rows [0, n_used) of each stream (all of V if it is transposed)
+    uint32_t n_used = 0;
+    for (const auto & cells : v_cells) {
+        n_used = std::max(n_used, cells.used_max_p1());
+    }
+    if (legacy) {
+        n_used = get_size();
+    }
 
     // allocate the K/V in the new buffer and copy the content from the old one
     ggml_tallocr talloc = ggml_tallocr_new(buf);
+    size_t n_copied = 0;
+    std::vector<uint8_t> tmp;
     for (ggml_tensor * t : tensors) {
         ggml_tensor old = *t;
         t->buffer = nullptr;
         t->data   = nullptr;
         ggml_tallocr_alloc(&talloc, t);
-        ggml_backend_tensor_copy(&old, t);
+
+        const bool rows = !(t == layer.v && v_trans);
+        const size_t n_rows = rows ? n_used : t->ne[1];
+        for (int64_t s = 0; s < t->ne[2] && n_rows > 0; ++s) {
+            const size_t off = s*t->nb[2];
+            const size_t len = n_rows*t->nb[1];
+            const bool src_host = ggml_backend_buffer_is_host(old.buffer);
+            const bool dst_host = ggml_backend_buffer_is_host(t->buffer);
+            if (src_host) {
+                if (backend && !dst_host) {
+                    ggml_backend_tensor_set_async(backend, t, (const char *) old.data + off, off, len);
+                } else {
+                    ggml_backend_tensor_set(t, (const char *) old.data + off, off, len);
+                }
+            } else if (dst_host) {
+                if (backend) {
+                    ggml_backend_tensor_get_async(backend, &old, (char *) t->data + off, off, len);
+                } else {
+                    ggml_backend_tensor_get(&old, (char *) t->data + off, off, len);
+                }
+            } else {
+                tmp.resize(len);
+                ggml_backend_tensor_get(&old, tmp.data(), off, len);
+                ggml_backend_tensor_set(t, tmp.data(), off, len);
+            }
+            n_copied += len;
+        }
     }
+    if (backend) {
+        ggml_backend_synchronize(backend);
+    }
+    const int64_t t3 = ggml_time_us();
 
     // the per-stream views point into the K/V
     for (auto * views : { &layer.k_stream, &layer.v_stream }) {
@@ -3030,9 +3081,11 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu) {
     // frees the old buffer
     ctxs_bufs.bufs[fk.buf_idx].second.reset(buf);
     fk.on_gpu = to_gpu;
+    const int64_t t4 = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %.1f ms)\n", __func__, il, ggml_backend_buft_name(buft),
-        size / 1024.0 / 1024.0, (ggml_time_us() - t_start_us) / 1000.0);
+    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
+        __func__, il, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0, n_used, n_copied / 1024.0 / 1024.0, (t4 - t0) / 1000.0,
+        (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
     return true;
 }
 

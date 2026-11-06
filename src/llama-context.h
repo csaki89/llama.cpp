@@ -392,6 +392,7 @@ private:
     bool     flex_test_kv      = true;  // LLAMA_FLEX_TEST_KV=0: keep the K/V in place when a layer moves
     bool     flex_use_host     = true;  // LLAMA_FLEX_TEST_HOST=0: no op offload from the host copies of the layers that are off
     bool     flex_test_file    = false; // LLAMA_FLEX_TEST_FILE=1: put back from the model file instead of the host copy
+    bool     flex_test_copy_legacy = false; // LLAMA_FLEX_TEST_COPY_LEGACY=1: synchronous copies, K/V in the CPU buffer, all cells (first implementation)
 
     // register (layer off) or remove (layer on the GPU) the host copies of a flex layer with the scheduler
     void flex_set_alts(int il);

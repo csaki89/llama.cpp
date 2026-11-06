@@ -974,7 +974,8 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
 
     // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
-    bool flex_move(int il, bool to_gpu, bool from_file = false) const;
+    // backend: the GPU backend of the layer, for asynchronous (DMA) copies when putting back; NULL = synchronous copies
+    bool flex_move(int il, bool to_gpu, bool from_file = false, ggml_backend_t backend = nullptr) const;
     bool flex_has_layer(int il) const;
     bool flex_on_gpu(int il) const;
     std::vector<int> flex_layers() const;
