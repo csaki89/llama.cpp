@@ -1836,9 +1836,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         ram_src   = "env override";
                     }
                     if (ram_total > 0) {
-                        const int n_gpu = std::min(this->n_gpu_layers(), hparams.n_layer_all + 1);
-                        const double cpu_frac = 1.0 - (double) n_gpu / (hparams.n_layer_all + 1);
-                        const size_t cpu_part = (size_t) (ml.n_bytes * cpu_frac);
+                        // bytes of weights that stay in RAM: from the tensors' placement (layer split and tensor overrides), so a --fit result is covered
+                        // unknown placement counts as CPU, which gives a smaller budget
+                        const int n_gpu = (int) std::min(this->n_gpu_layers(), (uint32_t) hparams.n_layer_all + 1);
+                        const int i_gpu_start_est = std::max((int) hparams.n_layer_all + 1 - n_gpu, 0);
+                        std::vector<std::pair<std::regex, bool>> ovr; // (pattern, stays in RAM)
+                        for (auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
+                            auto * od = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
+                            ovr.emplace_back(std::regex(o->pattern), !od || ggml_backend_buft_is_host(o->buft) || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
+                        }
+                        size_t cpu_part = 0;
+                        for (const auto & it : ml.weights_map) {
+                            const std::string & name = it.first;
+                            bool in_ram = true;
+                            bool decided = false;
+                            for (const auto & o : ovr) {
+                                if (std::regex_search(name, o.first)) {
+                                    in_ram  = o.second;
+                                    decided = true;
+                                    break;
+                                }
+                            }
+                            if (!decided) {
+                                int il = -1;
+                                if (name.compare(0, 4, "blk.") == 0 && sscanf(name.c_str() + 4, "%d", &il) == 1) {
+                                    in_ram = il < i_gpu_start_est;
+                                } else if (name.compare(0, 10, "token_embd") != 0) {
+                                    in_ram = n_gpu <= hparams.n_layer_all; // output tensors
+                                }
+                            }
+                            if (in_ram) {
+                                cpu_part += ggml_nbytes(it.second.tensor);
+                            }
+                        }
                         const size_t reserve  = std::max((size_t) 1 << 30, ram_total / 20);
                         const size_t need     = cpu_part + reserve;
                         const size_t budget   = ram_free > need ? ram_free - need : 0;

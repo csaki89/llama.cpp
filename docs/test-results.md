@@ -81,3 +81,15 @@ Laptop, Qwen2.5-1.5B, `-ngl 14`, a bench.sh teljes sorozata (3 ismétlés).
 - Laptop (Windows, nincs cgroup): a naplóban `free RAM 2270 MiB (system)`, 87 súly duplikálva (308,18 MiB), `Vulkan_Host` 533,33 MiB; `--dual-buffer-limit 100` -> 35 súly (99,98 MiB). A viselkedés a v2-vel azonos.
 - A `get_cgroup_free()` önálló programban, hamis cgroup-fán: v2 beágyazott (`a`: max 1000 MiB, használat 400 MiB, inaktív cache 100 MiB; `a/b` korlátlan) -> szabad 700 MiB, korlát 1000 MiB; v1 (500 MiB korlát, 200 MiB használat) -> 300 MiB; gyökér cgroup / nincs memory vezérlő / nem létező fájl -> nincs korlát.
 - Nem tesztelt: valódi cgroup (Docker `--memory`) a NAS-on.
+
+## v4: a CPU-s rész becslése az elhelyezésből
+Laptop, Qwen2.5-1.5B, `LLAMA_DUAL_BUFFER_FREE_MIB=6000`. "becslés" = a naplóbeli `CPU part`, "tényleges" = a pufferek összege a RAM-ban (CPU_REPACK + host-puffer).
+| beállítás | becslés (MiB) | tényleges (MiB) |
+|---|---|---|
+| `-ngl 14` | 716 | 533 (CPU_REPACK 308 + 225 nem repackelhető) - óvatos |
+| `-ngl 0` | 1060 | 1060 |
+| nincs `-ngl` (minden GPU-n, fit) | 125 | 125 (`token_embd`) |
+| `-ngl 99 -ot "ffn_.*=CPU"` | 793 | 793 |
+| `-ngl 99 -ot "blk\.1[0-9]\..*=CPU"` | 390 | 390 |
+| `-ngl 99 -ot "ffn_.*=Vulkan0"` | 125 | 125 |
+A javítás előtti bináris `-ngl 99 -ot` mellett `CPU part ~0 MiB`-ot adott (a hiba reprodukálva). A NAS-os Ollama + MoE esetet ott kell újramérni.
