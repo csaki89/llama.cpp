@@ -44,3 +44,17 @@ A kimenet első ~200 karaktere: a rövid promptnál minden módban ugyanaz (" Th
 - 3 ismétlés, nagy szórás (különösen a gen sebességnél és a `host_noopoff` promptjánál), ezért a kisebb különbségek (pl. `repack` vs `repack_noopoff`) nem értelmezhetők.
 - Az iGPU és a CPU közös RAM-ot és közös hőkeretet használ, a mérés sorrendje (repack, host, ...) befolyásolhatja az eredményt.
 - A szkript első verziójában egy printf-hiba összeragasztotta a prompt nevét és a tokenszámot a TSV-ben. A szkriptet javítottam, a már lefutott mérés TSV-jét mechanikusan helyreállítottam (a nyers `.err`/`.out` fájlok érintetlenek, a számok nem változtak).
+
+## NAS-összevetés (ugyanaz a modell: Qwen2.5-1.5B Q4_K_M, ROCm, RX 6700)
+A NAS-os számokat a felhasználó adta meg, nem általam mért adatok. Prompt / generálás, tok/s, rövid / hosszú prompt.
+
+| | NAS (ROCm, RX 6700) | Laptop (Vulkan, Iris Xe) | NAS / laptop |
+|---|---|---|---|
+| csak CPU, prompt | 466 / 482 | 97,2 / 83,9 | 4,8x / 5,7x |
+| csak CPU, generálás | 39,2 / 37,5 | 25,3 / 20,5 | 1,5x / 1,8x |
+| teljes GPU, prompt | 2230 / 3510 | 344,3 / 402,6 | 6,5x / 8,7x |
+| teljes GPU, generálás | 160,6 / 155,4 | 21,0 / 20,2 | 7,6x / 7,7x |
+| GPU / CPU, prompt | 4,8x / 7,3x | 3,5x / 4,8x | |
+| GPU / CPU, generálás | 4,1x / 4,1x | 0,83x / 0,99x | |
+
+Következmény: a NAS-on a GPU generálásban kb. 4-szer gyorsabb a CPU-nál, a laptopon nem gyorsabb (sőt lassabb). A laptopon ezért a dual-buffer generálási hatása nem mérhető, csak a helyesség (puffer, kimenet) és a prompt-gyorsulás. A generálási nyereséget a NAS-on kell mérni.
