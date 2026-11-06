@@ -124,3 +124,27 @@ Laptop (Vulkan, Iris Xe iGPU), Qwen2.5-1.5B (28 réteg), `-ngl 14`, `--flex-laye
 - **Időtartam:** levétel rétegenként 0,6-3,2 ms (mező-csere és a puffer felszabadítása; a második réteg ugyanabban a lépésben <0,1 ms). Visszatétel rétegenként 20-67 ms (25-29 MiB a modellfájlból, meleg page cache mellett, foglalás + olvasás + feltöltés), kb. 0,5-1,4 GB/s. Hideg cache-sel lassabb lehet.
 - **Scheduler:** a gráf újraépítése (`gf_res_prev_active = nullptr`) elég; a CPU-s compute-puffert a `ggml_gallocr` szükség esetén magától átméretezi. A `LLAMA_FLEX_TEST_RESERVE=1` (teljes újrafoglalás, ~190 ms) ugyanazt a kimenetet adja (`35969901`), ezért alapból nem fut.
 - **Nem tesztelt:** ROCm/CUDA (backend-gráfok címváltozása), dedikált GPU eszközmemória-lekérdezése, MoE, több context egy modellen, hideg page cache, `llama-server`.
+
+## Flex rétegek: a K/V követi a réteget
+Laptop, ugyanaz a beállítás (`-ngl 14`, `--flex-layers 2`, hosszú prompt 1611 token, 200 generált token, `n_ctx` = 32768, f16 K/V). Szkript: `tools/dualbuf/flex-test.sh` (1 ismétlés esetenként). A flex rétegek K/V-je saját pufferben van: `Vulkan0 KV buffer size = 32.00 MiB (flex layer 26)` és `(flex layer 27)`, a többi GPU-s réteg K/V-je 352 MiB, a CPU-s rétegeké 480 MiB (összesen 896 MiB, mint opció nélkül).
+
+"VRAM" = a futás végi `common_memory_breakdown_print` Vulkan0 sora: self = model (súlyok) + context (K/V) + compute. "Hasítások" = a ténylegesen számolt gráfok hasításszáma (`sched_graph_realloc`), prompt / generálás.
+
+| eset | prompt / gen tok/s | md5 | VRAM self (model + K/V) MiB | hasítások prompt / gen |
+|---|---|---|---|---|
+| opció nélkül | 238,6 / 11,5 | 0063c4c5 | 1251 (526 + 416) | 212 / 2 |
+| flex, mozgatás nélkül | 241,7 / 11,6 | 0063c4c5 | 1251 (526 + 416) | 212 / 2 |
+| 26+27 végig levéve, K/V helyben (`LLAMA_FLEX_TEST_KV=0`) | 213,9 / 13,7 | 0063c4c5 | 1197 (472 + 416) | 233 / **14** |
+| 26+27 végig levéve, K/V is | 192,7 / 14,8 | 0063c4c5 | **1133 (472 + 352)** | 233 / **10** |
+| prompt GPU, levéve a generálásra, K/V helyben | 260,0 / 13,8 | 35969901 | 1197 (472 + 416) | 212 / 14 |
+| prompt GPU, levéve a generálásra, K/V is | 243,6 / 13,3 | 35969901 | 1133 (472 + 352) | 212 / 10 |
+| 27. le +50, vissza +100 tokennél | 247,3 / 13,8 | 0063c4c5 | 1251 (526 + 416) | 212 / 2 |
+| levéve a promptra, vissza a generálásra | 224,2 / 15,1 | 0063c4c5 | 1251 (526 + 416) | 233 / 2 |
+| `--dual-buffer`, 27. le +50, vissza +100 | 257,4 / 14,6 | 4d6570f3 | 1251 (526 + 416) | 212 / 2 |
+
+- **Felszabaduló VRAM:** két levett réteggel K/V nélkül 54 MiB (csak a súlyok), K/V-vel együtt **118 MiB** (53,72 MiB súly + 2 x 32 MiB K/V). A K/V a CPU-s pufferbe kerül (a CPU-s rétegek K/V-je mellé), visszatétel után a VRAM újra 1251 (526 + 416).
+- **A K/V átmásolása** (32 MiB rétegenként, a teljes lefoglalt K/V, 32768 cella): GPU -> CPU 148-234 ms, CPU -> GPU 11-18 ms. A visszaolvasás az iGPU-n (Vulkan) lassú; dedikált GPU-n (PCIe) mérendő. A súlyok mozgatása változatlan: levétel 0,2-3,2 ms, visszatétel 21-29 ms rétegenként.
+- **Hasítások:** a generálási gráf levett rétegekkel K/V nélkül 14, K/V-vel 10 hasítást ad (opció nélkül 2); a teljes újrafoglalás (`LLAMA_FLEX_TEST_RESERVE=1`) ugyanezt mutatja (tg 14 -> 10). A prompt-gráf 233 marad, mert ott a CPU-s rétegek host-pufferes súlyai op offloaddal mennek a GPU-ra, és ezek adják a hasítások nagy részét. A maradék 10-ből rétegenként 4 abból jön, hogy a scheduler a súly nélküli műveleteket (a maradék-összeadás, `ADD`/`RMS_NORM`) a bemenetük eszközére teszi, és a reziduális út a 25. (GPU-s) rétegtől a GPU-n van: `CPU (figyelem) -> Vulkan (ADD) -> CPU (FFN) -> Vulkan (ADD)` (`GGML_SCHED_DEBUG=2`). Ez a scheduler alapviselkedése egy GPU-s réteg mögötti CPU-s rétegnél, nem a flex sajátja; a K/V mozgatása a figyelemszámítás miatti váltásokat szünteti meg.
+- **Kimenet:** minden esetben értelmes, a generálás folytatódik. A K/V mozgatása a kimenetet nem változtatja meg ott, ahol a réteg a prompt és a generálás alatt ugyanott van (`0063c4c5`), és a "prompt GPU, generálás CPU" eset is ugyanazt adja K/V-vel és nélküle (`35969901`, az első eltérés az eredetitől a 421. bájtnál). A `--dual-buffer` + le/vissza eset `4d6570f3` (korábban, K/V nélkül `35969901`), az első eltérés a 421. bájtnál, a szöveg értelmes.
+- **Sebesség:** a laptopon nem mérvadó (iGPU, nagy szórás); a levett rétegekkel a generálás nem lassult (13,3-14,8 vs 11,5 tok/s opció nélkül).
+- **Nem tesztelt:** ROCm/HIP (HIP-gráfok, lásd DESIGN-3zone.md 4.), dedikált GPU, iSWA/hibrid memória, több sorozat (`n_stream` > 1).

@@ -975,6 +975,7 @@ struct llama_model {
 
     // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
     bool flex_move(int il, bool to_gpu) const;
+    bool flex_has_layer(int il) const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 

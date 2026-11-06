@@ -2386,6 +2386,11 @@ static void flex_swap_storage(ggml_tensor * a, ggml_tensor * b) {
     std::swap(a->extra,  b->extra);
 }
 
+bool llama_model::flex_has_layer(int il) const {
+    auto it = pimpl->flex.find(il);
+    return it != pimpl->flex.end() && it->second.buf_idx != SIZE_MAX;
+}
+
 bool llama_model::flex_move(int il, bool to_gpu) const {
     auto it = pimpl->flex.find(il);
     if (it == pimpl->flex.end() || it->second.buf_idx == SIZE_MAX) {

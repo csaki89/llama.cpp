@@ -389,6 +389,7 @@ private:
     std::vector<flex_test_step> flex_test;
     uint64_t flex_test_tokens  = 0;
     bool     flex_test_reserve = false; // LLAMA_FLEX_TEST_RESERVE=1: also re-reserve the scheduler after a move
+    bool     flex_test_kv      = true;  // LLAMA_FLEX_TEST_KV=0: keep the K/V in place when a layer moves
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

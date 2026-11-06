@@ -39,6 +39,14 @@ Hibakereső környezeti változó: `LLAMA_FLEX_TEST="<token>:<take|put>:<réteg>
 ### 2.6 Dual-bufferrel együtt
 A rugalmas sáv rétegei **kimaradnak a dual-buffer ikrekből** (azok eleve GPU-s tenzorok, nincs mit duplikálni). Levétel után a réteg a repackelt tartalékkal számol a CPU-n; az op offload erre a rétegre nem megy (a repack puffer nem host). A többi, CPU-n maradó réteg dual-buffer viselkedése változatlan. (Levett rétegek host-példánya mint `weight_alt` későbbi lépés lehet: a context-eknek futás közben be kellene jegyezni a schedulerbe.)
 
+### 2.7 A réteg KV-cache-e követi a réteget
+Ok: ha a K/V a GPU-n marad, a levett rétegben a mátrixszorzás a CPU-n, a figyelemszámítás (amely a K/V pufferéhez rendelődik) a GPU-n fut, ez tokenenként extra eszközváltásokat (gráfhasításokat) okoz, és a levétel kevesebb VRAM-ot szabadít fel. A llama.cpp alapból is annak az eszköznek a memóriájába teszi a réteg K/V-jét, ahol a réteg fut (`llama_kv_cache` konstruktor, `model.dev_layer(il)`), a levett réteg így ugyanúgy viselkedik, mint egy eleve CPU-n lévő.
+- **Betöltés:** a `llama_kv_cache` a flex rétegek (`model.flex_has_layer(il)`, csak `offload` mellett) K/V tenzorait rétegenként saját contextbe és pufferbe teszi (`flex_kv_layers`: a puffer indexe a `ctxs_bufs`-ban, a GPU-puffertípus, az aktuális hely). A többi réteg K/V-je a megszokott, puffertípusonként közös pufferben marad.
+- **Mozgatás (`llama_kv_cache::flex_move(il, to_gpu)`):** új puffer a céleszközön (CPU: a CPU-eszköz alap puffertípusa, mint egy CPU-s rétegnél; GPU: az eredeti), a K és V újrafoglalása benne (`ggml_tallocr`), a tartalom átmásolása (`ggml_backend_tensor_copy` a régi tárolóból), a stream-nézetek (`k_stream`/`v_stream`) címének frissítése, végül a régi puffer felszabadítása. A cellák (pozíciók, sorozatok) nem változnak, a tartalom bájtra azonos, ezért nem kell újraszámolni a promptot.
+- **Sorrend:** a context a súlyok mozgatása után mozgatja a K/V-t, ugyanabban a lépésben, szinkronizálás után, majd a következő gráf újraépül.
+- **Hatókör:** csak a sima `llama_kv_cache` (dinamikus cast a contextben); más memóriatípusnál (iSWA, hibrid, rekurrens) a K/V helyben marad, figyelmeztetéssel. A KV mérete nem változik (a dinamikus KV-méretezés nem része ennek a lépésnek).
+- **Összehasonlításhoz:** `LLAMA_FLEX_TEST_KV=0` helyben hagyja a K/V-t (az előző viselkedés).
+
 ## 3. Alternatívák (elvetve)
 - **Sched-szintű csere (`weight_alt` mintára):** a modell tenzora marad a GPU-n, a scheduler egy térképen át cserélné az ikerre. Minden contexttől regisztrációt igényel és a CPU-s számítás is a "GPU-s" tenzor köré épülne; a mező-csere egyszerűbb, mert a gráf és a scheduler változatlan marad.
 - **Új `ggml_tensor` mutatók a gráfépítőkben:** minden modellarchitektúrát érintene.
@@ -50,13 +58,21 @@ A rugalmas sáv rétegei **kimaradnak a dual-buffer ikrekből** (azok eleve GPU-
 - **Több context egy modellen:** a mező-csere a modellt módosítja, így a többi contextben lévő gráf elavulhat. Ebben a lépésben csak egy context támogatott (dokumentált korlát).
 - **Futó munka:** a csere előtt kötelező a szinkronizálás; a `decode()` eleje erre alkalmas.
 - **Backend-gráfok (CUDA graph stb.):** a címváltozást a backendek a gráf újraépítésénél kezelik; ROCm/CUDA-n külön ellenőrizendő (a laptopon Vulkan van).
+- **ROCm/HIP: a HIP-gráfok állapota.** A HIP backend (a CUDA-kód HIP-fordítása) a decode-gráfokat HIP-gráfként rögzítheti és újrajátszhatja; a rögzített gráf a súlyok és a K/V címét tartalmazza. A mozgatás után ellenőrizni kell a NAS-on, hogy a backend felismeri-e a címváltozást és újrarögzít-e (a csomópontok `src` adatcímeinek összevetése), és hogy egy felszabadított pufferre mutató rögzített gráf nem fut-e le (`GGML_CUDA_DISABLE_GRAPHS=1`-gyel összehasonlítva).
+- **A K/V másolása:** a másolás ideje a kontextusmérettel nő (a teljes lefoglalt K/V-t másolja, nem csak a használt cellákat), és a másolás alatt rövid ideig mindkét példány létezik (csúcs-memória a céleszközön + a forráson).
+- **Nem sima KV-cache:** iSWA/hibrid/rekurrens memóriánál a K/V nem mozog (2.7).
 - **Többeszközös gép, split-mode row:** a split puffer tenzoraira nem alkalmazzuk (kimarad a sávból).
 - **Nézetek:** ha egy réteg tenzorát nézetként használja a gráf, a nézet `data` mutatója a gráfépítéskor jön a szülőből, ezért újraépítés után helyes.
 - **Teljesítmény:** a visszatétel egy rétegnyi fájlolvasás + feltöltés; mérjük.
-- **Rebase:** `llama-model-loader.cpp/.h`, `llama-model.cpp/.h`, `llama-context.cpp`, `llama.h`, `common/arg.cpp`, `common/common.cpp/.h`.
+- **Rebase:** `llama-model-loader.cpp/.h`, `llama-model.cpp/.h`, `llama-kv-cache.cpp/.h`, `llama-context.cpp/.h`, `llama.h`, `common/arg.cpp`, `common/common.cpp/.h`.
+
+### Következő lépések
+- **A levett rétegek host-példánya (op offload).** Levett rétegnél a súly a repackelt tartalékban van, amit az op offload nem tud a GPU-ra küldeni, ezért a levett rétegek promptja lassabb. Következő lépés: a levett rétegekhez is legyen eredeti formájú host-példány (dual-buffer), és a context futás közben jegyezze be a schedulerbe (`ggml_backend_sched_set_weight_alt`), a visszatételkor pedig vegye ki.
+- A dinamikus KV-méretezés és a zónaváltási szabály (ROADMAP.md).
 
 ## 5. Megvalósítás: eltérések és mért eredmény
 - **Az iker puffertípusa:** a CPU-s pufferlistában alapból a GPU host-puffere áll elöl (repack előtt), ezért a `select_weight_buft(buft_list_cpu)` az ikreket a host-pufferbe tette volna, repack nélkül. Az iker ezért csak a CPU-eszköz saját puffertípusai közül választ (extra/repack, majd CPU).
 - **Scheduler:** a 2.4 pont feltevése igaz: a gráf újraépítése elég, a CPU compute-puffert a `ggml_gallocr` magától átméretezi; a teljes újrafoglalás (`LLAMA_FLEX_TEST_RESERVE=1`) ugyanazt a kimenetet adja, ezért nem kell.
 - **Fájlok:** a loader `files` listája a betöltés végén a modellhez kerül (a loadert a betöltés után semmi nem használja), a visszatétel ezekből olvas.
 - **Mért értékek** (laptop, részletek: test-results.md): levétel 0,6-3,2 ms/réteg, visszatétel 20-67 ms/réteg (~27 MiB), a modell VRAM-foglalása a levett rétegek méretével csökken (526 -> 472 MiB két réteggel).
+- **K/V mozgatása** (2.7, részletek: test-results.md): két levett réteggel a felszabaduló VRAM 54 MiB-ról 118 MiB-ra nő (súlyok + 2 x 32 MiB K/V), a generálási gráf hasításai 14-ről 10-re csökkennek. A K/V másolása rétegenként (32 MiB) GPU -> CPU 148-234 ms, CPU -> GPU 11-18 ms az iGPU-n. A maradék hasítások a reziduális út súly nélküli műveleteiből jönnek, amelyeket a scheduler a GPU-n hagy (alapviselkedés egy GPU-s réteg mögötti CPU-s rétegnél).

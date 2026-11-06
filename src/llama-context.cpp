@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-kv-cache.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -214,6 +215,8 @@ llama_context::llama_context(
         }
         const char * env_res = getenv("LLAMA_FLEX_TEST_RESERVE");
         flex_test_reserve = env_res && atoi(env_res) != 0;
+        const char * env_kv = getenv("LLAMA_FLEX_TEST_KV");
+        flex_test_kv = !env_kv || atoi(env_kv) != 0;
     }
 
     const auto & hparams = model.hparams;
@@ -2128,6 +2131,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             s.done = true;
             synchronize();
             if (model.flex_move(s.layer, s.to_gpu)) {
+                // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
+                if (flex_test_kv) {
+                    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                        kv->flex_move(s.layer, s.to_gpu);
+                    } else {
+                        LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
+                    }
+                }
                 // the weight placement changed: build the next graph again
                 gf_res_prev_active = nullptr;
                 if (flex_test_reserve) {

@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -258,7 +259,18 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // flex layers: move the K/V of a layer between its GPU buffer and the CPU, copying the content (DESIGN-3zone.md)
+    bool flex_move(int32_t il, bool to_gpu);
+
 private:
+    // flex layers: the K/V of the layer has its own buffer (index into ctxs_bufs)
+    struct flex_kv {
+        size_t buf_idx;
+        ggml_backend_buffer_type_t buft_gpu;
+        bool   on_gpu;
+    };
+    std::map<int32_t, flex_kv> flex_kv_layers;
+
     const llama_model & model;
     const llama_hparams & hparams;
 

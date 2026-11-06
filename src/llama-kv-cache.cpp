@@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // flex layers: layer -> (GPU buffer type, own context)
+    std::map<uint32_t, std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctx_flex;
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
@@ -222,7 +225,18 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
+        // flex layers: own context (and buffer) per layer, so the K/V can move with the layer
+        const bool flex = offload && model.flex_has_layer(il);
+        if (flex) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_flex.emplace(il, std::make_pair(buft, ggml_context_ptr(ggml_init(params))));
+        }
+
+        ggml_context * ctx = flex ? ctx_flex.at(il).second.get() : ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -278,6 +292,12 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+    for (auto & [il, bc] : ctx_flex) {
+        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(bc.second), bc.first, "kv cache");
+        flex_kv_layers[il] = { ctxs_bufs.bufs.size() - 1, bc.first, true };
+
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (flex layer %u)\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0, il);
     }
 
     {
@@ -2942,6 +2962,76 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
             }
         }
     }
+}
+
+bool llama_kv_cache::flex_move(int32_t il, bool to_gpu) {
+    auto it = flex_kv_layers.find(il);
+    if (it == flex_kv_layers.end()) {
+        return false;
+    }
+    auto & fk = it->second;
+    if (fk.on_gpu == to_gpu) {
+        return true;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    ggml_backend_buffer_type_t buft = fk.buft_gpu;
+    if (!to_gpu) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            return false;
+        }
+        buft = ggml_backend_dev_buffer_type(cpu_dev);
+    }
+
+    auto & layer = layers[map_layer_ids.at(il)];
+    std::vector<ggml_tensor *> tensors;
+    for (ggml_tensor * t : { layer.k, layer.v }) {
+        if (t) {
+            tensors.push_back(t);
+        }
+    }
+
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = 0;
+    for (ggml_tensor * t : tensors) {
+        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!buf) {
+        LLAMA_LOG_ERROR("%s: layer %d: failed to allocate %zu bytes in %s\n", __func__, il, size, ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_buffer_clear(buf, 0);
+
+    // allocate the K/V in the new buffer and copy the content from the old one
+    ggml_tallocr talloc = ggml_tallocr_new(buf);
+    for (ggml_tensor * t : tensors) {
+        ggml_tensor old = *t;
+        t->buffer = nullptr;
+        t->data   = nullptr;
+        ggml_tallocr_alloc(&talloc, t);
+        ggml_backend_tensor_copy(&old, t);
+    }
+
+    // the per-stream views point into the K/V
+    for (auto * views : { &layer.k_stream, &layer.v_stream }) {
+        for (ggml_tensor * v : *views) {
+            if (v && v->view_src) {
+                v->buffer = v->view_src->buffer;
+                v->data   = (char *) v->view_src->data + v->view_offs;
+            }
+        }
+    }
+
+    // frees the old buffer
+    ctxs_bufs.bufs[fk.buf_idx].second.reset(buf);
+    fk.on_gpu = to_gpu;
+
+    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %.1f ms)\n", __func__, il, ggml_backend_buft_name(buft),
+        size / 1024.0 / 1024.0, (ggml_time_us() - t_start_us) / 1000.0);
+    return true;
 }
 
 //
