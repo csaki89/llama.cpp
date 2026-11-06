@@ -23,8 +23,27 @@ Becslés a qwen3-coder:30b-re (32K kontextus): 1. zóna ~5,7 GB, 2. zóna ~3 GB,
 ### Dinamikus KV-foglalás: lehetőségek
 - **(a) Átméretezés küszöböknél, másolással.** A KV a használt hossz szerint lépcsőzetesen nő; átméretezéskor új puffer, másolás, régi felszabadítása. Egyszerű, de a másolás és a csúcs-memóriahasználat (régi + új egyszerre) költsége van, és a gráf-újrahasznosítást érinti.
 - **(b) Lapozott, blokkokban foglalt KV** (a vLLM PagedAttention mintájára). Rugalmas, de a figyelemszámító kernelek módosítását igényli minden backenden, ami nagy és invazív változtatás.
-- **(c) Virtuális memória.** A teljes kontextus címtartománya előre le van foglalva, fizikai memória csak a használt részhez van hozzárendelve (CUDA/HIP virtuális memória API), így a KV egybefüggő marad, a kernelek változatlanok. **Ez a jelölt.** Ellenőrizendő: a ROCm támogatása gfx1030-on (RX 6700), és a Vulkan megfelelője (sparse binding), ha a megoldás backend-független marad.
+- **(c) Virtuális memória.** A teljes kontextus címtartománya előre le van foglalva, fizikai memória csak a használt részhez van hozzárendelve (CUDA/HIP virtuális memória API), így a KV egybefüggő marad, a kernelek változatlanok. **Ez a jelölt, a ROCm-on megvalósíthatónak bizonyult (lásd alább).** Ellenőrizendő maradt a Vulkan megfelelője (sparse binding), ha a megoldás backend-független marad.
 
+
+#### A (c) változat NAS-os ellenőrzése (VMM-teszt)
+Környezet: RX 6700 (gfx1031), `HSA_OVERRIDE_GFX_VERSION=10.3.0`, ROCm 7.2.1, `rocm/dev-ubuntu-24.04:7.2.1`. A tesztprogramok (`vmm_test.cpp` ... `vmm_test4.cpp`) a NAS-on vannak, a repóban nincsenek.
+
+Mért tények:
+- A VMM támogatott (`hipDeviceAttributeVirtualMemoryManagementSupported` = 1), a legkisebb egység 4 KiB.
+- A címtartomány lefoglalása nem fogyaszt VRAM-ot. Több darab egymás után leképezve egybefüggő memóriaként írható.
+- Egy darab leválasztása (`hipMemUnmap` + `hipMemRelease`) a címtartomány megtartásával **nem adja vissza a VRAM-ot**: a HIP visszatartja, és csak ugyanabba a címtartományba újraleképezéskor használja újra (más méretben is). Más címtartományba vagy sima `hipMalloc`-hoz nem. A VRAM csak a címtartomány felszabadításával (`hipMemAddressFree`) jön vissza.
+- A `hipMemAddressReserve` kért címe csak javaslat: egymás mögé kért külön tartományok máshova kerültek.
+- Egyetlen 1 GiB-os `hipMemCreate`-darab megbízhatatlan: 5-ből 5 futás GPU-laphibával összeomlott. 2, 64 és 256 MiB-os darabokkal minden futás hibátlan.
+- Sávszélesség (1 GiB olvasása, 20 ismétlés): `hipMalloc` 317 GB/s, VMM 64 MiB-os és 2 MiB-os darabokkal 317 GB/s (az elméleti 320 GB/s 99%-a). Ha a VMM-foglalás ugyanabban a folyamatban egy `hipMalloc`-terület felszabadítása után jön, 303-304 GB/s (kb. -4%, minden futásban).
+
+Következmények a tervre:
+- A (c) változat **megvalósítható** ezen a kártyán.
+- Darabméret legfeljebb 64-256 MiB, a súlyoknál és a KV-nél közös egységmérettel.
+- A 2. zóna rétegeinek nem kell állandó cím: levételkor a súlyok a címtartományukkal együtt szabadulnak fel, visszatöltéskor új címre kerülnek, és a tenzor mutatója frissül (ez a számítási terv újraépítésével jár együtt).
+- A KV egyetlen nagy címtartományban nő. Csökkentés csak új beszélgetésnél, a teljes KV-tartomány felszabadításával és újrakezdésével (darabonkénti visszaadás nem szabadít VRAM-ot).
+- A -4%-os eltérést a `hipMalloc` után a valódi megvalósításban is meg kell mérni.
+- Nyitott: a Vulkan megfelelője (sparse binding) nincs megvizsgálva; a VMM-teszt csak ROCm-ra vonatkozik.
 
 ### Szükséges építőkockák
 - **Dinamikus KV-foglalás.** Ma a KV-cache a context létrehozásakor fix méretben foglalódik. A rugalmas sáv akkor ér valamit, ha a KV növekedhet (vagy zsugorodhat) futás közben, és a felszabaduló/lefoglalt VRAM a sávval kiegyenlíthető. Kérdés: szegmentált KV vagy újrafoglalás; a `llama_kv_cache` és a `--fit` kölcsönhatása.
