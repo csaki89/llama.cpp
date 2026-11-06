@@ -219,6 +219,10 @@ llama_context::llama_context(
         flex_test_reserve = env_res && atoi(env_res) != 0;
         const char * env_kv = getenv("LLAMA_FLEX_TEST_KV");
         flex_test_kv = !env_kv || atoi(env_kv) != 0;
+        const char * env_host = getenv("LLAMA_FLEX_TEST_HOST");
+        flex_use_host = !env_host || atoi(env_host) != 0;
+        const char * env_file = getenv("LLAMA_FLEX_TEST_FILE");
+        flex_test_file = env_file && atoi(env_file) != 0;
     }
 
     const auto & hparams = model.hparams;
@@ -814,9 +818,20 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     for (const auto & [w, copy] : model.dual_weights) {
         ggml_backend_sched_set_weight_alt(sched.get(), w, copy);
     }
+    for (int il : model.flex_layers()) {
+        flex_set_alts(il);
+    }
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+}
+
+void llama_context::flex_set_alts(int il) {
+    // a flex layer that is off uses its host copies for op offload, like a dual-buffer CPU layer
+    const bool off = !model.flex_on_gpu(il) && flex_use_host;
+    for (const auto & [w, host] : model.flex_host_copies(il)) {
+        ggml_backend_sched_set_weight_alt(sched.get(), w, off ? host : nullptr);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -2135,7 +2150,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (s.layer < 0) {
                 s.layer = model.flex_next(s.to_gpu);
             }
-            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu)) {
+            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file)) {
+                if (sched) {
+                    flex_set_alts(s.layer);
+                }
                 // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
                 if (flex_test_kv) {
                     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {

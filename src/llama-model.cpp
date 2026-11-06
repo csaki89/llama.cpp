@@ -1801,6 +1801,84 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
 
+    // RAM guard (DECISIONS.md 12-14, 17): free RAM, the RAM-resident part of the model, and the zone 2 copies of the flex layers
+    size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0;
+    const char * ram_src = "system";
+    bool flex_off = params.flex_layers == 0 || ml.use_mmap;
+    if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off) {
+        size_t cg_free = 0, cg_limit = 0;
+        ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (ram_dev) {
+            ggml_backend_dev_memory(ram_dev, &ram_free, &ram_total);
+        }
+        // a cgroup memory limit applies instead of the system memory
+        if (get_cgroup_free(cg_free, cg_limit)) {
+            ram_free  = cg_free;
+            ram_total = cg_limit;
+            ram_src   = "cgroup limit";
+        }
+        if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
+            ram_free  = (size_t) atoll(env) * 1024 * 1024;
+            ram_total = std::max(ram_total, ram_free);
+            ram_src   = "env override";
+        }
+        ram_reserve = std::max((size_t) 1 << 30, ram_total / 20);
+
+        // bytes of weights that stay in RAM: from the tensors' placement (layer split and tensor overrides), so a --fit result is covered
+        // unknown placement counts as CPU, which gives a smaller budget
+        const int n_gpu = (int) std::min(this->n_gpu_layers(), (uint32_t) hparams.n_layer_all + 1);
+        const int i_gpu_start_est = std::max((int) hparams.n_layer_all + 1 - n_gpu, 0);
+        const int flex_end_est = flex_off ? i_gpu_start_est : std::min(i_gpu_start_est + (int) params.flex_layers, (int) hparams.n_layer_all);
+        std::vector<std::pair<std::regex, bool>> ovr; // (pattern, stays in RAM)
+        for (auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
+            auto * od = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
+            ovr.emplace_back(std::regex(o->pattern), !od || ggml_backend_buft_is_host(o->buft) || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
+        }
+        for (const auto & it : ml.weights_map) {
+            const std::string & name = it.first;
+            bool in_ram = true;
+            bool decided = false;
+            for (const auto & o : ovr) {
+                if (std::regex_search(name, o.first)) {
+                    in_ram  = o.second;
+                    decided = true;
+                    break;
+                }
+            }
+            int il = -1;
+            const bool is_layer = name.compare(0, 4, "blk.") == 0 && sscanf(name.c_str() + 4, "%d", &il) == 1;
+            if (!decided) {
+                if (is_layer) {
+                    in_ram = il < i_gpu_start_est;
+                } else if (name.compare(0, 10, "token_embd") != 0) {
+                    in_ram = n_gpu <= hparams.n_layer_all; // output tensors
+                }
+            }
+            if (in_ram) {
+                ram_cpu_part += ggml_nbytes(it.second.tensor);
+            } else if (is_layer && il >= i_gpu_start_est && il < flex_end_est) {
+                ram_flex += 2*ggml_nbytes(it.second.tensor); // zone 2: repacked copy + host copy
+            }
+        }
+
+        // flex: without room for both RAM copies, drop the host copies (put back from the model file), or the flex band
+        if (!flex_off && ram_total > 0) {
+            if (ram_free < ram_cpu_part + ram_flex + ram_reserve) {
+                if (ram_free >= ram_cpu_part + ram_flex/2 + ram_reserve) {
+                    LLAMA_LOG_WARN("%s: flex: not enough free RAM for the host copies (%.0f MiB), the layers go back from the model file\n", __func__, ram_flex / 2 / 1024.0 / 1024.0);
+                    ml.flex_no_host = true;
+                    ram_flex /= 2;
+                } else {
+                    LLAMA_LOG_WARN("%s: flex: not enough free RAM for the CPU copies (%.0f MiB), disabling --flex-layers\n", __func__, ram_flex / 2 / 1024.0 / 1024.0);
+                    flex_off = true;
+                    ram_flex = 0;
+                }
+            }
+            LLAMA_LOG_INFO("%s: flex: free RAM %.0f MiB (%s), CPU part ~%.0f MiB, flex copies %.0f MiB, reserve %.0f MiB\n", __func__,
+                ram_free / 1024.0 / 1024.0, ram_src, ram_cpu_part / 1024.0 / 1024.0, ram_flex / 1024.0 / 1024.0, ram_reserve / 1024.0 / 1024.0);
+        }
+    }
+
     // dual-buffer: find the host buffer type that holds the original-format copies (same choice as make_cpu_buft_list)
     if (params.dual_buffer) {
         if (ml.use_mmap) {
@@ -1826,63 +1904,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (params.dual_buffer_limit_mib > 0) {
                     ml.dual_max_bytes = (size_t) params.dual_buffer_limit_mib * 1024 * 1024;
                 } else {
-                    // no manual limit: keep the copies within the free RAM minus the CPU part of the model and a reserve
-                    size_t ram_free = 0, ram_total = 0, cg_free = 0, cg_limit = 0;
-                    const char * ram_src = "system";
-                    ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                    if (ram_dev) {
-                        ggml_backend_dev_memory(ram_dev, &ram_free, &ram_total);
-                    }
-                    // a cgroup memory limit applies instead of the system memory
-                    if (get_cgroup_free(cg_free, cg_limit)) {
-                        ram_free  = cg_free;
-                        ram_total = cg_limit;
-                        ram_src   = "cgroup limit";
-                    }
-                    if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
-                        ram_free  = (size_t) atoll(env) * 1024 * 1024;
-                        ram_total = std::max(ram_total, ram_free);
-                        ram_src   = "env override";
-                    }
+                    // no manual limit: keep the copies within the free RAM minus the CPU part of the model, the flex copies and a reserve
                     if (ram_total > 0) {
-                        // bytes of weights that stay in RAM: from the tensors' placement (layer split and tensor overrides), so a --fit result is covered
-                        // unknown placement counts as CPU, which gives a smaller budget
-                        const int n_gpu = (int) std::min(this->n_gpu_layers(), (uint32_t) hparams.n_layer_all + 1);
-                        const int i_gpu_start_est = std::max((int) hparams.n_layer_all + 1 - n_gpu, 0);
-                        std::vector<std::pair<std::regex, bool>> ovr; // (pattern, stays in RAM)
-                        for (auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
-                            auto * od = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
-                            ovr.emplace_back(std::regex(o->pattern), !od || ggml_backend_buft_is_host(o->buft) || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(od) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
-                        }
-                        size_t cpu_part = 0;
-                        for (const auto & it : ml.weights_map) {
-                            const std::string & name = it.first;
-                            bool in_ram = true;
-                            bool decided = false;
-                            for (const auto & o : ovr) {
-                                if (std::regex_search(name, o.first)) {
-                                    in_ram  = o.second;
-                                    decided = true;
-                                    break;
-                                }
-                            }
-                            if (!decided) {
-                                int il = -1;
-                                if (name.compare(0, 4, "blk.") == 0 && sscanf(name.c_str() + 4, "%d", &il) == 1) {
-                                    in_ram = il < i_gpu_start_est;
-                                } else if (name.compare(0, 10, "token_embd") != 0) {
-                                    in_ram = n_gpu <= hparams.n_layer_all; // output tensors
-                                }
-                            }
-                            if (in_ram) {
-                                cpu_part += ggml_nbytes(it.second.tensor);
-                            }
-                        }
-                        const size_t reserve  = std::max((size_t) 1 << 30, ram_total / 20);
-                        const size_t need     = cpu_part + reserve;
+                        const size_t need     = ram_cpu_part + ram_flex + ram_reserve;
                         const size_t budget   = ram_free > need ? ram_free - need : 0;
-                        LLAMA_LOG_INFO("%s: dual-buffer: free RAM %.0f MiB (%s), CPU part ~%.0f MiB, reserve %.0f MiB, copy budget %.0f MiB\n", __func__,
-                            ram_free / 1024.0 / 1024.0, ram_src, cpu_part / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0, budget / 1024.0 / 1024.0);
+                        LLAMA_LOG_INFO("%s: dual-buffer: free RAM %.0f MiB (%s), CPU part ~%.0f MiB, flex copies %.0f MiB, reserve %.0f MiB, copy budget %.0f MiB\n", __func__,
+                            ram_free / 1024.0 / 1024.0, ram_src, ram_cpu_part / 1024.0 / 1024.0, ram_flex / 1024.0 / 1024.0, ram_reserve / 1024.0 / 1024.0, budget / 1024.0 / 1024.0);
                         if (budget == 0) {
                             LLAMA_LOG_WARN("%s: dual-buffer: not enough free RAM for the copies, disabling it\n", __func__);
                             ml.dual_host_buft = nullptr;
@@ -1951,7 +1978,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.flex_layers > 0) {
         if (ml.use_mmap) {
             LLAMA_LOG_WARN("%s: --flex-layers requires --load-mode none, disabling it\n", __func__);
-        } else {
+        } else if (!flex_off) {
             ml.flex_lo = i_gpu_start;
             ml.flex_hi = std::min(i_gpu_start + (int) params.flex_layers, n_layer_all) - 1;
             if (ml.flex_lo > ml.flex_hi) {
@@ -2181,6 +2208,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     for (const auto & p : ml.flex_pairs) {
         dual_copies.insert(p.cpu);
+        if (p.host) {
+            dual_copies.insert(p.host);
+        }
         pimpl->flex[p.layer].pairs.push_back(p);
     }
     dual_weights = ml.dual_pairs;
@@ -2366,15 +2396,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!pimpl->flex.empty()) {
         // the loader is not used after load_tensors, keep its files to reload the GPU copies
         pimpl->flex_files = std::move(ml.files);
-        size_t n_pairs = 0, n_bytes_flex = 0;
+        size_t n_pairs = 0, n_bytes_flex = 0, n_host = 0, n_bytes_host = 0;
         for (const auto & [il, fl] : pimpl->flex) {
             for (const auto & p : fl.pairs) {
                 n_pairs++;
                 n_bytes_flex += ggml_nbytes(p.gpu);
+                if (p.host) {
+                    n_host++;
+                    n_bytes_host += ggml_nbytes(p.host);
+                }
             }
         }
-        LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB)\n", __func__,
-            pimpl->flex.begin()->first, pimpl->flex.rbegin()->first, n_pairs, n_bytes_flex / 1024.0 / 1024.0);
+        LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB), %zu with a host copy (%.2f MiB)\n", __func__,
+            pimpl->flex.begin()->first, pimpl->flex.rbegin()->first, n_pairs, n_bytes_flex / 1024.0 / 1024.0, n_host, n_bytes_host / 1024.0 / 1024.0);
     }
 
     return true;
@@ -2409,7 +2443,35 @@ bool llama_model::flex_has_layer(int il) const {
     return it != pimpl->flex.end() && it->second.buf_idx != SIZE_MAX;
 }
 
-bool llama_model::flex_move(int il, bool to_gpu) const {
+bool llama_model::flex_on_gpu(int il) const {
+    auto it = pimpl->flex.find(il);
+    return it == pimpl->flex.end() || it->second.on_gpu;
+}
+
+std::vector<std::pair<ggml_tensor *, ggml_tensor *>> llama_model::flex_host_copies(int il) const {
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> res;
+    auto it = pimpl->flex.find(il);
+    if (it != pimpl->flex.end()) {
+        for (const auto & p : it->second.pairs) {
+            if (p.host) {
+                res.emplace_back(p.gpu, p.host);
+            }
+        }
+    }
+    return res;
+}
+
+std::vector<int> llama_model::flex_layers() const {
+    std::vector<int> res;
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.buf_idx != SIZE_MAX) {
+            res.push_back(il);
+        }
+    }
+    return res;
+}
+
+bool llama_model::flex_move(int il, bool to_gpu, bool from_file) const {
     auto it = pimpl->flex.find(il);
     if (it == pimpl->flex.end() || it->second.buf_idx == SIZE_MAX) {
         LLAMA_LOG_WARN("%s: layer %d is not a flex layer\n", __func__, il);
@@ -2420,10 +2482,12 @@ bool llama_model::flex_move(int il, bool to_gpu) const {
         return true;
     }
 
-    const int64_t t_start_us = ggml_time_us();
+    const int64_t t0 = ggml_time_us();
+    int64_t t_alloc = 0, t_copy = 0, t_free = 0;
     auto & bufs = pimpl->ctxs_bufs[fl.buf_idx].second;
     ggml_backend_buffer_type_t buft = fl.pairs[0].buft;
     size_t nbytes = 0;
+    int n_host = 0, n_cpu = 0, n_file = 0;
 
     if (!to_gpu) {
         // the model tensors take the CPU storage, then the layer's GPU buffer is freed
@@ -2431,19 +2495,23 @@ bool llama_model::flex_move(int il, bool to_gpu) const {
             flex_swap_storage(p.gpu, p.cpu);
             nbytes += ggml_nbytes(p.gpu);
         }
+        const int64_t t1 = ggml_time_us();
         bufs.clear();
+        t_free = ggml_time_us() - t1;
         for (auto & p : fl.pairs) {
             p.cpu->buffer = nullptr;
             p.cpu->data   = nullptr;
             p.cpu->extra  = nullptr;
         }
     } else {
-        // new GPU buffer for the twins, data from the model file, then swap back
+        // new GPU buffer for the twins, then swap back
+        // data source: the host copy (zone 2), else the CPU copy if it is host-readable (not repacked), else the model file
         const size_t align = ggml_backend_buft_get_alignment(buft);
         size_t size = 0;
         for (auto & p : fl.pairs) {
             size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, p.cpu), align);
         }
+        const int64_t t1 = ggml_time_us();
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
         if (!buf) {
             LLAMA_LOG_ERROR("%s: layer %d: failed to allocate %zu bytes in %s\n", __func__, il, size, ggml_backend_buft_name(buft));
@@ -2451,29 +2519,48 @@ bool llama_model::flex_move(int il, bool to_gpu) const {
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_tallocr talloc = ggml_tallocr_new(buf);
-        std::vector<uint8_t> tmp;
         for (auto & p : fl.pairs) {
             ggml_tallocr_alloc(&talloc, p.cpu);
+        }
+        t_alloc = ggml_time_us() - t1;
+
+        const int64_t t2 = ggml_time_us();
+        std::vector<uint8_t> tmp;
+        for (auto & p : fl.pairs) {
             const size_t n = ggml_nbytes(p.cpu);
-            tmp.resize(n);
-            auto & file = pimpl->flex_files.at(p.file_idx);
-            file->seek(p.offs, SEEK_SET);
-            file->read_raw(tmp.data(), n);
-            ggml_backend_tensor_set(p.cpu, tmp.data(), 0, n);
-            flex_swap_storage(p.gpu, p.cpu);
+            // p.gpu holds the CPU storage while the layer is off
+            if (!from_file && p.host) {
+                ggml_backend_tensor_set(p.cpu, p.host->data, 0, n);
+                n_host++;
+            } else if (!from_file && ggml_backend_buffer_is_host(p.gpu->buffer)) {
+                ggml_backend_tensor_set(p.cpu, p.gpu->data, 0, n);
+                n_cpu++;
+            } else {
+                tmp.resize(n);
+                auto & file = pimpl->flex_files.at(p.file_idx);
+                file->seek(p.offs, SEEK_SET);
+                file->read_raw(tmp.data(), n);
+                ggml_backend_tensor_set(p.cpu, tmp.data(), 0, n);
+                n_file++;
+            }
             nbytes += n;
         }
+        for (auto & p : fl.pairs) {
+            flex_swap_storage(p.gpu, p.cpu);
+        }
+        t_copy = ggml_time_us() - t2;
         bufs.emplace_back(buf);
     }
     fl.on_gpu = to_gpu;
-    const double t_ms = (ggml_time_us() - t_start_us) / 1000.0;
+    const double t_ms = (ggml_time_us() - t0) / 1000.0;
 
     size_t dev_free = 0, dev_total = 0;
     if (auto * dev = ggml_backend_buft_get_device(buft)) {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
     }
-    LLAMA_LOG_INFO("%s: layer %d moved to %s (%.2f MiB, %.1f ms), device free memory %.2f MiB\n", __func__, il,
-        to_gpu ? ggml_backend_buft_name(buft) : "CPU", nbytes / 1024.0 / 1024.0, t_ms, dev_free / 1024.0 / 1024.0);
+    LLAMA_LOG_INFO("%s: layer %d moved to %s (%.2f MiB, %.1f ms: alloc %.1f, copy %.1f, free %.1f; source host/cpu/file %d/%d/%d), device free memory %.2f MiB\n",
+        __func__, il, to_gpu ? ggml_backend_buft_name(buft) : "CPU", nbytes / 1024.0 / 1024.0, t_ms,
+        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0, n_host, n_cpu, n_file, dev_free / 1024.0 / 1024.0);
     return true;
 }
 

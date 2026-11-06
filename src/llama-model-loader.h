@@ -178,6 +178,7 @@ struct llama_model_loader {
     struct flex_pair {
         ggml_tensor * gpu;  // the model tensor
         ggml_tensor * cpu;  // twin in the CPU buffer
+        ggml_tensor * host; // original-format copy in the device host buffer (only for a repacked twin), or NULL
         int           layer;
         ggml_backend_buffer_type_t buft; // GPU buffer type
         uint16_t      file_idx;
@@ -185,6 +186,7 @@ struct llama_model_loader {
     };
     int flex_lo = -1;
     int flex_hi = -1;
+    bool flex_no_host = false; // RAM guard: no host copies (the layers go back from the model file)
     std::vector<flex_pair> flex_pairs;
 
     // track tensors that had to be moved for debugging:

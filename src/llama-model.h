@@ -974,8 +974,12 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
 
     // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
-    bool flex_move(int il, bool to_gpu) const;
+    bool flex_move(int il, bool to_gpu, bool from_file = false) const;
     bool flex_has_layer(int il) const;
+    bool flex_on_gpu(int il) const;
+    std::vector<int> flex_layers() const;
+    // (model tensor, original-format host copy) of a flex layer, registered with the scheduler while the layer is off
+    std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> flex_host_copies(int il) const;
     int  flex_next(bool to_gpu) const; // next layer to take (to_gpu = false) or put back, -1 if none
     ggml_backend_dev_t flex_gpu_dev(int il) const; // the GPU device of a flex layer (dev_layer() is the CPU while it is taken off)
     llama_split_mode split_mode() const;

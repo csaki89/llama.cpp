@@ -20,3 +20,4 @@
 ## Háromzónás terv, rugalmas sáv (`--flex-layers`)
 - 1. építőkocka: rétegek áthelyezése futás közben, K/V követése: kész (`3e60401dc`, `a6dd34d00`).
 - Befejezés, 1. lépés (a sáv helye): kész. A sáv a GPU-s rétegek első N rétege, a levétel a határ felől halad; a `dev_layer()` levett rétegnél a CPU (DECISIONS.md 15-16). Levett rétegekkel a generálási gráf 2 hasítású (0, 1, 2 levett réteg: 2 / 2 / 2).
+- 2. lépés (a 2. zóna host-példánya): kész. Levett rétegnél op offload a host-példányból, a visszatétel a host-példányból (4-7 ms/réteg, fájlból 23-106 ms). Egy végig levett réteg kimenete bájtra azonos a `-ngl 13 --dual-buffer` futáséval (DECISIONS.md 17-18).

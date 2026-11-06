@@ -1169,6 +1169,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // set by buft_for_tensor() for a GPU weight in the flex layer range: buffer type of its CPU twin
     ggml_backend_buffer_type_t flex_cpu_buft = nullptr;
+    ggml_backend_buffer_type_t flex_host_buft = nullptr; // set if the twin is repacked: original-format copy in the host buffer
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1332,6 +1333,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     }
                 }
                 flex_cpu_buft = select_weight_buft(hparams, t_meta, op, &cpu_only);
+                // zone 2: a repacked twin is not host-readable, so keep an original-format copy in the device host buffer too
+                // (op offload while the layer is off, and the source when it goes back to the GPU)
+                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev_w);
+                if (!flex_no_host && flex_cpu_buft && !ggml_backend_buft_is_host(flex_cpu_buft) && host_buft && weight_buft_supported(hparams, t_meta, op, host_buft, dev_w)) {
+                    flex_host_buft = host_buft;
+                }
             }
         }
 
@@ -1446,9 +1453,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         struct ggml_tensor * twin = ggml_dup_tensor(ctx_for_buft(flex_cpu_buft), &t_meta);
         ggml_set_name(twin, ggml_get_name(&t_meta));
         size_data += ggml_nbytes(&t_meta);
+        struct ggml_tensor * host = nullptr;
+        if (flex_host_buft) {
+            host = ggml_dup_tensor(ctx_for_buft(flex_host_buft), &t_meta);
+            ggml_set_name(host, ggml_get_name(&t_meta));
+            size_data += ggml_nbytes(&t_meta);
+        }
         const auto it_w = weights_map.find(tn.str());
         GGML_ASSERT(it_w != weights_map.end());
-        flex_pairs.push_back({ tensor, twin, tn.bid, buft, it_w->second.idx, it_w->second.offs });
+        flex_pairs.push_back({ tensor, twin, host, tn.bid, buft, it_w->second.idx, it_w->second.offs });
     }
 
     return tensor;
