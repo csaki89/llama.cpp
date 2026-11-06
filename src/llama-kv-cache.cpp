@@ -295,7 +295,9 @@ llama_kv_cache::llama_kv_cache(
     }
     for (auto & [il, bc] : ctx_flex) {
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(bc.second), bc.first, "kv cache");
-        flex_kv_layers[il] = { ctxs_bufs.bufs.size() - 1, bc.first, true };
+        // the layer may already be taken off when the context is created
+        ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(model.flex_gpu_dev(il));
+        flex_kv_layers[il] = { ctxs_bufs.bufs.size() - 1, buft_gpu, bc.first == buft_gpu };
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (flex layer %u)\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0, il);
     }

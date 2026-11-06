@@ -207,7 +207,9 @@ llama_context::llama_context(
             unsigned long long at = 0;
             char op[8] = {};
             int layer = -1;
-            if (sscanf(item.c_str(), "%llu:%7[a-z]:%d", &at, op, &layer) == 3 && (strcmp(op, "take") == 0 || strcmp(op, "put") == 0)) {
+            // "<tokens>:<take|put>" moves the next layer in the band order, "<tokens>:<take|put>:<layer>" a given one
+            const int n_read = sscanf(item.c_str(), "%llu:%7[a-z]:%d", &at, op, &layer);
+            if (n_read >= 2 && (strcmp(op, "take") == 0 || strcmp(op, "put") == 0)) {
                 flex_test.push_back({ (uint64_t) at, strcmp(op, "put") == 0, layer, false });
             } else {
                 LLAMA_LOG_WARN("%s: LLAMA_FLEX_TEST: ignoring '%s'\n", __func__, item.c_str());
@@ -2130,7 +2132,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (!s.done && flex_test_tokens >= s.at) {
             s.done = true;
             synchronize();
-            if (model.flex_move(s.layer, s.to_gpu)) {
+            if (s.layer < 0) {
+                s.layer = model.flex_next(s.to_gpu);
+            }
+            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu)) {
                 // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
                 if (flex_test_kv) {
                     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {

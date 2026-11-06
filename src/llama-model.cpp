@@ -1947,13 +1947,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
 
-    // flex layers: the last N GPU layers can move to the CPU at runtime (DESIGN-3zone.md)
+    // flex layers: the first N GPU layers (next to the CPU layers) can move to the CPU at runtime (DESIGN-3zone.md)
     if (params.flex_layers > 0) {
         if (ml.use_mmap) {
             LLAMA_LOG_WARN("%s: --flex-layers requires --load-mode none, disabling it\n", __func__);
         } else {
-            ml.flex_lo = std::max(n_layer_all - (int) params.flex_layers, i_gpu_start);
-            ml.flex_hi = n_layer_all - 1;
+            ml.flex_lo = i_gpu_start;
+            ml.flex_hi = std::min(i_gpu_start + (int) params.flex_layers, n_layer_all) - 1;
             if (ml.flex_lo > ml.flex_hi) {
                 ml.flex_lo = ml.flex_hi = -1;
             }
@@ -2384,6 +2384,24 @@ static void flex_swap_storage(ggml_tensor * a, ggml_tensor * b) {
     std::swap(a->buffer, b->buffer);
     std::swap(a->data,   b->data);
     std::swap(a->extra,  b->extra);
+}
+
+int llama_model::flex_next(bool to_gpu) const {
+    // take: the GPU flex layer closest to the CPU layers; put: the last one taken (reverse order)
+    if (to_gpu) {
+        for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
+            if (!it->second.on_gpu) {
+                return it->first;
+            }
+        }
+    } else {
+        for (const auto & [il, fl] : pimpl->flex) {
+            if (fl.on_gpu) {
+                return il;
+            }
+        }
+    }
+    return -1;
 }
 
 bool llama_model::flex_has_layer(int il) const {
@@ -3095,6 +3113,15 @@ void llama_model::print_info() const {
 }
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
+    // a flex layer that was taken off the GPU runs on the CPU, like a CPU layer
+    auto it = pimpl->flex.find(il);
+    if (it != pimpl->flex.end() && !it->second.on_gpu) {
+        return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return pimpl->dev_layer.at(il).dev;
+}
+
+ggml_backend_dev_t llama_model::flex_gpu_dev(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 

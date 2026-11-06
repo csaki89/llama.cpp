@@ -16,3 +16,7 @@
 
 ## 5. fázis (zárás): kész
 - `docs/SUMMARY.md` megírva. Az éjszakai munka vége; a branch nincs pusholva.
+
+## Háromzónás terv, rugalmas sáv (`--flex-layers`)
+- 1. építőkocka: rétegek áthelyezése futás közben, K/V követése: kész (`3e60401dc`, `a6dd34d00`).
+- Befejezés, 1. lépés (a sáv helye): kész. A sáv a GPU-s rétegek első N rétege, a levétel a határ felől halad; a `dev_layer()` levett rétegnél a CPU (DECISIONS.md 15-16). Levett rétegekkel a generálási gráf 2 hasítású (0, 1, 2 levett réteg: 2 / 2 / 2).
