@@ -71,3 +71,7 @@ Alapelv: a modell két tenzort tart minden repackelt CPU-s súlyhoz: az elsődle
 ## 5. Upstream keresés (`gh search`)
 - Keresések: "dual buffer", "op offload repack", "CPU_REPACK offload", "extra buffer op_offload", "host buffer prompt processing repack", "no-host" (issue-k és PR-ok).
 - Eredmény: nincs olyan issue vagy PR, amely ezt a megoldást vagy egy hasonlót tartalmazna. Az egyetlen kapcsolódó a #31538 (a címe a keresés szerint csak "Misc. bug:", nyitott, `bug-unconfirmed`). A tartalmát nem tudtam elolvasni, mert a `gh issue` és a `gh api` ebben a projektben tiltott, így a CLAUDE.md-ben leírt "host-puffer prioritás" témát nem ellenőriztem.
+
+## 6. Kiegészítések (dual-buffer v2)
+- **Pufferlista sorrend:** dual módban az elsődleges lista: ACCEL, extra pufferek (CPU_REPACK), device host-puffer, sima CPU. A 2.1/2. pont "host-puffer nélkül épül" kitétele ezzel módosul: a nem repackelhető tenzorok a host-pufferbe kerülnek (op offload rögzített memóriából), a repackelhetők továbbra is a repackbe és ikert kapnak.
+- **RAM-védelem:** `--dual-buffer-limit` nélkül a betöltő a szabad RAM-ból számol keretet (DECISIONS.md 12.), és vág vagy kikapcsol, naplózva. Ez oldja meg a 2.3 pontban rögzített korlátot (a `--fit` nem ellenőrizte a host RAM-ot).

@@ -65,3 +65,14 @@ A 4. fázis után az alapviselkedés újra ellenőrizve (ugyanaz a bináris): re
 
 ## Figyelmeztetés a mérési módszerhez
 A kimenet md5-jének összehasonlításakor a stderr-t **fájlba** kell irányítani (ahogy a `bench.sh` teszi). Ha a stderr `/dev/null`-ra (Windowson NUL) megy, a program ANSI színkódokat ír a kimenetbe (+9 bájt), és az md5 eltér, miközben a modell kimenete azonos. Ezt egy hibás kézi ellenőrzés közben vettem észre.
+
+## v2: host-puffer a nem repackelhető tenzoroknak + RAM-védelem
+Laptop, Qwen2.5-1.5B, `-ngl 14`, a bench.sh teljes sorozata (3 ismétlés).
+- **Elfogadási feltételek:** minden mód md5-je azonos a korábbiakkal (rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`). A `dual_noopoff` = repack kimenet, a dual prompt a host szintjén: hosszú dual 330,0 (322,9-333,7) vs host 317,2 vs repack 122,6 tok/s; rövid dual 214,2 (153,4-261,5; nagy szórás) vs host 238,5. Generálás: dual 19,8, repack 19,2, host 18,7 (laptopon nem mérvadó).
+- **Pufferek dual módban:** `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33` - sima `CPU` puffer nincs (korábban `CPU=225,15`), a `Vulkan_Host` mérete megegyezik a host módéval (533,33), vagyis a 225 MiB nem repackelhető súly most a host-pufferben van.
+- **RAM-védelem** (`LLAMA_DUAL_BUFFER_FREE_MIB` a szabad RAM felülírására, mert a gépen 5,5 GiB szabad volt; tartalék 1024 MiB, CPU-s rész ~548 MiB):
+  - szabad 5561 MiB: keret 3989 MiB, 87 súly duplikálva (308,18 MiB), változatlan viselkedés;
+  - szabad 1700 MiB: keret 128 MiB, 44 súly duplikálva (127,62 MiB), `Vulkan_Host` 352,77 MiB;
+  - szabad 1500 / 1300 MiB: keret 0, figyelmeztetés "not enough free RAM ... disabling it", normál host-puffer lista (`Vulkan_Host` 533,33, nincs `CPU_REPACK`);
+  - szabad 1300 MiB + `--dual-buffer-limit 100`: a kézi limit nyer, 35 súly (99,98 MiB).
+- **Nem tesztelt:** MoE modell és a NAS (ROCm); a qwen3-coder:30b prompt-különbség (438 vs 515 tok/s) javulását ott kell mérni.

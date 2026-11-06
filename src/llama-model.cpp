@@ -1225,7 +1225,7 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
-static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
+static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, bool host_after_extra = false) {
     buft_list_t buft_list;
 
     // add ACCEL buffer types
@@ -1246,7 +1246,11 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     // generally, this will be done using the first device in the list
     // a better approach would be to handle this on a weight-by-weight basis using the offload_op
     // function of the device to determine if it would benefit from being stored in a host buffer
-    if (!no_host) {
+    // with host_after_extra (dual-buffer) it goes after the extra buffer types, so only what cannot be repacked lands in it
+    auto add_host_buft = [&]() {
+        if (no_host) {
+            return;
+        }
         for (const auto & dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
             if (buft) {
@@ -1254,6 +1258,9 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
                 break;
             }
         }
+    };
+    if (!host_after_extra) {
+        add_host_buft();
     }
 
     // add extra buffer types
@@ -1273,6 +1280,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
                 ++extra_bufts;
             }
         }
+    }
+
+    if (host_after_extra) {
+        add_host_buft();
     }
 
     // add the CPU buffer type
@@ -1732,18 +1743,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!ml.dual_host_buft) {
                 LLAMA_LOG_WARN("%s: --dual-buffer needs a device host buffer, none available, disabling it\n", __func__);
             }
-            if (params.dual_buffer_pattern) {
-                ml.dual_pattern = params.dual_buffer_pattern;
-            }
-            if (params.dual_buffer_limit_mib > 0) {
-                ml.dual_max_bytes = (size_t) params.dual_buffer_limit_mib * 1024 * 1024;
+            if (ml.dual_host_buft) {
+                if (params.dual_buffer_pattern) {
+                    ml.dual_pattern = params.dual_buffer_pattern;
+                }
+                if (params.dual_buffer_limit_mib > 0) {
+                    ml.dual_max_bytes = (size_t) params.dual_buffer_limit_mib * 1024 * 1024;
+                } else {
+                    // no manual limit: keep the copies within the free RAM minus the CPU part of the model and a reserve
+                    size_t ram_free = 0, ram_total = 0;
+                    ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    if (ram_dev) {
+                        ggml_backend_dev_memory(ram_dev, &ram_free, &ram_total);
+                    }
+                    if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
+                        ram_free  = (size_t) atoll(env) * 1024 * 1024;
+                        ram_total = std::max(ram_total, ram_free);
+                    }
+                    if (ram_total > 0) {
+                        const int n_gpu = std::min(this->n_gpu_layers(), hparams.n_layer_all + 1);
+                        const double cpu_frac = 1.0 - (double) n_gpu / (hparams.n_layer_all + 1);
+                        const size_t cpu_part = (size_t) (ml.n_bytes * cpu_frac);
+                        const size_t reserve  = std::max((size_t) 1 << 30, ram_total / 20);
+                        const size_t need     = cpu_part + reserve;
+                        const size_t budget   = ram_free > need ? ram_free - need : 0;
+                        LLAMA_LOG_INFO("%s: dual-buffer: free RAM %.0f MiB, CPU part ~%.0f MiB, reserve %.0f MiB, copy budget %.0f MiB\n", __func__,
+                            ram_free / 1024.0 / 1024.0, cpu_part / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0, budget / 1024.0 / 1024.0);
+                        if (budget == 0) {
+                            LLAMA_LOG_WARN("%s: dual-buffer: not enough free RAM for the copies, disabling it\n", __func__);
+                            ml.dual_host_buft = nullptr;
+                            ml.dual_host_dev  = nullptr;
+                        } else {
+                            ml.dual_max_bytes = budget;
+                        }
+                    }
+                }
             }
         }
     }
 
     // build a list of buffer types for the CPU and GPU devices
-    // with dual-buffer the weights use the extra (repack) buffers and the host buffer only holds the copies
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host || ml.dual_host_buft);
+    // with dual-buffer the host buffer goes after the extra (repack) buffers: repackable weights keep a host copy, the rest lives in the host buffer
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host, ml.dual_host_buft != nullptr);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
