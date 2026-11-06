@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh api:*)",
+      "Bash(gh repo fork:*)",
+      "Bash(git push upstream:*)",
+      "Bash(git push * upstream:*)",
+      "Bash(git push * upstream *)",
+      "PowerShell(gh pr:*)",
+      "PowerShell(gh issue:*)",
+      "PowerShell(gh api:*)",
+      "PowerShell(gh repo fork:*)",
+      "PowerShell(git push upstream:*)",
+      "PowerShell(git push * upstream:*)",
+      "PowerShell(git push * upstream *)"
+    ]
+  }
+}
