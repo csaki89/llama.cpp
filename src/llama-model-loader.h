@@ -166,6 +166,9 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t dual_host_buft = nullptr;
     ggml_backend_dev_t         dual_host_dev  = nullptr;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> dual_pairs; // (weight, copy)
+    std::string dual_pattern;     // only duplicate tensors with a matching name (empty = all)
+    size_t      dual_max_bytes = SIZE_MAX; // limit for the total size of the copies
+    size_t      dual_bytes     = 0;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

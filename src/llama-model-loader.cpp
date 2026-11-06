@@ -1307,8 +1307,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (dual_host_buft && !files.empty() && !ggml_backend_buft_is_host(buft)) {
             auto * dev_w = ggml_backend_buft_get_device(buft);
             if (!dev_w || ggml_backend_dev_type(dev_w) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(dev_w) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                if (weight_buft_supported(hparams, t_meta, op, dual_host_buft, dual_host_dev)) {
+                const size_t nbytes = ggml_nbytes(t_meta);
+                const bool name_ok  = dual_pattern.empty() || std::regex_search(tn.str(), std::regex(dual_pattern));
+                if (name_ok && dual_bytes + nbytes <= dual_max_bytes && weight_buft_supported(hparams, t_meta, op, dual_host_buft, dual_host_dev)) {
                     dual_buft = dual_host_buft;
+                    dual_bytes += nbytes;
                 }
             }
         }

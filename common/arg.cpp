@@ -2393,6 +2393,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DUAL_BUFFER"));
     add_opt(common_arg(
+        {"--dual-buffer-pattern"}, "REGEX",
+        "with --dual-buffer: only duplicate tensors whose name matches REGEX (default: all)",
+        [](common_params & params, const std::string & value) {
+            params.dual_buffer_pattern = value;
+        }
+    ).set_env("LLAMA_ARG_DUAL_BUFFER_PATTERN"));
+    add_opt(common_arg(
+        {"--dual-buffer-limit"}, "MiB",
+        "with --dual-buffer: max extra host memory for the copies, in tensor order (default: 0 = no limit)",
+        [](common_params & params, int value) {
+            params.dual_buffer_limit_mib = value;
+        }
+    ).set_env("LLAMA_ARG_DUAL_BUFFER_LIMIT"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

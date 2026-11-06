@@ -11,4 +11,7 @@
 ## 3. fázis (ellenőrzés): kész
 - Minden elfogadási feltétel teljesül, részletek: `docs/test-results.md` (commit `e2bf5e847` kódon).
 
-## Következő: 4. fázis (duplikálás korlátozása: tenzorminta, RAM-keret)
+## 4. fázis (korlátozás): kész
+- `--dual-buffer-pattern`, `--dual-buffer-limit` (docs/test-results.md, 4. fázis szakasz). Alapviselkedés újraellenőrizve.
+
+## Következő: 5. fázis (docs/SUMMARY.md)

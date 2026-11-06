@@ -46,3 +46,22 @@ A futások közötti eltérés jelentős (a gép állapota óráról órára vá
   - `--dual-buffer --no-host`: a dual-buffer nyer (DECISIONS.md 3.).
   - `LLAMA_ARG_DUAL_BUFFER=1`: bekapcsolja.
 - **Nem tesztelt:** MoE modell (`MUL_MAT_ID`), többeszközös gép, ROCm/CUDA, `llama-server` hosszú futás, LoRA. Ezeket a NAS-on / külön kell ellenőrizni.
+
+## 4. fázis: a duplikálás korlátozása
+Új, alapból kikapcsolt kapcsolók `--dual-buffer` mellett: `--dual-buffer-pattern REGEX` (a tenzornévre `regex_search`) és `--dual-buffer-limit MiB` (a másolatok összmérete; a tenzorok létrehozási, azaz réteg-sorrendjében vág, a korai rétegek kapják meg). Env: `LLAMA_ARG_DUAL_BUFFER_PATTERN`, `LLAMA_ARG_DUAL_BUFFER_LIMIT`. Minden szám **egyetlen futás** (nem 3 ismétlés), hosszú prompt (1611 token), `-ngl 14`, tájékoztató jellegű:
+
+| beállítás | duplikált súly | Vulkan_Host (MiB) | prompt tok/s | kimenet md5 |
+|---|---|---|---|---|
+| nincs korlát (alapértelmezés) | 87 | 308,18 | 341,9 | 35969901 |
+| `ffn_` | 36 | 265,78 | 227,2 | c2abe0a6 |
+| `attn_` | 51 | 42,40 | 154,7 | f773f5bc |
+| limit 100 MiB | 35 | 99,98 | 152,8 | a8939715 |
+| limit 100 MiB + `ffn_` | 13 | 95,98 | 145,3 | 35969901 |
+| minta, ami nem illeszkedik (`zzz`) | 0 | (nincs) | 123,8 | 2be92339 (= repack) |
+
+A prompt-sebesség a duplikált súlyok arányával nő, 0 duplikált súlynál a viselkedés a `repack`-ével azonos (md5 `2be92339`). Az `ffn_` tenzorok adják a repackelt súlyok nagy részét (265,78 / 308,18 MiB), tehát RAM-szűkös esetben a `--dual-buffer-pattern ffn_` a legjobb ár-érték.
+
+A 4. fázis után az alapviselkedés újra ellenőrizve (ugyanaz a bináris): repack `2be92339`, host `0063c4c5`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual_noopoff `2be92339`, dual `35969901`: mind egyezik a korábbiakkal.
+
+## Figyelmeztetés a mérési módszerhez
+A kimenet md5-jének összehasonlításakor a stderr-t **fájlba** kell irányítani (ahogy a `bench.sh` teszi). Ha a stderr `/dev/null`-ra (Windowson NUL) megy, a program ANSI színkódokat ír a kimenetbe (+9 bájt), és az md5 eltér, miközben a modell kimenete azonos. Ezt egy hibás kézi ellenőrzés közben vettem észre.

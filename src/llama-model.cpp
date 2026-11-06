@@ -1732,6 +1732,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!ml.dual_host_buft) {
                 LLAMA_LOG_WARN("%s: --dual-buffer needs a device host buffer, none available, disabling it\n", __func__);
             }
+            if (params.dual_buffer_pattern) {
+                ml.dual_pattern = params.dual_buffer_pattern;
+            }
+            if (params.dual_buffer_limit_mib > 0) {
+                ml.dual_max_bytes = (size_t) params.dual_buffer_limit_mib * 1024 * 1024;
+            }
         }
     }
 
@@ -3562,6 +3568,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.dual_buffer_pattern         =*/ nullptr,
+        /*.dual_buffer_limit_mib       =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

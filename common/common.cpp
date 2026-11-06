@@ -1700,6 +1700,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.dual_buffer     = params.dual_buffer;
+    mparams.dual_buffer_pattern   = params.dual_buffer_pattern.empty() ? nullptr : params.dual_buffer_pattern.c_str();
+    mparams.dual_buffer_limit_mib = params.dual_buffer_limit_mib > 0 ? (uint32_t) params.dual_buffer_limit_mib : 0;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
