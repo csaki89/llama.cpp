@@ -4361,6 +4361,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.n_ctx_init                  =*/ 0,
+        /*.zone_vram_margin            =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

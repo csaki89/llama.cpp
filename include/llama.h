@@ -355,6 +355,10 @@ extern "C" {
         // flex layers: the last N GPU layers get a per-layer buffer and a repacked CPU twin, so they can move to the CPU at runtime (0 = off)
         uint32_t     flex_layers;
 
+        // auto zones: the number of GPU layers that fit with the max context (-1 = unset); with flex_layers == 0 the
+        // flex band is the GPU layers beyond it (n_gpu_layers - flex_ngl_full)
+        int32_t      flex_ngl_full;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -406,6 +410,11 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        // dynamic KV (auto zones): the KV cache starts with n_ctx_init cells and grows with the use up to n_ctx (0 = allocate n_ctx at once)
+        // the flex layers move to the CPU when the KV needs device memory, keeping zone_vram_margin bytes free on the device
+        uint32_t n_ctx_init;
+        size_t   zone_vram_margin;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

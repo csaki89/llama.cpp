@@ -23,3 +23,7 @@
 - 2. lépés (a 2. zóna host-példánya): kész. Levett rétegnél op offload a host-példányból, a visszatétel a host-példányból (4-7 ms/réteg, fájlból 23-106 ms). Egy végig levett réteg kimenete bájtra azonos a `-ngl 13 --dual-buffer` futáséval (DECISIONS.md 17-18).
 - 3. lépés (másolási sebesség): kész. K/V GPU -> CPU 32K kontextusnál 149-163 ms -> 12-15 ms (a másolás 140-153 ms -> 0,5 ms: 1628 használt cella, DMA rögzített memóriába; a maradék a foglalás és a törlés). Részletek: test-results.md (4. lépés), DECISIONS.md 19-20.
 - 4. lépés (ellenőrzés, dokumentáció): kész. test-results.md "A rugalmas sáv befejezése"; DESIGN-3zone.md (2.1, 2.3, 2.6, 2.7, kockázatok, Következő lépések), ROADMAP.md, SUMMARY.md (6. NAS-on). Opció nélkül a baseline változatlan.
+
+## Háromzónás terv, automatikus működés (`--auto-zones`)
+- Terv: DESIGN-3zone.md 6. (`ba9a60e1b`).
+- 1. rész (a sáv mérete automatikusan): kész. Két fit (max és kis kontextus), `flex_ngl_full` modellparaméter, `n_ctx_init` / `zone_vram_margin` kontextparaméter (a 2-3. rész használja). DECISIONS.md 21.

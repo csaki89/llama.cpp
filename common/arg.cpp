@@ -2407,6 +2407,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FLEX_LAYERS"));
     add_opt(common_arg(
+        {"--auto-zones"},
+        "three-zone placement without manual settings: the flex band comes from --fit at the max and a small context, the KV grows with the use, and flex layers move to the CPU when the KV needs the device memory (default: off, requires --load-mode none and --fit on)",
+        [](common_params & params) {
+            params.auto_zones = true;
+        }
+    ).set_env("LLAMA_ARG_AUTO_ZONES"));
+    add_opt(common_arg(
+        {"--zones-ctx-init"}, "N",
+        string_format("with --auto-zones: the small context for zone 1 + 2 and the initial KV size (default: %d)", params.zones_ctx_init),
+        [](common_params & params, int value) {
+            params.zones_ctx_init = value;
+        }
+    ).set_env("LLAMA_ARG_ZONES_CTX_INIT"));
+    add_opt(common_arg(
         {"--dual-buffer-limit"}, "MiB",
         "with --dual-buffer: max extra host memory for the copies, in tensor order (default: 0 = no limit)",
         [](common_params & params, int value) {

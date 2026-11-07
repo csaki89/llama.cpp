@@ -1235,6 +1235,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+static void common_auto_zones(common_params & params, const llama_model_params & mparams_orig, const llama_context_params & cparams_orig,
+        llama_model_params & mparams, llama_context_params & cparams, const common_fit_extra_model * extra);
+
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (!params.fit_params) {
         return;
@@ -1264,13 +1267,72 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
-    common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+    // auto zones: the fit below is the max context (zone 1), a second fit with a small context gives zone 1 + 2 (DESIGN-3zone.md 6.1)
+    const llama_model_params   mparams_orig = mparams;
+    const llama_context_params cparams_orig = cparams;
+
+    const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+    if (params.auto_zones && status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        common_auto_zones(params, mparams_orig, cparams_orig, mparams, cparams, has_draft || spec_mtp ? &extra : nullptr);
+    }
+}
+
+static void common_auto_zones(common_params & params, const llama_model_params & mparams_orig, const llama_context_params & cparams_orig,
+        llama_model_params & mparams, llama_context_params & cparams, const common_fit_extra_model * extra) {
+    const uint32_t n_ctx_max  = cparams.n_ctx;
+    const uint32_t n_ctx_init = std::min<uint32_t>(params.zones_ctx_init, n_ctx_max);
+    cparams.zone_vram_margin  = params.fit_params_target.empty() ? 0 : params.fit_params_target[0];
+    if (n_ctx_init < n_ctx_max) {
+        cparams.n_ctx_init = n_ctx_init; // dynamic KV
+    }
+    if (mparams_orig.n_gpu_layers != llama_model_default_params().n_gpu_layers) {
+        COM_INF("%s: auto zones: -ngl is set, no automatic flex band (dynamic KV only)\n", __func__);
+        return;
+    }
+    if (mparams.n_gpu_layers < 0) {
+        COM_INF("%s: auto zones: all layers fit with the max context (%u), the flex band is empty\n", __func__, n_ctx_max);
+        return;
+    }
+    if (n_ctx_init >= n_ctx_max) {
+        return;
+    }
+
+    // fit again with the small context, on scratch buffers
+    llama_model_params   mparams_small = mparams_orig;
+    llama_context_params cparams_small = cparams_orig;
+    cparams_small.n_ctx = n_ctx_init;
+    std::vector<float> split_small(params.tensor_split, params.tensor_split + 128);
+    std::vector<llama_model_tensor_buft_override> ovr_small(params.tensor_buft_overrides);
+    ovr_small.resize(std::max(ovr_small.size(), llama_max_tensor_buft_overrides()), { nullptr, nullptr });
+    const size_t n_ovr_user = std::count_if(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
+        [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+    mparams_small.tensor_split          = split_small.data();
+    mparams_small.tensor_buft_overrides = ovr_small.data();
+
+    const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams_small, &cparams_small,
+        split_small.data(), ovr_small.data(), params.fit_params_target.data(), n_ctx_init, extra,
+        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    const size_t n_ovr_small = std::count_if(ovr_small.begin(), ovr_small.end(),
+        [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || n_ovr_small != n_ovr_user) {
+        COM_INF("%s: auto zones: the small-context fit failed or uses tensor overrides (MoE), no automatic flex band\n", __func__);
+        return;
+    }
+
+    const int32_t ngl_full  = mparams.n_gpu_layers;
+    const int32_t ngl_small = mparams_small.n_gpu_layers; // -1 = all layers
+    std::copy(split_small.begin(), split_small.end(), params.tensor_split);
+    mparams.n_gpu_layers  = ngl_small;
+    mparams.flex_ngl_full = ngl_full;
+    COM_INF("%s: auto zones: n_ctx %u -> %d GPU layers (zone 1), n_ctx %u -> %d GPU layers (zone 1 + 2), KV starts at %u cells\n",
+        __func__, n_ctx_max, ngl_full, n_ctx_init, ngl_small, cparams.n_ctx_init);
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :

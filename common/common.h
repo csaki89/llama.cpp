@@ -593,7 +593,9 @@ struct common_params {
     bool dual_buffer       = false; // keep repacked CPU weights also in the host buffer (original format) for op offload
     std::string dual_buffer_pattern;      // regex on tensor names to duplicate with --dual-buffer (empty = all)
     int32_t     dual_buffer_limit_mib = 0; // max extra host memory for --dual-buffer in MiB (0 = no limit)
-    int32_t     flex_layers           = 0; // last N GPU layers can move to the CPU at runtime (0 = off)
+    int32_t     flex_layers           = 0; // first N GPU layers can move to the CPU at runtime (0 = off, or automatic with auto_zones)
+    bool        auto_zones            = false; // three-zone placement: flex band from two fits, dynamic KV, zone switching (DESIGN-3zone.md 6)
+    int32_t     zones_ctx_init        = 4096;  // auto zones: small context for zone 1 + 2, and the initial KV size
     bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation

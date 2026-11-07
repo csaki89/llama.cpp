@@ -1801,10 +1801,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
 
+    // flex band size: --flex-layers, else the GPU layers beyond the ones that fit with the max context (auto zones, DESIGN-3zone.md 6.1)
+    int n_flex = (int) params.flex_layers;
+    if (n_flex == 0 && params.flex_ngl_full >= 0) {
+        n_flex = std::max(0, (int) this->n_gpu_layers() - params.flex_ngl_full);
+        LLAMA_LOG_INFO("%s: auto zones: %u GPU layers, %d fit with the max context, flex band %d layers\n", __func__,
+            this->n_gpu_layers(), params.flex_ngl_full, n_flex);
+    }
+
     // RAM guard (DECISIONS.md 12-14, 17): free RAM, the RAM-resident part of the model, and the zone 2 copies of the flex layers
     size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0;
     const char * ram_src = "system";
-    bool flex_off = params.flex_layers == 0 || ml.use_mmap;
+    bool flex_off = n_flex == 0 || ml.use_mmap;
     if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off) {
         size_t cg_free = 0, cg_limit = 0;
         ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1828,7 +1836,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // unknown placement counts as CPU, which gives a smaller budget
         const int n_gpu = (int) std::min(this->n_gpu_layers(), (uint32_t) hparams.n_layer_all + 1);
         const int i_gpu_start_est = std::max((int) hparams.n_layer_all + 1 - n_gpu, 0);
-        const int flex_end_est = flex_off ? i_gpu_start_est : std::min(i_gpu_start_est + (int) params.flex_layers, (int) hparams.n_layer_all);
+        const int flex_end_est = flex_off ? i_gpu_start_est : std::min(i_gpu_start_est + n_flex, (int) hparams.n_layer_all);
         std::vector<std::pair<std::regex, bool>> ovr; // (pattern, stays in RAM)
         for (auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
             auto * od = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
@@ -1975,12 +1983,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
 
     // flex layers: the first N GPU layers (next to the CPU layers) can move to the CPU at runtime (DESIGN-3zone.md)
-    if (params.flex_layers > 0) {
+    if (n_flex > 0) {
         if (ml.use_mmap) {
             LLAMA_LOG_WARN("%s: --flex-layers requires --load-mode none, disabling it\n", __func__);
         } else if (!flex_off) {
             ml.flex_lo = i_gpu_start;
-            ml.flex_hi = std::min(i_gpu_start + (int) params.flex_layers, n_layer_all) - 1;
+            ml.flex_hi = std::min(i_gpu_start + n_flex, n_layer_all) - 1;
             if (ml.flex_lo > ml.flex_hi) {
                 ml.flex_lo = ml.flex_hi = -1;
             }
@@ -3959,6 +3967,7 @@ llama_model_params llama_model_default_params() {
         /*.dual_buffer_pattern         =*/ nullptr,
         /*.dual_buffer_limit_mib       =*/ 0,
         /*.flex_layers                 =*/ 0,
+        /*.flex_ngl_full               =*/ -1,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
