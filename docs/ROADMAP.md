@@ -5,7 +5,7 @@
 2. **zóna, rugalmas sáv:** a RAM-ban mindig két formában van meg: GPU-formájú (eredeti) példány a host-pufferben és CPU-ra repackelt tartalék; amikor a réteg a GPU-n van, a VRAM-ban is.
 3. **zóna, mindig CPU:** a RAM-ban CPU-ra repackelve, és ha a dual-buffer be van kapcsolva, mellette a GPU-formájú példány a prompt op offloadhoz.
 
-Állapot: a rugalmas sáv (`--flex-layers N`) kész: a GPU-s rétegek első N rétege, repackelt tartalék + host-példány a RAM-ban, futás közbeni le- és visszatétel a K/V-vel együtt; egy levett réteg úgy viselkedik, mint egy eleve CPU-s dual-bufferes réteg (DESIGN-3zone.md, test-results.md). Hiányzik: a zónaváltási szabály, a dinamikus KV, a NAS-os (ROCm, PCIe) mérés.
+Állapot: az automatikus működés (`--auto-zones`) kész: a sáv két `--fit`-futásból, dinamikus KV (átméretezés másolással), zónaváltási szabály (DESIGN-3zone.md 6); a VMM-út és a MoE-re szabott sáv hiányzik. Előzmény: a rugalmas sáv (`--flex-layers N`) kész: a GPU-s rétegek első N rétege, repackelt tartalék + host-példány a RAM-ban, futás közbeni le- és visszatétel a K/V-vel együtt; egy levett réteg úgy viselkedik, mint egy eleve CPU-s dual-bufferes réteg (DESIGN-3zone.md, test-results.md). Hiányzik: a zónaváltási szabály, a dinamikus KV, a NAS-os (ROCm, PCIe) mérés.
 
 Kiindulás: a dual-buffer ma minden CPU-n maradó repackelhető súlyhoz tart egy host-puffer másolatot (RAM-többlet), a limit és a minta csak durva szabályozás (DESIGN.md, DECISIONS.md). A cél a súlyok tudatos elhelyezése három zónában.
 

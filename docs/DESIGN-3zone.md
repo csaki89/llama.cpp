@@ -118,3 +118,9 @@ Cél: kézi beállítás nélkül, a `--auto-zones` kapcsolóval (`LLAMA_ARG_AUT
 - Átméretezéskor a gráf és a scheduler foglalása újraépül (`sched_need_reserve`), ez egy-két tized másodperc lehet.
 - Állapotmentés/-betöltés: a betöltött cellaszámhoz a KV előbb megnő.
 - A HIP-gráfok a K/V és a súlyok címváltozása után (4. pont) itt gyakrabban jelentkeznek.
+
+### 6.5 Megvalósítás: állapot és eltérések
+- **Kész:** 6.1 (két fit, `flex_ngl_full`), 6.2 a tartalék úttal (rétegenkénti puffer, a használt sorok eszközön belüli másolása, `resize_keep`, állapotbetöltés), 6.3 (könyvelt keret, levétel a növeléskor, csökkentés és visszatétel kiürüléskor, a host-oldali K/V-puffer újrahasznosítása). Mérés: test-results.md "Automatikus háromzónás működés".
+- **Nem készült el:** a VMM-út (6.2, DECISIONS.md 22); az automatikus sáv MoE-re (a kis kontextusú fit override-okat állítana: a sáv kimarad, csak a dinamikus KV működik).
+- **Eltérések a tervtől:** (a) a zónalépés és a mozgatások a decode-ban az adag sorba állítása előtt futnak, és a scheduler szinkronizálását használják, nem a `synchronize()`-t (DECISIONS.md 23); (b) a szabály a máshol (állapotbetöltésnél) történt KV-növekedést is könyveli, és negatív keretnél rétegeket vesz le, mielőtt bármi más történik (DECISIONS.md 24); (c) a csökkentés a használathoz igazodó darabhatárig megy (legalább `n_ctx_init`), nem mindig a kezdőméretig.
+- **Mért költség** (laptop): KV-növelés 30-94 ms (a foglalás 17-78 ms), levétel 1-5 ms rétegenként (súly + K/V), visszatétel 4-29 ms (a foglalás 1-26 ms). A foglalás maradt a nagyobb rész; a VMM ezt szüntetné meg.

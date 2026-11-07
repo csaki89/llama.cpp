@@ -212,3 +212,66 @@ Laptop (Vulkan, Iris Xe iGPU, közös memória), Qwen2.5-1.5B, `-ngl 14 --flex-l
 
 ### Nem tesztelt
 ROCm/HIP (HIP-gráfok a címváltozás után, PCIe-sebesség), dedikált GPU eszközmemória-lekérdezése, MoE, több context, iSWA/hibrid memória, `llama-server`, transzponált V (flash attention nélkül), a RAM-védelem kiváltása (`flex_no_host`, a sáv kikapcsolása) valódi RAM-hiánnyal.
+
+## Automatikus háromzónás működés (`--auto-zones`)
+Laptop (Vulkan, Iris Xe iGPU), Qwen2.5-1.5B, `-c 32768`, `-fa auto -b 512 -ub 512`, temperature 0. A sáv kényszerítése a `--fit-target`-tel (`-fitt 6500`: a fit 6,5 GiB tartalékot hagy), a keret a `LLAMA_ZONES_HEADROOM_MIB`-bel. Szkriptek: `tools/dualbuf/zones-test.sh` (llama-server), a sebességsor kézi `llama-completion` futás.
+
+### Kikapcsolva
+`bench.sh -r 1` a `047a72477` kódon: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759`; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pl. dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer viselkedése nem változott.
+
+### A zónák (1. rész)
+| `-fitt` (MiB) | 1. zóna (`n_ctx` 32768) | 1. + 2. zóna (`n_ctx` 4096) | sáv |
+|---|---|---|---|
+| 1024 | minden réteg | - | 0 (minden elfér a max kontextussal) |
+| 6300 | 11 | 20 | 9 (9-17. réteg) |
+| 6500 | 7 | 13 | 6 (16-21.) |
+| 6700 | 4 | 7 | 3 (22-24.) |
+`--zones-ctx-init 512` mellett (`-fitt 6500`): `llama-completion` 7 / 15, `llama-server` 10 / 23 réteg (a szerver compute-puffere más).
+
+### Dinamikus KV (2. rész), statikus elhelyezéssel (`-ngl 14`, `--zones-ctx-init 512`)
+- 512 cellával indul, a darab 2560 cella (70 MiB az összes rétegre). Hosszú prompt (1611 token): egy növelés 512 -> 2560 (66 ms: alloc 57, copy 9), a VRAM-ban a KV 416 helyett **32 MiB**; a kimenet **bájtra azonos** a statikus KV-s futással (`0063c4c5`), `-b 2048`-cal is.
+- Javított mérési hiba: a decode elején hívott `synchronize()` a sorba állított adagot ~0 ms-mal számolta el (DECISIONS.md 23).
+
+### Zónaváltás egy beszélgetésben (3. rész), `llama-server`
+`LLAMA_ZONES_HEADROOM_MIB=30`, `--auto-zones -fitt 6500 --zones-ctx-init 512 -c 32768`; sáv 13 réteg (6-18.). Kérések egymás után, ugyanazon a sloton:
+
+| kérés | prompt / gen token | prompt tok/s | gen tok/s | ami történt |
+|---|---|---|---|---|
+| hosszú (long1) | 6414 / 100 | 200,7 | 12,66 | KV 512 -> 2560 -> 5120 -> 7680; közben a 6., 7., 8., 9. réteg le (a határ felől) |
+| új, rövid (short) | 10 / 100 | 26,3 | 19,23 | KV 7680 -> 2560 (üres), a 9., 8., 7. réteg vissza (fordított sorrend), a 6. a keret miatt nem |
+| a hosszú újra (long2) | 1 / 100 (a szerver RAM-os prompt-gyorsítótárából) | - | 12,80 | állapotbetöltés: KV 2560 -> 7680, utána a 7., 8., 9. réteg le (könyvelt keret) |
+
+A long1 és long2 kimenete azonos (`10476d2c`), a szöveg minden kérésnél értelmes.
+
+**A mozgatások ideje (a foglalással együtt):**
+| művelet | idő | ebből foglalás |
+|---|---|---|
+| levétel: súlyok | 0,0-1,4 ms | - |
+| levétel: K/V (0,5-7,5 MiB, a használt cellák DMA-val) | 1,0-3,3 ms | 0,2-1,1 ms |
+| visszatétel: súlyok (28,6 MiB, host-példányból) | 3,6-28,6 ms | 1,2-26,1 ms |
+| visszatétel: K/V (üres KV) | 0,3-0,4 ms | 0,2-0,3 ms |
+| KV növelés (az összes réteg, 14-140 MiB másolva) | 30-94 ms | 17-78 ms |
+| KV csökkentés üres KV-nál | 15 ms | 9,5 ms |
+A foglalás továbbra is a nagyobb rész (a Vulkan-eszközmemória foglalása 1-78 ms, erősen szór); a host-oldali K/V-puffer újrahasznosítása ebben a sorban nem jött létre, mert a KV a két levétel között nőtt (a régi puffer kicsi volt).
+
+### Bájtos egyezés a statikus elhelyezéssel
+Ahol a rétegek helye a kérés alatt nem változik: `LLAMA_ZONES_HEADROOM_MIB=-50 --auto-zones -fitt 6500 --dual-buffer` (13 GPU-réteg, a sávból 2 réteg a kérés előtt le) kimenete `f773f5bc`, azonos a statikus `-ngl 11 --dual-buffer` futással (`f773f5bc`). A KV-növelés a kimenetet nem változtatja (a 2. rész fenti mérése).
+
+### Generálási sebesség a kontextus hosszával
+`llama-completion`, 100 generált token. "statikus 7" = az 1. zóna (ami a teljes 32K KV-vel elfér), "statikus 13" = 1. + 2. zóna teljes 32K KV-vel (a valódi kereten túl; a laptopon a közös memória miatt elfér), "auto" = `--auto-zones -fitt 6500`, `LLAMA_ZONES_HEADROOM_MIB=60`.
+
+| prompt | eset | prompt tok/s | gen tok/s | md5 | VRAM: model + K/V (MiB) |
+|---|---|---|---|---|---|
+| 1611 | statikus 7 | 273,7 | 18,11 | 42a75edb | 340 + 192 |
+| 1611 | statikus 13 | 302,7 | 18,58 | 94748168 | 501 + 384 |
+| 1611 | auto (KV 4096, nincs mozgatás) | 308,4 | 17,78 | 94748168 | 501 + 48 |
+| 6414 | statikus 7 | 185,8 | 11,02 | ddd5ed9c | 340 + 192 |
+| 6414 | statikus 13 | 192,7 | 12,13 | ddd5ed9c | 501 + 384 |
+| 6414 | auto (KV 4096 -> 5120 -> 7680, nincs mozgatás) | 193,8 | 11,83 | ddd5ed9c | 501 + 90 |
+
+- Az auto a statikus 13 sebességén fut, az 1. zóna VRAM-jánál alig többel a KV-ben (48-90 MiB a 384 helyett); ebben a sorban a 60 MiB-os keret elég volt, így réteg nem mozgott (a mozgatással járó sebességet a szerveres sor mutatja: 12,7 tok/s 4 levett réteggel 6,4k kontextusnál, 19,2 visszatétel után rövid kontextusnál).
+- A laptopon a különbségek kicsik (iGPU, közös memória); a hatást a NAS-on kell mérni (SUMMARY.md 7.).
+- **Nem futott le:** a 12,8k tokenes sor (a `statikus 7` futás közben a rendszer kevés memória miatt leállította a mérést; nem indítottam újra).
+
+### Nem tesztelt
+VMM (CUDA/HIP, nem készült el), ROCm/HIP-gráfok a címváltozások után, dedikált GPU-n a keret pontossága, MoE (az automatikus sáv ott kimarad), több slot/sorozat (`-np` > 1), transzponált V (flash attention nélkül a dinamikus KV kikapcsol), a 12,8k-s sebességsor.
