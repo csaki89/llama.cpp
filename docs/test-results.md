@@ -307,3 +307,6 @@ A napló minden dinamikus KV-s futásnál: `zones: flash attention on, dynamic K
 
 ### Nem tesztelt
 Valódi VMM (CUDA/HIP), ROCm, nagy MoE (qwen3-coder:30b), több slot. A megszakadt 12,8k-s sebességsort nem ismételtem meg (kérés szerint).
+
+### VMM aréna (DECISIONS 32), laptop
+A változás a ggml-cuda-ban és a KV relayoutban van; a laptopos (Vulkan) út nem kap arénát. Ellenőrzés: dinamikus KV a tartalék úton `0063c4c5` (mint a statikus), `LLAMA_KV_VMM_SIM=1`-gyel (az aréna-API szimulációja) `set_dynamic: ... 13/13 layers in place (VMM)`, a növelés `13 grown in place`, a kimenet `0063c4c5`; szerveres beszélgetés-próba `10476d2c` / `d640dab1` / `10476d2c`, mint korábban.

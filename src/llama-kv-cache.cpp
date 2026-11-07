@@ -3143,13 +3143,32 @@ bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
     return true;
 }
 
-// growable device buffers (ggml-cuda/HIP VMM), looked up through the backend registry; NULL if the backend has none
-typedef ggml_backend_buffer_t (*ggml_backend_buffer_alloc_growable_t)(ggml_backend_buffer_type_t buft, size_t size, size_t max_size);
-typedef bool (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
+// growable device buffers (ggml-cuda/HIP VMM), looked up through the backend registry; NULL if the backend has none:
+// one arena (a reserved address range) per device and relayout, a section in it for every K and V, grown in place
+typedef void *                (*ggml_backend_vmm_arena_new_t)(ggml_backend_buffer_type_t buft, size_t size);
+typedef size_t                (*ggml_backend_vmm_arena_alignment_t)(void * arena);
+typedef ggml_backend_buffer_t (*ggml_backend_vmm_arena_buffer_t)(void * arena, size_t offset, size_t size, size_t max_size);
+typedef void                  (*ggml_backend_vmm_arena_free_t)(void * arena);
+typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
 
-// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the max size, to test the in-place path without VMM
-static ggml_backend_buffer_t kv_sim_alloc_growable(ggml_backend_buffer_type_t buft, size_t size, size_t max_size) {
-    return ggml_backend_buft_alloc_buffer(buft, std::max(size, max_size));
+// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the section size, to test the in-place path without VMM
+struct kv_sim_arena {
+    ggml_backend_buffer_type_t buft;
+};
+static void * kv_sim_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_UNUSED(size);
+    return new kv_sim_arena { buft };
+}
+static size_t kv_sim_arena_alignment(void * arena) {
+    GGML_UNUSED(arena);
+    return 2u << 20;
+}
+static ggml_backend_buffer_t kv_sim_arena_buffer(void * arena, size_t offset, size_t size, size_t max_size) {
+    GGML_UNUSED(offset);
+    return ggml_backend_buft_alloc_buffer(((kv_sim_arena *) arena)->buft, std::max(size, max_size));
+}
+static void kv_sim_arena_free(void * arena) {
+    delete (kv_sim_arena *) arena;
 }
 static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
     return size <= ggml_backend_buffer_get_size(buffer);
@@ -3162,7 +3181,12 @@ static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name)
     }
     static const bool sim = getenv("LLAMA_KV_VMM_SIM") && atoi(getenv("LLAMA_KV_VMM_SIM")) != 0;
     if (sim) {
-        return strcmp(name, "ggml_backend_buffer_grow") == 0 ? (void *) kv_sim_grow : (void *) kv_sim_alloc_growable;
+        if (strcmp(name, "ggml_backend_vmm_arena_new")       == 0) { return (void *) kv_sim_arena_new; }
+        if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0) { return (void *) kv_sim_arena_alignment; }
+        if (strcmp(name, "ggml_backend_vmm_arena_buffer")    == 0) { return (void *) kv_sim_arena_buffer; }
+        if (strcmp(name, "ggml_backend_vmm_arena_free")      == 0) { return (void *) kv_sim_arena_free; }
+        if (strcmp(name, "ggml_backend_buffer_grow")         == 0) { return (void *) kv_sim_grow; }
+        return nullptr;
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
@@ -3254,6 +3278,37 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         dyn_vmm.assign(layers.size(), 0);
     }
 
+    // growable layout: one arena per device for the K and V of the layers that get a new buffer here (the tested VMM pattern);
+    // the address space is virtual, so it is reserved with room for any chunk alignment (64 MiB per section)
+    struct vmm_arena {
+        void * arena = nullptr;
+        size_t align = 0;
+        size_t next  = 0;
+    };
+    std::map<ggml_backend_buffer_type_t, vmm_arena> arenas;
+    if (!dyn_vmm_off && n_stream == 1 && dyn_max > 0) {
+        std::map<ggml_backend_buffer_type_t, size_t> want;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            const auto & layer = layers[ikv];
+            if (ggml_backend_buffer_is_host(layer.k->buffer) || flex_kv_layers.count(layer.il) > 0 || (dyn_vmm[ikv] && n > n_old && !force)) {
+                continue; // host or flex layer, or a growable layer that grows in place
+            }
+            for (const ggml_tensor * t : { layer.k, layer.v }) {
+                if (t) {
+                    want[ggml_backend_buffer_get_type(layer.k->buffer)] += t->nb[1]*dyn_max*t->ne[2] + (64u << 20);
+                }
+            }
+        }
+        for (const auto & [buft, size] : want) {
+            auto arena_new   = (ggml_backend_vmm_arena_new_t)       kv_growable_fn(buft, "ggml_backend_vmm_arena_new");
+            auto arena_align = (ggml_backend_vmm_arena_alignment_t) kv_growable_fn(buft, "ggml_backend_vmm_arena_alignment");
+            void * arena = arena_new && arena_align ? arena_new(buft, size) : nullptr;
+            if (arena) {
+                arenas[buft] = { arena, arena_align(arena), 0 };
+            }
+        }
+    }
+
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
     bufs_new.reserve(2*layers.size());
     size_t n_copied = 0;
@@ -3333,19 +3388,23 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
             nl.v_stream.push_back(nl.v ? ggml_view_2d(ctx.get(), nl.v, nl.v->ne[0], n, nl.v->nb[1], s*nl.v->nb[2]) : nullptr);
         }
 
-        // on a device with growable buffers: K and V in their own, with the address range for the max context
+        // on a device with growable buffers: K and V each in a section of the device's arena, sized for the max context
         std::vector<ggml_backend_buffer_ptr> bufs_layer;
-        auto alloc_growable = (ggml_backend_buffer_alloc_growable_t) kv_growable_fn(buft, "ggml_backend_buffer_alloc_growable");
-        if (alloc_growable && !dyn_vmm_off && on_dev && !is_flex && n_stream == 1 && dyn_max > 0) {
+        auto it_ar = arenas.find(buft);
+        if (it_ar != arenas.end() && on_dev && !is_flex) {
+            auto & ar = it_ar->second;
+            auto arena_buffer = (ggml_backend_vmm_arena_buffer_t) kv_growable_fn(buft, "ggml_backend_vmm_arena_buffer");
             for (ggml_tensor * t : { nl.k, nl.v }) {
-                if (!t) {
+                if (!t || !arena_buffer) {
                     continue;
                 }
-                ggml_backend_buffer_ptr b(alloc_growable(buft, ggml_nbytes(t), t->nb[1]*dyn_max*t->ne[2]));
+                const size_t max_bytes = t->nb[1]*dyn_max*t->ne[2];
+                ggml_backend_buffer_ptr b(arena_buffer(ar.arena, ar.next, ggml_nbytes(t), max_bytes));
                 if (!b || ggml_backend_tensor_alloc(b.get(), t, ggml_backend_buffer_get_base(b.get())) != GGML_STATUS_SUCCESS) {
                     bufs_layer.clear();
                     break;
                 }
+                ar.next += ar.align*((max_bytes + ar.align - 1)/ar.align);
                 ggml_backend_buffer_clear(b.get(), 0);
                 bufs_layer.push_back(std::move(b));
             }
@@ -3430,6 +3489,14 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
 
     const int64_t t4 = ggml_time_us();
     ctxs_bufs.bufs = std::move(bufs_new); // frees the shared buffers and the old contexts
+
+    // the arenas stay while their buffers live (the address range and its VRAM are freed with the last one)
+    for (auto & [buft, ar] : arenas) {
+        auto arena_free = (ggml_backend_vmm_arena_free_t) kv_growable_fn(buft, "ggml_backend_vmm_arena_free");
+        if (arena_free) {
+            arena_free(ar.arena);
+        }
+    }
     t_free += ggml_time_us() - t4;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
