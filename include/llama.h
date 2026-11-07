@@ -359,6 +359,10 @@ extern "C" {
         // flex band is the GPU layers beyond it (n_gpu_layers - flex_ngl_full)
         int32_t      flex_ngl_full;
 
+        // auto zones: the tensor overrides of the max-context fit (NULL-terminated, NULL = none); a GPU tensor of the
+        // loaded placement that one of them puts on the CPU is in the flex band too (MoE experts)
+        const struct llama_model_tensor_buft_override * flex_ovr_full;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

@@ -596,6 +596,7 @@ struct common_params {
     int32_t     flex_layers           = 0; // first N GPU layers can move to the CPU at runtime (0 = off, or automatic with auto_zones)
     bool        auto_zones            = false; // three-zone placement: flex band from two fits, dynamic KV, zone switching (DESIGN-3zone.md 6)
     int32_t     zones_ctx_init        = 4096;  // auto zones: small context for zone 1 + 2, and the initial KV size
+    std::vector<llama_model_tensor_buft_override> zones_ovr_full; // auto zones: the tensor overrides of the max-context fit (zone 1)
     bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation

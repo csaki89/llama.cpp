@@ -30,3 +30,8 @@
 - 2. rész (dinamikus KV): kész. `n_ctx_init` cellával indul, darabokban (64 MiB) nő, kiürülve csökken; statikus elhelyezéssel a kimenet bájtra azonos (`0063c4c5`), a KV a VRAM-ban 416 helyett 32 MiB (2560 cella). A VMM-út nem készült el (DECISIONS.md 22).
 - 3. rész (zónaváltási szabály): kész. A KV növekedésével a határhoz legközelebbi rétegek lekerülnek, kiürüléskor (új beszélgetés) a KV csökken és a rétegek visszakerülnek; állapotbetöltés után is könyvel. Ahol a kérés alatt a hely nem változik, a kimenet bájtra azonos a statikus elhelyezéssel (`-ngl 11 --dual-buffer`: `f773f5bc`). DECISIONS.md 24-25.
 - Ellenőrzés és dokumentáció: test-results.md "Automatikus háromzónás működés"; SUMMARY.md 7. (Ollama-patch, NAS-teendők); DESIGN-3zone.md 6.5. Kikapcsolva a baseline változatlan. A 12,8k tokenes sebességsor nem futott le (a rendszer kevés memória miatt leállította a mérést).
+
+## Háromzónás terv, valódi használat (MoE, VMM, FA, Ollama)
+- 1. MoE (részleges flex rétegek a fit override-jaiból): kész, `granite-3.1-1b-a400m`-mel kipróbálva (DECISIONS.md 26).
+- 2. VMM a KV-növeléshez (ggml-cuda/HIP növelhető puffer, rétegenként, tartalék úttal, csúcs a zónaszabályban): kész, a laptopon szimulációval ellenőrizve, a ROCm-build az ollama-dualbuf CI-jén (DECISIONS.md 27-29).
+- 3. Flash Attention: forrásból kiderítve, nem kényszerítjük, egyértelmű napló (DECISIONS.md 30).

@@ -226,7 +226,7 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
         // flex layers: own context (and buffer) per layer, so the K/V can move with the layer
-        const bool flex = offload && model.flex_has_layer(il);
+        const bool flex = offload && model.flex_whole(il);
         if (flex) {
             ggml_init_params params = {
                 /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
@@ -3110,7 +3110,11 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
 
 bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
     // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
-    if (other || v_trans || ctxs_bufs.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || map_layer_ids.size() != layers.size() || max_size <= get_size()) {
+    if (v_trans) {
+        LLAMA_LOG_WARN("%s: dynamic KV disabled: the V cache is transposed because flash attention is off (-fa off, OLLAMA_FLASH_ATTENTION=0)\n", __func__);
+        return false;
+    }
+    if (other || ctxs_bufs.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || map_layer_ids.size() != layers.size() || max_size <= get_size()) {
         return false;
     }
     const size_t per_cell = cell_bytes(false);
@@ -3119,9 +3123,65 @@ bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
     }
     dyn_max   = max_size;
     dyn_chunk = GGML_PAD(std::max<size_t>(1, chunk_bytes / per_cell), 256);
-    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB)\n", __func__, get_size(), dyn_max, dyn_chunk,
-        dyn_chunk * per_cell / 1024.0 / 1024.0);
+    const char * env = getenv("LLAMA_KV_NO_VMM");
+    dyn_vmm_off = env && atoi(env) != 0;
+    dyn_vmm.assign(layers.size(), 0);
+
+    // one buffer per layer from now on; on a device with virtual memory the K and V get growable buffers
+    if (!relayout(get_size(), true)) {
+        dyn_max = 0;
+        return false;
+    }
+    size_t n_vmm = 0, n_dev = 0;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        n_vmm += dyn_vmm[ikv];
+        n_dev += layers[ikv].k->buffer && !ggml_backend_buffer_is_host(layers[ikv].k->buffer);
+    }
+    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
+        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0, n_vmm, n_dev, n_dev - n_vmm,
+        dyn_vmm_off ? " (LLAMA_KV_NO_VMM)" : (n_vmm < n_dev ? " (no VMM on this backend/device, or flex layers)" : ""));
     return true;
+}
+
+// growable device buffers (ggml-cuda/HIP VMM), looked up through the backend registry; NULL if the backend has none
+typedef ggml_backend_buffer_t (*ggml_backend_buffer_alloc_growable_t)(ggml_backend_buffer_type_t buft, size_t size, size_t max_size);
+typedef bool (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
+
+// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the max size, to test the in-place path without VMM
+static ggml_backend_buffer_t kv_sim_alloc_growable(ggml_backend_buffer_type_t buft, size_t size, size_t max_size) {
+    return ggml_backend_buft_alloc_buffer(buft, std::max(size, max_size));
+}
+static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
+    return size <= ggml_backend_buffer_get_size(buffer);
+}
+
+static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return nullptr;
+    }
+    static const bool sim = getenv("LLAMA_KV_VMM_SIM") && atoi(getenv("LLAMA_KV_VMM_SIM")) != 0;
+    if (sim) {
+        return strcmp(name, "ggml_backend_buffer_grow") == 0 ? (void *) kv_sim_grow : (void *) kv_sim_alloc_growable;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+size_t llama_kv_cache::resize_peak(uint32_t n) const {
+    // the copy path allocates a layer's new K/V before it frees the old one: the largest old device layer is the transient extra
+    size_t res = 0;
+    if (n <= get_size()) {
+        return 0;
+    }
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        const bool dev = layer.k->buffer && !ggml_backend_buffer_is_host(layer.k->buffer);
+        if (dev && (dyn_vmm.size() <= ikv || !dyn_vmm[ikv])) {
+            res = std::max(res, ggml_nbytes(layer.k) + (layer.v ? ggml_nbytes(layer.v) : 0));
+        }
+    }
+    return res;
 }
 
 uint32_t llama_kv_cache::dyn_round(uint32_t n) const {
@@ -3161,9 +3221,13 @@ size_t llama_kv_cache::layer_bytes(int32_t il) const {
 }
 
 bool llama_kv_cache::resize(uint32_t n) {
+    return relayout(n, false);
+}
+
+bool llama_kv_cache::relayout(uint32_t n, bool force) {
     const uint32_t n_old  = get_size();
     const uint32_t n_used = used_cells();
-    if (n == n_old) {
+    if (n == n_old && !force) {
         return true;
     }
     if (n < n_used || layers.empty()) {
@@ -3172,27 +3236,76 @@ bool llama_kv_cache::resize(uint32_t n) {
 
     const int64_t t0 = ggml_time_us();
     int64_t t_alloc = 0, t_copy = 0, t_free = 0;
+    size_t n_grow = 0, n_vmm_new = 0, n_copy = 0;
 
-    // which layers own their buffer (the buffers shared by several layers are freed at the end)
+    // the buffers of each layer (K and V are separate in a growable layout); a buffer shared by several layers is freed at the end
     std::vector<size_t> owner(ctxs_bufs.bufs.size(), SIZE_MAX);
     std::vector<size_t> n_owners(ctxs_bufs.bufs.size(), 0);
     for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-            if (layers[ikv].k && layers[ikv].k->buffer == ctxs_bufs.bufs[ib].second.get()) {
+            const auto * b = ctxs_bufs.bufs[ib].second.get();
+            if (b && (layers[ikv].k->buffer == b || (layers[ikv].v && layers[ikv].v->buffer == b))) {
                 owner[ib] = ikv;
                 n_owners[ib]++;
             }
         }
     }
+    if (dyn_vmm.size() != layers.size()) {
+        dyn_vmm.assign(layers.size(), 0);
+    }
 
-    // one layer at a time: new context and buffer on the same buffer type, copy the used rows, free the old buffer if it is the layer's own
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
-    bufs_new.reserve(layers.size());
+    bufs_new.reserve(2*layers.size());
     size_t n_copied = 0;
     const uint32_t n_rows = std::min(n_used, n);
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         auto & layer = layers[ikv];
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+        const bool on_dev  = !ggml_backend_buffer_is_host(layer.k->buffer);
+        const bool is_flex = flex_kv_layers.count(layer.il) > 0;
+
+        // growable K/V: map more memory at the end, the tensors keep their address and content (no transient copy)
+        if (dyn_vmm[ikv] && n > n_old && !force) {
+            auto grow = (ggml_backend_buffer_grow_t) kv_growable_fn(buft, "ggml_backend_buffer_grow");
+            bool ok = grow != nullptr;
+            const int64_t t1 = ggml_time_us();
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (ok && t) {
+                    ok = grow(t->buffer, t->nb[1]*n*t->ne[2]);
+                }
+            }
+            if (ok) {
+                for (ggml_tensor * t : { layer.k, layer.v }) {
+                    if (!t) {
+                        continue;
+                    }
+                    const size_t old_bytes = ggml_nbytes(t);
+                    t->ne[1] = n;
+                    t->nb[2] = t->nb[1]*n;
+                    t->nb[3] = t->nb[2]*t->ne[2];
+                    ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
+                }
+                for (auto * views : { &layer.k_stream, &layer.v_stream }) {
+                    for (ggml_tensor * v : *views) {
+                        if (v) {
+                            v->ne[1] = n;
+                            v->nb[2] = v->nb[1]*n;
+                            v->nb[3] = v->nb[2];
+                        }
+                    }
+                }
+                t_alloc += ggml_time_us() - t1;
+                for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
+                    if (owner[ib] == ikv && n_owners[ib] == 1) {
+                        bufs_new.emplace_back(std::move(ctxs_bufs.bufs[ib].first), std::move(ctxs_bufs.bufs[ib].second));
+                    }
+                }
+                n_grow++;
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: layer %u: growing the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
+            dyn_vmm[ikv] = 0;
+        }
 
         const int64_t t1 = ggml_time_us();
         ggml_init_params params = {
@@ -3219,12 +3332,54 @@ bool llama_kv_cache::resize(uint32_t n) {
             nl.k_stream.push_back(nl.k ? ggml_view_2d(ctx.get(), nl.k, nl.k->ne[0], n, nl.k->nb[1], s*nl.k->nb[2]) : nullptr);
             nl.v_stream.push_back(nl.v ? ggml_view_2d(ctx.get(), nl.v, nl.v->ne[0], n, nl.v->nb[1], s*nl.v->nb[2]) : nullptr);
         }
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-        if (!buf) {
-            LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
-            return false;
+
+        // on a device with growable buffers: K and V in their own, with the address range for the max context
+        std::vector<ggml_backend_buffer_ptr> bufs_layer;
+        auto alloc_growable = (ggml_backend_buffer_alloc_growable_t) kv_growable_fn(buft, "ggml_backend_buffer_alloc_growable");
+        if (alloc_growable && !dyn_vmm_off && on_dev && !is_flex && n_stream == 1 && dyn_max > 0) {
+            for (ggml_tensor * t : { nl.k, nl.v }) {
+                if (!t) {
+                    continue;
+                }
+                ggml_backend_buffer_ptr b(alloc_growable(buft, ggml_nbytes(t), t->nb[1]*dyn_max*t->ne[2]));
+                if (!b || ggml_backend_tensor_alloc(b.get(), t, ggml_backend_buffer_get_base(b.get())) != GGML_STATUS_SUCCESS) {
+                    bufs_layer.clear();
+                    break;
+                }
+                ggml_backend_buffer_clear(b.get(), 0);
+                bufs_layer.push_back(std::move(b));
+            }
+            if (bufs_layer.empty()) {
+                // a failed growable allocation leaves the tensors unallocated
+                for (ggml_tensor * t : { nl.k, nl.v }) {
+                    if (t) {
+                        t->buffer = nullptr;
+                        t->data   = nullptr;
+                    }
+                }
+                LLAMA_LOG_WARN("%s: layer %u: no growable (VMM) buffer on %s, the K/V grows by copy\n", __func__, layer.il, ggml_backend_buft_name(buft));
+            } else {
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    ggml_backend_view_init(nl.k_stream[s]);
+                    if (nl.v_stream[s]) {
+                        ggml_backend_view_init(nl.v_stream[s]);
+                    }
+                }
+            }
         }
-        ggml_backend_buffer_clear(buf.get(), 0);
+        dyn_vmm[ikv] = !bufs_layer.empty();
+        if (bufs_layer.empty()) {
+            ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!b) {
+                LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
+                return false;
+            }
+            ggml_backend_buffer_clear(b.get(), 0);
+            bufs_layer.push_back(std::move(b));
+            n_copy++;
+        } else {
+            n_vmm_new++;
+        }
         t_alloc += ggml_time_us() - t1;
 
         // the used rows of each stream, through the backend (device-internal copy on the same GPU, memcpy on the host)
@@ -3267,7 +3422,10 @@ bool llama_kv_cache::resize(uint32_t n) {
         if (itf != flex_kv_layers.end()) {
             itf->second.buf_idx = bufs_new.size();
         }
-        bufs_new.emplace_back(std::move(ctx), std::move(buf));
+        bufs_new.emplace_back(std::move(ctx), std::move(bufs_layer[0]));
+        for (size_t i = 1; i < bufs_layer.size(); ++i) {
+            bufs_new.emplace_back(nullptr, std::move(bufs_layer[i]));
+        }
     }
 
     const int64_t t4 = ggml_time_us();
@@ -3282,8 +3440,9 @@ bool llama_kv_cache::resize(uint32_t n) {
     }
     n_resize++;
 
-    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n", __func__,
-        n_old, n, n_used, n_copied / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1000.0, t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
+    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu grown in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
+        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
+        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
     return true;
 }
 

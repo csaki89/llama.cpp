@@ -273,7 +273,11 @@ public:
     uint64_t generation()   const { return n_resize; } // changes when the K/V tensors are reallocated
 
     // resize every layer's K/V to n cells, keeping the used cells (they must fit); each layer stays on its buffer type
+    // growable (VMM) device buffers grow in place, the others get a new buffer and a copy of the used rows
     bool resize(uint32_t n);
+
+    // device bytes that a resize to n needs on top of the new size for a moment (the copy path holds the old and the new layer)
+    size_t resize_peak(uint32_t n) const;
 
     // bytes of one cell over the layers (only those whose K/V is in device memory if device_only), and of one layer at the current size
     size_t cell_bytes(bool device_only) const;
@@ -283,6 +287,10 @@ private:
     uint32_t dyn_max   = 0;
     uint32_t dyn_chunk = 0;
     uint64_t n_resize  = 0;
+    bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
+    std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers
+
+    bool relayout(uint32_t n, bool force); // force: rebuild the buffers even at the same size (one per layer, growable where possible)
 
     // flex layers: the K/V of the layer has its own buffer (index into ctxs_bufs)
     struct flex_kv {

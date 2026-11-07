@@ -1442,6 +1442,7 @@ struct llama_model::impl {
     struct flex_layer {
         size_t buf_idx = SIZE_MAX;
         bool   on_gpu  = true;
+        bool   whole   = false; // the whole layer is in the band (its device and K/V move), else only some tensors (e.g. MoE experts)
         std::vector<llama_model_loader::flex_pair> pairs;
     };
     std::map<int, flex_layer> flex;
@@ -1805,14 +1806,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     int n_flex = (int) params.flex_layers;
     if (n_flex == 0 && params.flex_ngl_full >= 0) {
         n_flex = std::max(0, (int) this->n_gpu_layers() - params.flex_ngl_full);
-        LLAMA_LOG_INFO("%s: auto zones: %u GPU layers, %d fit with the max context, flex band %d layers\n", __func__,
+        LLAMA_LOG_INFO("%s: auto zones: %u GPU layers, %d fit with the max context, flex band %d whole layers\n", __func__,
             this->n_gpu_layers(), params.flex_ngl_full, n_flex);
     }
+    // auto zones, partial flex layers: the max-context fit puts these tensors on the CPU (MoE experts), the loaded placement on the GPU
+    std::vector<std::regex> flex_ovr;
+    if (params.flex_layers == 0) {
+        for (auto * o = params.flex_ovr_full; o && o->pattern; ++o) {
+            if (o->buft == ggml_backend_cpu_buffer_type() || (o->buft && ggml_backend_buft_is_host(o->buft))) {
+                flex_ovr.emplace_back(o->pattern);
+            }
+        }
+        if (!flex_ovr.empty()) {
+            LLAMA_LOG_INFO("%s: auto zones: %zu tensor patterns of the max-context fit go to the CPU: their GPU tensors are partial flex layers\n",
+                __func__, flex_ovr.size());
+        }
+    }
+    auto flex_ovr_match = [&](const std::string & name) {
+        for (const auto & r : flex_ovr) {
+            if (std::regex_search(name, r)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     // RAM guard (DECISIONS.md 12-14, 17): free RAM, the RAM-resident part of the model, and the zone 2 copies of the flex layers
     size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0;
     const char * ram_src = "system";
-    bool flex_off = n_flex == 0 || ml.use_mmap;
+    bool flex_off = (n_flex == 0 && flex_ovr.empty()) || ml.use_mmap;
     if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off) {
         size_t cg_free = 0, cg_limit = 0;
         ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1864,7 +1886,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (in_ram) {
                 ram_cpu_part += ggml_nbytes(it.second.tensor);
-            } else if (is_layer && il >= i_gpu_start_est && il < flex_end_est) {
+            } else if (is_layer && ((il >= i_gpu_start_est && il < flex_end_est) || flex_ovr_match(name))) {
                 ram_flex += 2*ggml_nbytes(it.second.tensor); // zone 2: repacked copy + host copy
             }
         }
@@ -1983,15 +2005,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
 
     // flex layers: the first N GPU layers (next to the CPU layers) can move to the CPU at runtime (DESIGN-3zone.md)
-    if (n_flex > 0) {
+    if (n_flex > 0 || !flex_ovr.empty()) {
         if (ml.use_mmap) {
-            LLAMA_LOG_WARN("%s: --flex-layers requires --load-mode none, disabling it\n", __func__);
+            LLAMA_LOG_WARN("%s: --flex-layers / --auto-zones flex band requires --load-mode none, disabling it\n", __func__);
         } else if (!flex_off) {
-            ml.flex_lo = i_gpu_start;
-            ml.flex_hi = std::min(i_gpu_start + n_flex, n_layer_all) - 1;
-            if (ml.flex_lo > ml.flex_hi) {
-                ml.flex_lo = ml.flex_hi = -1;
+            if (n_flex > 0) {
+                ml.flex_lo = i_gpu_start;
+                ml.flex_hi = std::min(i_gpu_start + n_flex, n_layer_all) - 1;
+                if (ml.flex_lo > ml.flex_hi) {
+                    ml.flex_lo = ml.flex_hi = -1;
+                }
             }
+            ml.flex_ovr = std::move(flex_ovr);
         }
     }
 
@@ -2220,6 +2245,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             dual_copies.insert(p.host);
         }
         pimpl->flex[p.layer].pairs.push_back(p);
+        pimpl->flex[p.layer].whole = p.layer >= ml.flex_lo && p.layer <= ml.flex_hi;
     }
     dual_weights = ml.dual_pairs;
     if (ml.dual_host_buft) {
@@ -2429,21 +2455,38 @@ static void flex_swap_storage(ggml_tensor * a, ggml_tensor * b) {
 }
 
 int llama_model::flex_next(bool to_gpu) const {
-    // take: the GPU flex layer closest to the CPU layers; put: the last one taken (reverse order)
+    // take order: the partial layers (only some tensors, e.g. MoE experts) from the last one down, they end the zone 1 run of
+    // full layers; then the whole layers from the CPU boundary up. Put back: the reverse.
+    std::vector<int> order;
+    for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
+        if (!it->second.whole && it->second.buf_idx != SIZE_MAX) {
+            order.push_back(it->first);
+        }
+    }
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.whole && fl.buf_idx != SIZE_MAX) {
+            order.push_back(il);
+        }
+    }
     if (to_gpu) {
-        for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
-            if (!it->second.on_gpu) {
-                return it->first;
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            if (!pimpl->flex.at(*it).on_gpu) {
+                return *it;
             }
         }
     } else {
-        for (const auto & [il, fl] : pimpl->flex) {
-            if (fl.on_gpu) {
+        for (int il : order) {
+            if (pimpl->flex.at(il).on_gpu) {
                 return il;
             }
         }
     }
     return -1;
+}
+
+bool llama_model::flex_whole(int il) const {
+    auto it = pimpl->flex.find(il);
+    return it != pimpl->flex.end() && it->second.whole && it->second.buf_idx != SIZE_MAX;
 }
 
 bool llama_model::flex_has_layer(int il) const {
@@ -3224,9 +3267,9 @@ void llama_model::print_info() const {
 }
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
-    // a flex layer that was taken off the GPU runs on the CPU, like a CPU layer
+    // a whole flex layer that was taken off the GPU runs on the CPU, like a CPU layer (a partial one stays a GPU layer)
     auto it = pimpl->flex.find(il);
-    if (it != pimpl->flex.end() && !it->second.on_gpu) {
+    if (it != pimpl->flex.end() && !it->second.on_gpu && it->second.whole) {
         return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
     return pimpl->dev_layer.at(il).dev;
@@ -3979,6 +4022,7 @@ llama_model_params llama_model_default_params() {
         /*.dual_buffer_limit_mib       =*/ 0,
         /*.flex_layers                 =*/ 0,
         /*.flex_ngl_full               =*/ -1,
+        /*.flex_ovr_full               =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

@@ -858,6 +858,17 @@ void llama_context::zones_step(uint32_t n_tokens) {
         }
     };
 
+    // the flash attention probe has run by now: the dynamic KV needs a non-transposed V cache, not flash attention itself
+    if (!zones_fa_logged) {
+        zones_fa_logged = true;
+        if (cparams.flash_attn) {
+            LLAMA_LOG_INFO("%s: zones: flash attention on, dynamic KV on\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: zones: flash attention is not available on this device (auto resolved it to off): the dynamic KV stays on "
+                "(the V cache was created non-transposed), the attention runs without flash attention\n", __func__);
+        }
+    }
+
     // zone rule (DESIGN-3zone.md 6.3): device memory budget, booked from the first step on
     const bool rule = !model.flex_layers().empty();
     if (rule && !zones_headroom_set) {
@@ -881,7 +892,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
         if (il < 0) {
             break;
         }
-        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
         if (!flex_move_layer(il, false)) {
             break;
         }
@@ -908,7 +919,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
     // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size)
     if (rule && (shrunk || used == 0)) {
         for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
-            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
             if (cost > zones_headroom) {
                 break;
             }
@@ -923,25 +934,29 @@ void llama_context::zones_step(uint32_t n_tokens) {
     if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
         sync();
         const uint32_t n = kv->dyn_round(used + n_tokens);
-        int64_t delta = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
+        // the copy path also needs the old and the new K/V of a layer at the same time (resize_peak), the VMM path does not
+        auto need = [&]() { return (int64_t) ((n - kv->get_size())*kv->cell_bytes(true) + kv->resize_peak(n)); };
+        int64_t delta = need();
         while (rule && delta > zones_headroom) {
             const int il = model.flex_next(false);
             if (il < 0) {
                 break;
             }
-            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
             if (!flex_move_layer(il, false)) {
                 break;
             }
             zones_headroom += freed;
-            delta = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
+            delta = need();
         }
         if (rule && delta > zones_headroom) {
             LLAMA_LOG_WARN("%s: zones: the KV grows beyond the device memory budget (%.0f MiB over), no flex layer left\n", __func__,
                 (delta - zones_headroom) / 1048576.0);
         }
+        // the budget books the final growth (the transient peak is gone after the resize)
+        const int64_t growth = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
         if (kv->resize(n)) {
-            zones_headroom -= delta;
+            zones_headroom -= growth;
         }
     }
     zones_kv_size = kv->get_size();
@@ -975,7 +990,7 @@ bool llama_context::flex_move_layer(int il, bool to_gpu) {
         flex_set_alts(il);
     }
     // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
-    if (flex_test_kv) {
+    if (flex_test_kv && model.flex_whole(il)) {
         if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
             kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
         } else {

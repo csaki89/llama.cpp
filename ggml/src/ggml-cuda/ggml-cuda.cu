@@ -777,7 +777,7 @@ struct ggml_backend_cuda_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
-    ~ggml_backend_cuda_buffer_context() {
+    virtual ~ggml_backend_cuda_buffer_context() {
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -1039,6 +1039,136 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
+
+// growable device buffer (llama.cpp dynamic KV): a reserved virtual address range, physical memory mapped in chunks at its end,
+// so the tensors keep their address when it grows; the VRAM goes back when the buffer (and its address range) is freed
+// HIP has the VMM functions in the runtime, CUDA needs the driver API (GGML_USE_VMM)
+#if defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
+#define GGML_CUDA_GROWABLE_BUFFER
+#if defined(GGML_USE_HIP)
+#define GGML_CUDA_VMM_OK(x) ((x) == hipSuccess)
+#else
+#define GGML_CUDA_VMM_OK(x) ((x) == CUDA_SUCCESS)
+#endif
+
+struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_context {
+    CUdeviceptr base = 0;
+    size_t reserved = 0;
+    size_t mapped   = 0;
+    size_t granularity = 0;
+    int    physical_device = 0;
+    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+
+    ggml_backend_cuda_growable_buffer_context(int device, CUdeviceptr base, size_t reserved, size_t granularity, int physical_device) :
+        ggml_backend_cuda_buffer_context(device, (void *) base), base(base), reserved(reserved), granularity(granularity), physical_device(physical_device) {
+    }
+
+    ~ggml_backend_cuda_growable_buffer_context() override {
+        // each mapping on its own (ROCR-Runtime issue 285), then the address range, which gives the memory back
+        for (auto & m : mappings) {
+            (void) cuMemUnmap(m.first, m.second);
+        }
+        (void) cuMemAddressFree(base, reserved);
+        dev_ptr = nullptr; // not from cudaMalloc
+    }
+
+    // map physical memory up to size, in chunks of at most 64 MiB (a single 1 GiB chunk is unreliable on ROCm)
+    bool map_to(size_t size) {
+        const size_t chunk_max = granularity * std::max<size_t>(1, (64ull << 20) / granularity);
+        while (mapped < size) {
+            size_t chunk = std::min(chunk_max, size - mapped);
+            chunk = granularity * ((chunk + granularity - 1) / granularity);
+            if (mapped + chunk > reserved) {
+                return false;
+            }
+            CUmemAllocationProp prop = {};
+            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id   = physical_device;
+            CUmemGenericAllocationHandle handle;
+            if (!GGML_CUDA_VMM_OK(cuMemCreate(&handle, chunk, &prop, 0))) {
+                return false;
+            }
+            const CUdeviceptr ptr = (CUdeviceptr) ((char *) base + mapped);
+            if (!GGML_CUDA_VMM_OK(cuMemMap(ptr, chunk, 0, handle, 0))) {
+                (void) cuMemRelease(handle);
+                return false;
+            }
+            (void) cuMemRelease(handle); // the mapping keeps the memory
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id   = physical_device;
+            access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            if (!GGML_CUDA_VMM_OK(cuMemSetAccess(ptr, chunk, &access, 1))) {
+                (void) cuMemUnmap(ptr, chunk);
+                return false;
+            }
+            mappings.push_back({ ptr, chunk });
+            mapped += chunk;
+        }
+        return true;
+    }
+};
+
+// size: mapped now, max_size: the reserved address range; NULL if the device has no VMM (the caller falls back)
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_growable(ggml_backend_buffer_type_t buft, size_t size, size_t max_size) {
+    if (buft->iface.get_name != ggml_backend_cuda_buffer_type_get_name) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    const int device   = buft_ctx->device;
+    const int physical = ggml_cuda_get_physical_device(device);
+    ggml_cuda_set_device(device);
+
+    CUdevice cu_dev;
+    int vmm = 0;
+    if (!GGML_CUDA_VMM_OK(cuDeviceGet(&cu_dev, physical)) ||
+        !GGML_CUDA_VMM_OK(cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu_dev)) || !vmm) {
+        return nullptr;
+    }
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = physical;
+    size_t granularity = 0;
+    if (!GGML_CUDA_VMM_OK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)) || granularity == 0) {
+        return nullptr;
+    }
+    const size_t reserved = granularity * ((std::max(size, max_size) + granularity - 1) / granularity);
+    CUdeviceptr base = 0;
+    if (!GGML_CUDA_VMM_OK(cuMemAddressReserve(&base, reserved, 0, 0, 0))) {
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_growable_buffer_context(device, base, reserved, granularity, physical);
+    if (!ctx->map_to(std::max<size_t>(size, 1))) {
+        delete ctx;
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+// map more memory at the end of a growable buffer; false if it is not one, or the memory is not available
+static bool ggml_backend_cuda_buffer_grow(ggml_backend_buffer_t buffer, size_t size) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
+    if (!ctx) {
+        return false;
+    }
+    if (size <= buffer->size) {
+        return true;
+    }
+    ggml_cuda_set_device(ctx->device);
+    if (!ctx->map_to(size)) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    buffer->size = size;
+    return true;
+}
+#endif // defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return 128;
@@ -6556,6 +6686,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#if defined(GGML_CUDA_GROWABLE_BUFFER)
+    if (strcmp(name, "ggml_backend_buffer_alloc_growable") == 0) {
+        return (void *)ggml_backend_cuda_buffer_alloc_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_grow") == 0) {
+        return (void *)ggml_backend_cuda_buffer_grow;
+    }
+#endif
     return nullptr;
 }
 

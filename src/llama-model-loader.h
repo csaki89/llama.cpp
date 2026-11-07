@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <regex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -187,6 +188,7 @@ struct llama_model_loader {
     int flex_lo = -1;
     int flex_hi = -1;
     bool flex_no_host = false; // RAM guard: no host copies (the layers go back from the model file)
+    std::vector<std::regex> flex_ovr; // partial flex layers: GPU tensors matching these (zone 1 puts them on the CPU, e.g. MoE experts)
     std::vector<flex_pair> flex_pairs;
 
     // track tensors that had to be moved for debugging:

@@ -1321,7 +1321,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // flex layers: a GPU weight in the range also gets a CPU twin (repacked if possible), so the layer can move to the CPU at runtime
-        if (flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
+        bool flex_tensor = flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi;
+        if (!flex_tensor && tn.bid >= 0 && !flex_ovr.empty()) {
+            const std::string name = tn.str();
+            for (const auto & r : flex_ovr) {
+                if (std::regex_search(name, r)) {
+                    flex_tensor = true;
+                    break;
+                }
+            }
+        }
+        if (flex_tensor && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
             auto * dev_w = ggml_backend_buft_get_device(buft);
             if (dev_w && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_ACCEL &&
                     !ggml_backend_buft_is_host(buft) && strstr(ggml_backend_buft_name(buft), "Split") == nullptr) {

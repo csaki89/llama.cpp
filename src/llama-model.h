@@ -976,6 +976,7 @@ struct llama_model {
     // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
     bool flex_move(int il, bool to_gpu, bool from_file = false) const;
     bool flex_has_layer(int il) const;
+    bool flex_whole(int il) const; // the whole layer moves (device and K/V), not only some tensors (MoE experts)
     bool flex_on_gpu(int il) const;
     std::vector<int> flex_layers() const;
     size_t flex_layer_bytes(int il) const; // the layer's weights in its GPU buffer
