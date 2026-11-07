@@ -112,6 +112,25 @@ public:
         reset();
     }
 
+    // change the number of cells and keep their state; the used cells must be below n
+    void resize_keep(uint32_t n) {
+        assert(used_max_p1() <= n);
+        const uint32_t n_old = pos.size();
+        pos.resize(n, -1);
+        ext.resize(n);
+        shift.resize(n, 0);
+        seq.resize(n);
+        for (uint32_t i = n_old; i < n; ++i) {
+            ext[i].reset();
+            seq[i].reset();
+        }
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (!seq_bits[s].empty()) {
+                seq_bits[s].resize((n + 63)/64, 0);
+            }
+        }
+    }
+
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);

@@ -577,7 +577,25 @@ llama_context::llama_context(
             /*.no_alloc  =*/ model.no_alloc(),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        // dynamic KV (DESIGN-3zone.md 6.2): start with n_ctx_init cells, grow up to n_ctx_seq
+        const uint32_t n_init = GGML_PAD(params.n_ctx_init, 256);
+        const bool     dyn    = params.n_ctx_init > 0 && n_init < cparams.n_ctx_seq && !model.no_alloc();
+        if (dyn) {
+            llama_cparams cparams_mem = cparams;
+            cparams_mem.n_ctx_seq = n_init;
+            memory.reset(model.create_memory(params_mem, cparams_mem));
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv && kv->set_dynamic(cparams.n_ctx_seq, (size_t) 64*1024*1024)) {
+                zones_kv_init = n_init;
+            } else {
+                LLAMA_LOG_WARN("%s: dynamic KV is not supported for this memory (or with a transposed V cache), allocating %u cells\n", __func__, cparams.n_ctx_seq);
+                memory.reset();
+                memory.reset(model.create_memory(params_mem, cparams));
+            }
+        } else {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
+        zones_vram_margin = params.zone_vram_margin;
     }
 
     // init backends
@@ -826,6 +844,77 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+}
+
+void llama_context::zones_step(uint32_t n_tokens) {
+    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    if (!kv || !kv->is_dynamic()) {
+        return;
+    }
+    // the previous batch must be done before buffers change; not synchronize(), that would account the queued batch in the perf stats
+    auto sync = [&]() {
+        if (sched) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+    };
+
+    const uint32_t size = kv->get_size();
+    const uint32_t used = kv->used_cells();
+
+    // shrink when the KV is empty or mostly unused (new conversation, removed sequences)
+    if (size > zones_kv_init && (used == 0 || used < size/4)) {
+        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(used + n_tokens));
+        if (n < size) {
+            sync();
+            kv->resize(n);
+        }
+    }
+
+    // grow in chunks when the next batch does not fit
+    if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
+        sync();
+        kv->resize(kv->dyn_round(used + n_tokens));
+    }
+
+    // the K/V tensors were reallocated (here or in a state load): new graph and scheduler reservation
+    if (kv->generation() != zones_kv_gen) {
+        zones_kv_gen       = kv->generation();
+        gf_res_prev_active = nullptr;
+        sched_need_reserve = true;
+    }
+}
+
+bool llama_context::flex_move_layer(int il, bool to_gpu) {
+    // the previous batch must be done; not synchronize(), that would account the queued batch in the perf stats
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    // the GPU backend of the layer, for asynchronous (DMA) copies
+    ggml_backend_t backend_gpu = nullptr;
+    if (!flex_test_copy_legacy) {
+        for (auto & b : backends) {
+            if (ggml_backend_get_device(b.get()) == model.flex_gpu_dev(il)) {
+                backend_gpu = b.get();
+            }
+        }
+    }
+    if (!model.flex_move(il, to_gpu, flex_test_file)) {
+        return false;
+    }
+    if (sched) {
+        flex_set_alts(il);
+    }
+    // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
+    if (flex_test_kv) {
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+            kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
+        } else {
+            LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
+        }
+    }
+    // the weight placement changed: build the next graph again
+    gf_res_prev_active = nullptr;
+    return true;
 }
 
 void llama_context::flex_set_alts(int il) {
@@ -2137,6 +2226,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
+    // batch boundary: the zone rule and the debug moves run before this batch is queued (and accounted in the perf stats)
+    zones_step(n_tokens_all);
+
+    for (auto & s : flex_test) {
+        if (!s.done && flex_test_tokens >= s.at) {
+            s.done = true;
+            if (s.layer < 0) {
+                s.layer = model.flex_next(s.to_gpu);
+            }
+            if (s.layer >= 0 && flex_move_layer(s.layer, s.to_gpu) && flex_test_reserve) {
+                sched_need_reserve = true;
+            }
+        }
+    }
+    flex_test_tokens += n_tokens_all;
+
+    sched_reserve();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
@@ -2144,48 +2251,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
-
-    for (auto & s : flex_test) {
-        if (!s.done && flex_test_tokens >= s.at) {
-            s.done = true;
-            const int64_t t_sync = ggml_time_us();
-            synchronize();
-            LLAMA_LOG_INFO("%s: flex: synchronize before the move %.1f ms\n", __func__, (ggml_time_us() - t_sync) / 1000.0);
-            if (s.layer < 0) {
-                s.layer = model.flex_next(s.to_gpu);
-            }
-            // the GPU backend of the layer, for asynchronous (DMA) copies
-            ggml_backend_t backend_gpu = nullptr;
-            if (s.layer >= 0 && !flex_test_copy_legacy) {
-                for (auto & b : backends) {
-                    if (ggml_backend_get_device(b.get()) == model.flex_gpu_dev(s.layer)) {
-                        backend_gpu = b.get();
-                    }
-                }
-            }
-            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file)) {
-                if (sched) {
-                    flex_set_alts(s.layer);
-                }
-                // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
-                if (flex_test_kv) {
-                    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
-                        kv->flex_move(s.layer, s.to_gpu, backend_gpu, flex_test_copy_legacy);
-                    } else {
-                        LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
-                    }
-                }
-                // the weight placement changed: build the next graph again
-                gf_res_prev_active = nullptr;
-                if (flex_test_reserve) {
-                    sched_need_reserve = true;
-                }
-            }
-        }
-    }
-    flex_test_tokens += n_tokens_all;
-
-    sched_reserve();
 
     bool did_optimize = false;
 

@@ -264,7 +264,26 @@ public:
     // legacy (test): CPU buffer and a full synchronous copy, the first implementation
     bool flex_move(int32_t il, bool to_gpu, ggml_backend_t backend = nullptr, bool legacy = false);
 
+    // dynamic KV (DESIGN-3zone.md 6.2): the cache grows in chunks up to max_size; false if this cache cannot (shared layers, transposed V, ...)
+    bool set_dynamic(uint32_t max_size, size_t chunk_bytes);
+    bool     is_dynamic()   const { return dyn_max > 0; }
+    uint32_t dyn_max_size() const { return dyn_max; }
+    uint32_t dyn_round(uint32_t n) const; // n rounded up to the next chunk, at most max_size
+    uint32_t used_cells()   const;        // max used_max_p1() over the streams
+    uint64_t generation()   const { return n_resize; } // changes when the K/V tensors are reallocated
+
+    // resize every layer's K/V to n cells, keeping the used cells (they must fit); each layer stays on its buffer type
+    bool resize(uint32_t n);
+
+    // bytes of one cell over the layers (only those whose K/V is in device memory if device_only), and of one layer at the current size
+    size_t cell_bytes(bool device_only) const;
+    size_t layer_bytes(int32_t il) const;
+
 private:
+    uint32_t dyn_max   = 0;
+    uint32_t dyn_chunk = 0;
+    uint64_t n_resize  = 0;
+
     // flex layers: the K/V of the layer has its own buffer (index into ctxs_bufs)
     struct flex_kv {
         size_t buf_idx;

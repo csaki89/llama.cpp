@@ -397,6 +397,15 @@ private:
     // register (layer off) or remove (layer on the GPU) the host copies of a flex layer with the scheduler
     void flex_set_alts(int il);
 
+    // move a flex layer (weights, host copies in the scheduler, K/V) at a batch boundary
+    bool flex_move_layer(int il, bool to_gpu);
+
+    // auto zones (DESIGN-3zone.md 6): dynamic KV and the zone switching rule, at a batch boundary before the next batch
+    void     zones_step(uint32_t n_tokens);
+    uint32_t zones_kv_init     = 0; // initial (and minimum) KV cells, 0 = no dynamic KV
+    uint64_t zones_kv_gen      = 0; // the KV generation the graph was built for
+    size_t   zones_vram_margin = 0;
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

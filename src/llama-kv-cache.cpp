@@ -2356,6 +2356,14 @@ const slot_info_vec_t *   sinfos_in) {
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
+        // dynamic KV: make room for the restored cells first
+        if (is_dynamic()) {
+            const uint32_t need = (seq_id == -1 ? 0 : used_cells()) + cell_count;
+            if (need > get_size() && !resize(dyn_round(need))) {
+                throw std::runtime_error("failed to restore kv cache: the dynamic KV cannot grow to the restored cells");
+            }
+        }
+
         slot_info sinfo;
 
         bool res = true;
@@ -3084,6 +3092,185 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
     LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
         __func__, il, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0, n_used, n_copied / 1024.0 / 1024.0, (t4 - t0) / 1000.0,
         (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
+    return true;
+}
+
+bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
+    // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
+    if (other || v_trans || ctxs_bufs.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || map_layer_ids.size() != layers.size() || max_size <= get_size()) {
+        return false;
+    }
+    const size_t per_cell = cell_bytes(false);
+    if (per_cell == 0) {
+        return false;
+    }
+    dyn_max   = max_size;
+    dyn_chunk = GGML_PAD(std::max<size_t>(1, chunk_bytes / per_cell), 256);
+    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB)\n", __func__, get_size(), dyn_max, dyn_chunk,
+        dyn_chunk * per_cell / 1024.0 / 1024.0);
+    return true;
+}
+
+uint32_t llama_kv_cache::dyn_round(uint32_t n) const {
+    if (dyn_chunk == 0) {
+        return n;
+    }
+    return std::min<uint32_t>(dyn_max, ((n + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
+}
+
+uint32_t llama_kv_cache::used_cells() const {
+    uint32_t n = 0;
+    for (const auto & cells : v_cells) {
+        n = std::max(n, cells.used_max_p1());
+    }
+    return n;
+}
+
+size_t llama_kv_cache::cell_bytes(bool device_only) const {
+    size_t res = 0;
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * t : { layer.k, layer.v }) {
+            if (t && (!device_only || (t->buffer && !ggml_backend_buffer_is_host(t->buffer)))) {
+                res += t->nb[1]*t->ne[2];
+            }
+        }
+    }
+    return res;
+}
+
+size_t llama_kv_cache::layer_bytes(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return 0;
+    }
+    const auto & layer = layers[it->second];
+    return (layer.k ? ggml_nbytes(layer.k) : 0) + (layer.v ? ggml_nbytes(layer.v) : 0);
+}
+
+bool llama_kv_cache::resize(uint32_t n) {
+    const uint32_t n_old  = get_size();
+    const uint32_t n_used = used_cells();
+    if (n == n_old) {
+        return true;
+    }
+    if (n < n_used || layers.empty()) {
+        return false;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    int64_t t_alloc = 0, t_copy = 0, t_free = 0;
+
+    // which layers own their buffer (the buffers shared by several layers are freed at the end)
+    std::vector<size_t> owner(ctxs_bufs.bufs.size(), SIZE_MAX);
+    std::vector<size_t> n_owners(ctxs_bufs.bufs.size(), 0);
+    for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if (layers[ikv].k && layers[ikv].k->buffer == ctxs_bufs.bufs[ib].second.get()) {
+                owner[ib] = ikv;
+                n_owners[ib]++;
+            }
+        }
+    }
+
+    // one layer at a time: new context and buffer on the same buffer type, copy the used rows, free the old buffer if it is the layer's own
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
+    bufs_new.reserve(layers.size());
+    size_t n_copied = 0;
+    const uint32_t n_rows = std::min(n_used, n);
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        auto & layer = layers[ikv];
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+
+        const int64_t t1 = ggml_time_us();
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            return false;
+        }
+        kv_layer nl = layer;
+        nl.k_stream.clear();
+        nl.v_stream.clear();
+        for (ggml_tensor ** pt : { &nl.k, &nl.v }) {
+            ggml_tensor * t = *pt;
+            if (!t) {
+                continue;
+            }
+            *pt = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], n, t->ne[2]);
+            ggml_set_name(*pt, t->name);
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            nl.k_stream.push_back(nl.k ? ggml_view_2d(ctx.get(), nl.k, nl.k->ne[0], n, nl.k->nb[1], s*nl.k->nb[2]) : nullptr);
+            nl.v_stream.push_back(nl.v ? ggml_view_2d(ctx.get(), nl.v, nl.v->ne[0], n, nl.v->nb[1], s*nl.v->nb[2]) : nullptr);
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf.get(), 0);
+        t_alloc += ggml_time_us() - t1;
+
+        // the used rows of each stream, through the backend (device-internal copy on the same GPU, memcpy on the host)
+        const int64_t t2 = ggml_time_us();
+        for (int i = 0; i < 2 && n_rows > 0; ++i) {
+            ggml_tensor * src = i == 0 ? layer.k : layer.v;
+            ggml_tensor * dst = i == 0 ? nl.k : nl.v;
+            if (!src) {
+                continue;
+            }
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                ggml_tensor vs = *src;
+                ggml_tensor vd = *dst;
+                for (ggml_tensor * v : { &vs, &vd }) {
+                    v->ne[1] = n_rows;
+                    v->ne[2] = 1;
+                    v->nb[2] = v->nb[1]*n_rows;
+                    v->nb[3] = v->nb[2];
+                    v->view_src  = nullptr;
+                    v->view_offs = 0;
+                }
+                vs.data = (char *) src->data + s*src->nb[2];
+                vd.data = (char *) dst->data + s*dst->nb[2];
+                ggml_backend_tensor_copy(&vs, &vd);
+                n_copied += ggml_nbytes(&vs);
+            }
+        }
+        t_copy += ggml_time_us() - t2;
+
+        const int64_t t3 = ggml_time_us();
+        for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
+            if (owner[ib] == ikv && n_owners[ib] == 1) {
+                ctxs_bufs.bufs[ib].second.reset();
+            }
+        }
+        t_free += ggml_time_us() - t3;
+
+        layer = nl;
+        auto itf = flex_kv_layers.find(layer.il);
+        if (itf != flex_kv_layers.end()) {
+            itf->second.buf_idx = bufs_new.size();
+        }
+        bufs_new.emplace_back(std::move(ctx), std::move(buf));
+    }
+
+    const int64_t t4 = ggml_time_us();
+    ctxs_bufs.bufs = std::move(bufs_new); // frees the shared buffers and the old contexts
+    t_free += ggml_time_us() - t4;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].resize_keep(n);
+        if (v_heads[s] >= n) {
+            v_heads[s] = 0;
+        }
+    }
+    n_resize++;
+
+    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n", __func__,
+        n_old, n, n_used, n_copied / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1000.0, t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
     return true;
 }
 
