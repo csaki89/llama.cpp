@@ -275,3 +275,35 @@ Ahol a rétegek helye a kérés alatt nem változik: `LLAMA_ZONES_HEADROOM_MIB=-
 
 ### Nem tesztelt
 VMM (CUDA/HIP, nem készült el), ROCm/HIP-gráfok a címváltozások után, dedikált GPU-n a keret pontossága, MoE (az automatikus sáv ott kimarad), több slot/sorozat (`-np` > 1), transzponált V (flash attention nélkül a dinamikus KV kikapcsol), a 12,8k-s sebességsor.
+
+## Valódi használat: MoE, VMM, Flash Attention (`e86f222a5`)
+Laptop (Vulkan, Iris Xe iGPU). Modellek: Qwen2.5-1.5B (dense) és **granite-3.1-1b-a400m-instruct Q4_K_M** (MoE, 24 réteg, 32 szakértő, 784 MiB; nyilvános GGUF, bartowski).
+
+### Kikapcsolva
+`bench.sh -r 1`: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759`; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer változatlan.
+
+### MoE: a zónák a két fit különbségéből
+| beállítás | 1. zóna (max kontextus) | 1. + 2. zóna (kezdő kontextus) | sáv |
+|---|---|---|---|
+| `-c 32768 -fitt 6600` | 10 GPU-réteg, 9 override | 25 (minden), 12 override | 15 egész réteg (0-14.; 422 MiB a CPU-ikrekben) |
+| `-c 12288 -fitt 6500 --zones-ctx-init 1024` | 25 (minden dense), 22 szakértő-override | 25, 3 override | **részleges**: a 3-22. réteg szakértői (542 MiB) |
+| `-c 16384 -fitt 6500` | 22 GPU-réteg, 21 override | 25, 3 override | 3 egész + részleges (623 MiB) |
+A fit MoE-nél a dense részt is visszaveheti (32K-n a K/V ~1,5 GiB), ekkor egész rétegek is a sávba kerülnek; a különbség-szabály mindkettőt kezeli.
+
+**Szerveres beszélgetés MoE-vel** (`-c 12288 --auto-zones -fitt 6500 --zones-ctx-init 1024`, `LLAMA_ZONES_HEADROOM_MIB=20`): a hosszú kérés (7031 token) alatt a KV 1024 -> 7680 cellára nőtt, a szakértő-rétegek **csökkenő sorrendben** (23, 22, ..., 14.) kerültek le (rétegenként 27-31 MiB, levétel 0-3,6 ms; a réteg figyelemszámítása és K/V-je a GPU-n maradt); az új rövid kérésnél a KV 7680 -> 1536-ra csökkent, és a rétegek **növekvő sorrendben** vissza (2,5-31 ms rétegenként, a host-példányból); a hosszú kérés újra (RAM-os prompt-gyorsítótár) után a KV megnőtt, és a rétegek a keret szerint újra lekerültek. A hosszú kérés kimenete mindkétszer azonos (`f3980366`), a szöveg minden kérésnél értelmes. Az elfogadási futásban 30 mozgatás.
+
+**Bájtos egyezés MoE-vel:** `--auto-zones --dual-buffer` (`LLAMA_ZONES_HEADROOM_MIB=-30`, a kérés előtt 2 szakértő-réteg le) és a statikus `-fit off -ngl 25 --dual-buffer -ot ...=CPU` kimenete azonos (`4020432f`); ennél a modellnél és promptnál azonban a statikus változat a két réteg levétele nélkül is ugyanezt adja, tehát ez az összevetés itt nem érzékeny (a dense modellen az egyezés korábban valódi különbséget is mutatott: `f773f5bc`).
+
+### VMM (növelhető KV-pufferek)
+- A laptopos Vulkan-backend nem ad VMM-függvényt: `set_dynamic: ... growth on the device: 0/22 layers in place (VMM), 22 by copy (no VMM on this backend/device, or flex layers)`, a tartalék út fut (változatlan kimenet).
+- A helyben növelés logikája a `LLAMA_KV_VMM_SIM=1` szimulációval: `-ngl 14 --auto-zones --zones-ctx-init 512 -c 32768`, hosszú prompt: `set_dynamic: ... 13/13 layers in place (VMM)`, a növelés `relayout: KV 512 -> 2560 cells (... layers: 13 grown in place, 0 new growable, 15 new by copy), 18,9 ms` (a 15 CPU-s réteg másolással); a kimenet **bájtra azonos** a statikus KV-s futással (`0063c4c5`), ahogy a tartalék úté is.
+- A valódi CUDA/HIP VMM-kód (`ggml-cuda.cu`) a laptopon nem fordítható; a ROCm-fordítás az ollama-dualbuf CI-jén fut.
+
+### Flash Attention
+A napló minden dinamikus KV-s futásnál: `zones: flash attention on, dynamic KV on` (Vulkan, `-fa auto`). A kikapcsolt FA (`-fa off`) esetén a `set_dynamic` figyelmeztet (`dynamic KV disabled: the V cache is transposed because flash attention is off`), és a teljes KV foglalódik.
+
+### Szerveres beszélgetés (dense), változatlan
+`-c 32768 --auto-zones -fitt 6500 --zones-ctx-init 512`, `LLAMA_ZONES_HEADROOM_MIB=30`: long1 / short / long2 kimenete `10476d2c` / `d640dab1` / `10476d2c`, mint korábban; a rétegek (6-9.) a KV-vel le, új beszélgetésnél (9., 8., 7.) vissza.
+
+### Nem tesztelt
+Valódi VMM (CUDA/HIP), ROCm, nagy MoE (qwen3-coder:30b), több slot. A megszakadt 12,8k-s sebességsort nem ismételtem meg (kérés szerint).
