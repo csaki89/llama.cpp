@@ -289,6 +289,7 @@ private:
         size_t buf_idx;
         ggml_backend_buffer_type_t buft_gpu;
         bool   on_gpu;
+        ggml_backend_buffer_ptr spare = nullptr; // host buffer kept after the layer went back, reused when it goes off again
     };
     std::map<int32_t, flex_kv> flex_kv_layers;
 

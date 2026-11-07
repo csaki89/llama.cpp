@@ -405,6 +405,9 @@ private:
     uint32_t zones_kv_init     = 0; // initial (and minimum) KV cells, 0 = no dynamic KV
     uint64_t zones_kv_gen      = 0; // the KV generation the graph was built for
     size_t   zones_vram_margin = 0;
+    int64_t  zones_headroom    = 0;     // device memory budget left, booked with the moves and resizes
+    bool     zones_headroom_set = false;
+    uint32_t zones_kv_size     = 0;     // the KV size booked in the budget
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

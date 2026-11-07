@@ -28,3 +28,4 @@
 - Terv: DESIGN-3zone.md 6. (`ba9a60e1b`).
 - 1. rész (a sáv mérete automatikusan): kész. Két fit (max és kis kontextus), `flex_ngl_full` modellparaméter, `n_ctx_init` / `zone_vram_margin` kontextparaméter (a 2-3. rész használja). DECISIONS.md 21.
 - 2. rész (dinamikus KV): kész. `n_ctx_init` cellával indul, darabokban (64 MiB) nő, kiürülve csökken; statikus elhelyezéssel a kimenet bájtra azonos (`0063c4c5`), a KV a VRAM-ban 416 helyett 32 MiB (2560 cella). A VMM-út nem készült el (DECISIONS.md 22).
+- 3. rész (zónaváltási szabály): kész. A KV növekedésével a határhoz legközelebbi rétegek lekerülnek, kiürüléskor (új beszélgetés) a KV csökken és a rétegek visszakerülnek; állapotbetöltés után is könyvel. Ahol a kérés alatt a hely nem változik, a kimenet bájtra azonos a statikus elhelyezéssel (`-ngl 11 --dual-buffer`: `f773f5bc`). DECISIONS.md 24-25.

@@ -3016,7 +3016,15 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
     for (ggml_tensor * t : tensors) {
         size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
     }
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    // reuse the host buffer kept from the last time the layer was off (the allocation of pinned memory is the slow part)
+    ggml_backend_buffer_t buf = nullptr;
+    const bool reused = !to_gpu && fk.spare && ggml_backend_buffer_get_type(fk.spare.get()) == buft && ggml_backend_buffer_get_size(fk.spare.get()) >= size;
+    if (reused) {
+        buf = fk.spare.release();
+    } else {
+        fk.spare.reset();
+        buf = ggml_backend_buft_alloc_buffer(buft, size);
+    }
     if (!buf) {
         LLAMA_LOG_ERROR("%s: layer %d: failed to allocate %zu bytes in %s\n", __func__, il, size, ggml_backend_buft_name(buft));
         return false;
@@ -3084,14 +3092,19 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
         }
     }
 
-    // frees the old buffer
+    // frees the old buffer; a host buffer is kept for the next time the layer goes off (not in legacy mode)
+    ggml_backend_buffer_ptr old(ctxs_bufs.bufs[fk.buf_idx].second.release());
     ctxs_bufs.bufs[fk.buf_idx].second.reset(buf);
+    if (to_gpu && !legacy && old && ggml_backend_buffer_is_host(old.get())) {
+        fk.spare = std::move(old);
+    }
+    old.reset();
     fk.on_gpu = to_gpu;
     const int64_t t4 = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
+    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f%s, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
         __func__, il, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0, n_used, n_copied / 1024.0 / 1024.0, (t4 - t0) / 1000.0,
-        (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
+        (t1 - t0) / 1000.0, reused ? " (reused)" : "", (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
     return true;
 }
 

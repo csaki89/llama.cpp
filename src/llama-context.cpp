@@ -858,23 +858,93 @@ void llama_context::zones_step(uint32_t n_tokens) {
         }
     };
 
+    // zone rule (DESIGN-3zone.md 6.3): device memory budget, booked from the first step on
+    const bool rule = !model.flex_layers().empty();
+    if (rule && !zones_headroom_set) {
+        zones_headroom_set = true;
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_dev_memory(model.flex_gpu_dev(model.flex_layers().front()), &dev_free, &dev_total);
+        zones_headroom = (int64_t) dev_free - (int64_t) zones_vram_margin;
+        if (const char * env = getenv("LLAMA_ZONES_HEADROOM_MIB")) { // test aid
+            zones_headroom = (int64_t) atoll(env) * 1024 * 1024;
+        }
+        LLAMA_LOG_INFO("%s: zones: device memory budget %.0f MiB (free %.0f MiB, margin %.0f MiB)\n", __func__,
+            zones_headroom / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
+    }
+
+    // a resize outside this step (state load) is booked too; over the budget, flex layers go off first
+    if (rule && zones_kv_size != 0 && kv->get_size() != zones_kv_size) {
+        zones_headroom -= ((int64_t) kv->get_size() - (int64_t) zones_kv_size)*(int64_t) kv->cell_bytes(true);
+    }
+    while (rule && zones_headroom < 0) {
+        const int il = model.flex_next(false);
+        if (il < 0) {
+            break;
+        }
+        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+        if (!flex_move_layer(il, false)) {
+            break;
+        }
+        zones_headroom += freed;
+    }
+
     const uint32_t size = kv->get_size();
     const uint32_t used = kv->used_cells();
+    bool shrunk = false;
 
     // shrink when the KV is empty or mostly unused (new conversation, removed sequences)
     if (size > zones_kv_init && (used == 0 || used < size/4)) {
         const uint32_t n = std::max(zones_kv_init, kv->dyn_round(used + n_tokens));
         if (n < size) {
             sync();
-            kv->resize(n);
+            const size_t per_cell = kv->cell_bytes(true);
+            if (kv->resize(n)) {
+                zones_headroom += (int64_t) ((size - n)*per_cell);
+                shrunk = true;
+            }
         }
     }
 
-    // grow in chunks when the next batch does not fit
+    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size)
+    if (rule && (shrunk || used == 0)) {
+        for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
+            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+            if (cost > zones_headroom) {
+                break;
+            }
+            if (!flex_move_layer(il, true)) {
+                break;
+            }
+            zones_headroom -= cost;
+        }
+    }
+
+    // grow in chunks when the next batch does not fit; take flex layers off (closest to the CPU first) to make room
     if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
         sync();
-        kv->resize(kv->dyn_round(used + n_tokens));
+        const uint32_t n = kv->dyn_round(used + n_tokens);
+        int64_t delta = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
+        while (rule && delta > zones_headroom) {
+            const int il = model.flex_next(false);
+            if (il < 0) {
+                break;
+            }
+            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + kv->layer_bytes(il));
+            if (!flex_move_layer(il, false)) {
+                break;
+            }
+            zones_headroom += freed;
+            delta = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
+        }
+        if (rule && delta > zones_headroom) {
+            LLAMA_LOG_WARN("%s: zones: the KV grows beyond the device memory budget (%.0f MiB over), no flex layer left\n", __func__,
+                (delta - zones_headroom) / 1048576.0);
+        }
+        if (kv->resize(n)) {
+            zones_headroom -= delta;
+        }
     }
+    zones_kv_size = kv->get_size();
 
     // the K/V tensors were reallocated (here or in a state load): new graph and scheduler reservation
     if (kv->generation() != zones_kv_gen) {

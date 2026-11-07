@@ -978,6 +978,7 @@ struct llama_model {
     bool flex_has_layer(int il) const;
     bool flex_on_gpu(int il) const;
     std::vector<int> flex_layers() const;
+    size_t flex_layer_bytes(int il) const; // the layer's weights in its GPU buffer
     // (model tensor, original-format host copy) of a flex layer, registered with the scheduler while the layer is off
     std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> flex_host_copies(int il) const;
     int  flex_next(bool to_gpu) const; // next layer to take (to_gpu = false) or put back, -1 if none

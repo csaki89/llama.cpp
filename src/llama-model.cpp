@@ -2469,6 +2469,17 @@ std::vector<std::pair<ggml_tensor *, ggml_tensor *>> llama_model::flex_host_copi
     return res;
 }
 
+size_t llama_model::flex_layer_bytes(int il) const {
+    size_t res = 0;
+    auto it = pimpl->flex.find(il);
+    if (it != pimpl->flex.end()) {
+        for (const auto & p : it->second.pairs) {
+            res += ggml_nbytes(p.gpu);
+        }
+    }
+    return res;
+}
+
 std::vector<int> llama_model::flex_layers() const {
     std::vector<int> res;
     for (const auto & [il, fl] : pimpl->flex) {
