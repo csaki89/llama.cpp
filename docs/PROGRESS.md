@@ -37,4 +37,4 @@
 - 3. Flash Attention: forrásból kiderítve, nem kényszerítjük, egyértelmű napló (DECISIONS.md 30).
 - 8. VMM-laphiba: a leképezés aszinkron (DRM `GEM_VA`), KFD-korlát + várakozás, `commit` lépés, `vmm-stress` NAS-teszt (DECISIONS.md 33-36).
 - A ROCm-build nem futott le: a csaki89/ollama repóban ki vannak kapcsolva az Actions (DESIGN-3zone.md 7.2).
-- 9. A VMM-teszt a valódi megvalósítást is hívja (`vmm-stress-impl`), a tesztprogramok a ROCm-image részei (DECISIONS.md 37). Az Actions újra be van kapcsolva, a 7.2 akadály megszűnt.
+- 9. A VMM-teszt a valódi megvalósítást is hívja (`vmm-stress-impl`), a tesztprogramok a ROCm-image részei (DECISIONS.md 37). A ROCm-build továbbra sem indul (HTTP 422, DESIGN-3zone.md 7.2), így az image-be építés nincs kipróbálva.
