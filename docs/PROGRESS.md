@@ -36,3 +36,4 @@
 - 2. VMM a KV-növeléshez (ggml-cuda/HIP növelhető puffer, rétegenként, tartalék úttal, csúcs a zónaszabályban): kész, a laptopon szimulációval ellenőrizve, a ROCm-build az ollama-dualbuf CI-jén (DECISIONS.md 27-29).
 - 3. Flash Attention: forrásból kiderítve, nem kényszerítjük, egyértelmű napló (DECISIONS.md 30).
 - 8. VMM-laphiba: a leképezés aszinkron (DRM `GEM_VA`), KFD-korlát + várakozás, `commit` lépés, `vmm-stress` NAS-teszt (DECISIONS.md 33-36).
+- A ROCm-build nem futott le: a csaki89/ollama repóban ki vannak kapcsolva az Actions (DESIGN-3zone.md 7.2).
