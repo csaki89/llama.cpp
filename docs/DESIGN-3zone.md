@@ -134,5 +134,5 @@ Cél: kézi beállítás nélkül, a `--auto-zones` kapcsolóval (`LLAMA_ARG_AUT
 ### 7.1 A VMM-leképezés érvényessége (DECISIONS 33-35)
 A `hipMemSetAccess` a laptábla-frissítést csak sorba teszi. Ezért a VMM-út szétválasztja a leképezést és az első hozzáférést: a `map_to` csak leképez, a `commit` egyszer vár (KFD-korlát és/vagy `GGML_CUDA_VMM_WAIT_MS`), majd szinkron nulláz. A puffereket a `relayout` a `commit` után érinti először.
 
-### 7.2 Nyitott akadály: a ROCm-build nem futott le (2026-11-09)
+### 7.2 Megoldott akadály: a ROCm-build nem futott le (2026-11-09; az Actions azóta újra be van kapcsolva)
 A `7a0b6086f` kód és az ollama-dualbuf `8419895f` patch-e fent van, de a `dualbuf-image` workflow nem indult el: a `csaki89/ollama` repóban ki vannak kapcsolva a GitHub Actions (`gh workflow run`: HTTP 422, "Actions has been disabled for this repository"). Ezért a `commit` lépés és a KFD-korlát HIP-en még nem fordult le, image nincs, a compose címkéje marad a `b744d77`. Teendő: az Actions visszakapcsolása, utána a workflow indítása; a várható címke `0.40.2-dualbuf-8419895`. A `vmm-stress` NAS-teszt ettől független, a checkoutból futtatható.
