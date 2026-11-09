@@ -1049,6 +1049,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 // HIP has the VMM functions in the runtime, CUDA needs the driver API (GGML_USE_VMM)
 #if defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
 #define GGML_CUDA_GROWABLE_BUFFER
+#include <chrono>
+#include <thread>
 #if defined(GGML_USE_HIP)
 #define GGML_CUDA_VMM_OK(x) ((x) == hipSuccess)
 #ifndef CU_MEM_ALLOC_GRANULARITY_MINIMUM
@@ -1065,6 +1067,35 @@ static bool ggml_cuda_vmm_debug() {
 }
 #define GGML_CUDA_VMM_LOG(...) do { if (ggml_cuda_vmm_debug()) { GGML_LOG_INFO(__VA_ARGS__); } } while (0)
 
+// A mapping is not usable when hipMemSetAccess returns: on ROCm it is an amdgpu GEM_VA ioctl, which queues the page table update
+// on the VM's delayed entity and does not wait for it (the first access faults, depending on the timing). A KFD mapping waits for
+// its own update on the same entity (FIFO) and flushes the TLB, so mapping a fresh allocation larger than the ROCr 2 MiB
+// suballocation block is a barrier for all the updates queued before it.
+// GGML_CUDA_VMM_SYNC=auto|barrier|wait|both|none (auto: both on HIP, none on CUDA), GGML_CUDA_VMM_WAIT_MS (default: 5 on HIP, 0 on CUDA)
+struct ggml_cuda_vmm_sync_mode {
+    bool barrier;
+    int  wait_ms;
+};
+
+static const ggml_cuda_vmm_sync_mode & ggml_cuda_vmm_sync() {
+    static const ggml_cuda_vmm_sync_mode mode = []() {
+#if defined(GGML_USE_HIP)
+        const bool is_hip = true;
+#else
+        const bool is_hip = false;
+#endif
+        const char * env_sync = getenv("GGML_CUDA_VMM_SYNC");
+        const char * env_wait = getenv("GGML_CUDA_VMM_WAIT_MS");
+        const std::string s = env_sync ? env_sync : "auto";
+        const bool   do_all = s == "both" || (s == "auto" && is_hip);
+        const int    wait   = env_wait ? atoi(env_wait) : (is_hip ? 5 : 0);
+        ggml_cuda_vmm_sync_mode m = { do_all || s == "barrier", do_all || s == "wait" ? wait : 0 };
+        GGML_LOG_INFO("ggml_cuda_vmm_sync: after mapping: GGML_CUDA_VMM_SYNC=%s: KFD barrier %s, wait %d ms\n", s.c_str(), m.barrier ? "on" : "off", m.wait_ms);
+        return m;
+    }();
+    return mode;
+}
+
 static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20;   // 2 MiB
 static constexpr size_t GGML_CUDA_VMM_MAX_CHUNK = 256ull << 20; // 256 MiB (a single 1 GiB chunk is unreliable on ROCm)
 
@@ -1076,6 +1107,7 @@ struct ggml_cuda_vmm_arena {
     size_t      reserved = 0;
     size_t      align    = 0;
     int         refs     = 1; // the creator and every buffer in it
+    std::vector<std::pair<CUdeviceptr, size_t>> pending; // mapped chunks not committed yet (not to be accessed)
 };
 
 static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
@@ -1109,8 +1141,13 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
 
     ~ggml_backend_cuda_growable_buffer_context() override {
         // each mapping on its own (ROCR-Runtime issue 285), its handle only after the unmap; the address range goes with the arena
+        // no stream may use a chunk when it is unmapped
         ggml_cuda_set_device(device);
         (void) cudaDeviceSynchronize();
+        auto & pending = arena->pending;
+        for (auto & m : mappings) {
+            pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
+        }
         for (auto & m : mappings) {
             const auto r_unmap   = cuMemUnmap(m.ptr, m.size);
             const auto r_release = cuMemRelease(m.handle);
@@ -1120,7 +1157,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
         dev_ptr = nullptr; // not from cudaMalloc
     }
 
-    // map physical memory up to size into the section, then zero it synchronously (the first access)
+    // map physical memory up to size into the section; it must not be accessed before ggml_cuda_vmm_commit
     bool map_to(size_t size) {
         const size_t align = arena->align;
         const size_t need  = align * ((size + align - 1) / align);
@@ -1161,17 +1198,55 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             mappings.push_back({ ptr, chunk, handle });
             mapped += chunk;
 
-            // the first access: a synchronous memset, as in the VMM test
-            const cudaError_t r_zero = cudaMemset((void *) ptr, 0, chunk);
-            const cudaError_t r_sync = cudaDeviceSynchronize();
-            GGML_CUDA_VMM_LOG("%s: zero %p + %zu: %d, sync: %d\n", __func__, (void *) ptr, chunk, (int) r_zero, (int) r_sync);
-            if (r_zero != cudaSuccess || r_sync != cudaSuccess) {
-                return false;
-            }
+            arena->pending.push_back({ ptr, chunk });
         }
         return true;
     }
 };
+
+// wait until the pending mappings of the arena are valid, then zero them synchronously (their first access)
+static bool ggml_cuda_vmm_commit(ggml_cuda_vmm_arena * arena) {
+    if (arena->pending.empty()) {
+        return true;
+    }
+    ggml_cuda_set_device(arena->device);
+    const ggml_cuda_vmm_sync_mode & mode = ggml_cuda_vmm_sync();
+    const int64_t t0 = ggml_time_us();
+    bool barrier_ok = false;
+    if (mode.barrier) {
+        void * p = nullptr;
+        const cudaError_t r_barrier = cudaMalloc(&p, 4ull << 20);
+        barrier_ok = r_barrier == cudaSuccess;
+        if (barrier_ok) {
+            (void) cudaFree(p);
+        } else {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: the KFD barrier allocation failed (%d), relying on the wait\n", __func__, (int) r_barrier);
+        }
+    }
+    if (mode.wait_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(mode.wait_ms));
+    }
+    const int64_t t1 = ggml_time_us();
+    size_t bytes = 0;
+    for (const auto & p : arena->pending) {
+        const cudaError_t r_zero = cudaMemset((void *) p.first, 0, p.second);
+        GGML_CUDA_VMM_LOG("%s: zero %p + %zu: %d\n", __func__, (void *) p.first, p.second, (int) r_zero);
+        if (r_zero != cudaSuccess) {
+            return false;
+        }
+        bytes += p.second;
+    }
+    const cudaError_t r_sync = cudaDeviceSynchronize();
+    GGML_CUDA_VMM_LOG("%s: %zu chunks, %zu bytes: wait for the mappings %.1f ms (barrier %s, wait %d ms), zeroing %.1f ms, sync: %d\n", __func__,
+        arena->pending.size(), bytes, (t1 - t0) / 1000.0, barrier_ok ? "done" : "no", mode.wait_ms, (ggml_time_us() - t1) / 1000.0, (int) r_sync);
+    arena->pending.clear();
+    return r_sync == cudaSuccess;
+}
+
+static bool ggml_backend_cuda_vmm_arena_commit(void * arena) {
+    return ggml_cuda_vmm_commit((ggml_cuda_vmm_arena *) arena);
+}
 
 // a new arena of size bytes on the device of buft; NULL if the device has no VMM (the caller falls back)
 static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1244,7 +1319,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_vmm_arena_buffer(void * arena_ptr
     return ggml_backend_buffer_init(arena->buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
-// map more memory at the end of a growable buffer's section; false if it is not one, or the memory is not available
+// the arena of a growable buffer, committed after a series of ggml_backend_buffer_grow calls
+static bool ggml_backend_cuda_buffer_grow_commit(ggml_backend_buffer_t buffer) {
+    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
+    return ctx && ggml_cuda_vmm_commit(ctx->arena);
+}
+
+// map more memory at the end of a growable buffer's section (to be committed before any access); false if it is not one, or the memory is not available
 static bool ggml_backend_cuda_buffer_grow(ggml_backend_buffer_t buffer, size_t size) {
     if (!ggml_backend_buffer_is_cuda(buffer)) {
         return false;
@@ -6794,6 +6875,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_vmm_arena_buffer") == 0) {
         return (void *)ggml_backend_cuda_vmm_arena_buffer;
+    }
+    if (strcmp(name, "ggml_backend_vmm_arena_commit") == 0) {
+        return (void *)ggml_backend_cuda_vmm_arena_commit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_grow_commit;
     }
     if (strcmp(name, "ggml_backend_vmm_arena_free") == 0) {
         return (void *)ggml_backend_cuda_vmm_arena_free;

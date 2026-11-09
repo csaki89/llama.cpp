@@ -52,6 +52,15 @@ Következmények a tervre:
 - A -4%-os eltérést a `hipMalloc` után a valódi megvalósításban is meg kell mérni.
 - Nyitott: a Vulkan megfelelője (sparse binding) nincs megvizsgálva; a VMM-teszt csak ROCm-ra vonatkozik.
 
+#### A VMM-laphiba vizsgálata (NAS, ROCm 7.2.1, gfx1030 + HSA_OVERRIDE 10.3.0, TrueNAS kernel 6.12.33)
+Mért tények:
+- Ugyanaz a kód futásonként változóan működik vagy laphibát ad. A dmesg szerint a hiba pillanatában nincs bejegyzés a GPU laptáblájában (PERMISSION_FAULTS, MAPPING_ERROR, WALKER_ERROR mind 0), a `hipMemMap` és a `hipMemSetAccess` `hipSuccess`-szel tér vissza.
+- Önálló teszt (granularitás, igazítás, egy nagy címtartomány, abba egymás után darabok, minden darab teljes kitöltése kernellel és visszaolvasása): várakozás nélkül 2, 4, 64 és 256 MiB-os darabbal 0/3; a `hipMemMap` + `hipMemSetAccess` utáni 1, 10 és 100 ms várakozással minden méretnél 3/3.
+- Egy 9 GiB-os címtartomány, abba 24 x 256 MiB, 96 x 64 MiB és 8 x 1 GiB (6-8 GiB fizikai VRAM) várakozással hibátlan, a VRAM-foglaltság pontosan követi a leképezést, és a felszabadítás után visszaesik. (Az "egyetlen 1 GiB-os darab megbízhatatlan" korábbi megállapítás is ugyanez az időzítési hiba lehetett.)
+- Kizárva: a címtartomány mérete (1 és 9 GiB egyforma), a részleges leképezés, az igazítás (4 KiB és 2 MiB egyforma), a `hipMalloc`-kal közös használat, a granularitás ismételt lekérdezése, a `hipMemGetInfo` hívása. Ahol várakozás nélkül mégis működött, ott a leképezés és az első hozzáférés közé véletlenül került ~10 ms CPU-munka.
+
+Ok (forrásból): a `hipMemSetAccess` a ROCr-en át a DRM `GEM_VA` ioctl-t hívja, amely a laptábla-frissítést sorba teszi és nem várja meg; a KFD-s leképezés megvárja a sajátját. A megoldás és a nyitott kérdés: DECISIONS.md 33-34 (KFD-korlát + kis várakozás), a NAS-teszt: `tools/dualbuf/vmm-stress.sh`.
+
 ### Szükséges építőkockák
 - **Dinamikus KV-foglalás.** Ma a KV-cache a context létrehozásakor fix méretben foglalódik. A rugalmas sáv akkor ér valamit, ha a KV növekedhet (vagy zsugorodhat) futás közben, és a felszabaduló/lefoglalt VRAM a sávval kiegyenlíthető. Kérdés: szegmentált KV vagy újrafoglalás; a `llama_kv_cache` és a `--fit` kölcsönhatása.
 - **Rétegek áthelyezése futás közben: kész** (`--flex-layers`, DESIGN-3zone.md). Levétel: mező-csere + a GPU-puffer felszabadítása (~1 ms) + a K/V átmásolása (csak a használt cellák, DMA; a laptopon 1-20 ms, a foglalás dominál). Visszatétel: a host-példányból (6-10 ms/réteg a laptopon). A kiváltás ma csak hibakereső környezeti változóval megy; a szabály (mikor, hány réteg, hiszterézis) hiányzik.

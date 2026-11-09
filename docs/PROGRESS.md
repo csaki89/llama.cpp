@@ -35,3 +35,4 @@
 - 1. MoE (részleges flex rétegek a fit override-jaiból): kész, `granite-3.1-1b-a400m`-mel kipróbálva (DECISIONS.md 26).
 - 2. VMM a KV-növeléshez (ggml-cuda/HIP növelhető puffer, rétegenként, tartalék úttal, csúcs a zónaszabályban): kész, a laptopon szimulációval ellenőrizve, a ROCm-build az ollama-dualbuf CI-jén (DECISIONS.md 27-29).
 - 3. Flash Attention: forrásból kiderítve, nem kényszerítjük, egyértelmű napló (DECISIONS.md 30).
+- 8. VMM-laphiba: a leképezés aszinkron (DRM `GEM_VA`), KFD-korlát + várakozás, `commit` lépés, `vmm-stress` NAS-teszt (DECISIONS.md 33-36).

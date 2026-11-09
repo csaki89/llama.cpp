@@ -310,3 +310,6 @@ Valódi VMM (CUDA/HIP), ROCm, nagy MoE (qwen3-coder:30b), több slot. A megszaka
 
 ### VMM aréna (DECISIONS 32), laptop
 A változás a ggml-cuda-ban és a KV relayoutban van; a laptopos (Vulkan) út nem kap arénát. Ellenőrzés: dinamikus KV a tartalék úton `0063c4c5` (mint a statikus), `LLAMA_KV_VMM_SIM=1`-gyel (az aréna-API szimulációja) `set_dynamic: ... 13/13 layers in place (VMM)`, a növelés `13 grown in place`, a kimenet `0063c4c5`; szerveres beszélgetés-próba `10476d2c` / `d640dab1` / `10476d2c`, mint korábban.
+
+### VMM: leképezés-várakozás és commit (DECISIONS 33-35), laptop
+A valódi VMM-út a laptopon nem fut (nincs ROCm). Ellenőrzés: `bench.sh -r 1` mind a 16 md5-je és puffere a korábbi; dinamikus KV a tartalék úton és `LLAMA_KV_VMM_SIM=1`-gyel `0063c4c5`; szerveres próba dense `10476d2c` / `d640dab1` / `10476d2c` (20 mozgatás), MoE `f3980366` / `70b4fb2a` / `f3980366` (30 mozgatás).

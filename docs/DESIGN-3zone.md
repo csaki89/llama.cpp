@@ -130,3 +130,6 @@ Cél: kézi beállítás nélkül, a `--auto-zones` kapcsolóval (`LLAMA_ARG_AUT
 - **VMM (DECISIONS 27-29):** a ggml-cuda/HIP növelhető puffert ad (`ggml_backend_buffer_alloc_growable`, `ggml_backend_buffer_grow` a registry-n át: előre lefoglalt címtartomány, legfeljebb 64 MiB-os darabok, felszabadítás a címtartománnyal). A KV a GPU-s, nem egész-flex rétegeknél ezt használja (helyben nő, nincs átmeneti dupla foglalás), egyébként a tartalék út fut (új puffer + másolás); a zónaszabály a tartalék út csúcsát (`resize_peak`) előre felszabadítja. `LLAMA_KV_NO_VMM=1` kikapcsolja, `LLAMA_KV_VMM_SIM=1` szimulálja.
 - **Flash Attention (DECISIONS 30):** a dinamikus KV a nem transzponált V-t igényli, ami `-fa auto`/`on` mellett teljesül; az FA-t nem kényszerítjük, a napló jelzi az állapotot.
 - **Kockázat:** a VMM-kód csak a ROCm-buildben fordul (a laptopon nincs CUDA/HIP); a működését a NAS-on kell igazolni (SUMMARY.md 8.).
+
+### 7.1 A VMM-leképezés érvényessége (DECISIONS 33-35)
+A `hipMemSetAccess` a laptábla-frissítést csak sorba teszi. Ezért a VMM-út szétválasztja a leképezést és az első hozzáférést: a `map_to` csak leképez, a `commit` egyszer vár (KFD-korlát és/vagy `GGML_CUDA_VMM_WAIT_MS`), majd szinkron nulláz. A puffereket a `relayout` a `commit` után érinti először.
