@@ -38,3 +38,4 @@
 - 8. VMM-laphiba: a leképezés aszinkron (DRM `GEM_VA`), KFD-korlát + várakozás, `commit` lépés, `vmm-stress` NAS-teszt (DECISIONS.md 33-36).
 - A ROCm-build nem futott le: a csaki89/ollama repóban ki vannak kapcsolva az Actions (DESIGN-3zone.md 7.2).
 - 9. A VMM-teszt a valódi megvalósítást is hívja (`vmm-stress-impl`), a tesztprogramok a ROCm-image részei (DECISIONS.md 37). Az image elkészült: `0.40.2-dualbuf-b1798d9` (DESIGN-3zone.md 7.2), a NAS-os futtatás hátravan.
+- 10. VRAM-visszaadás és gyors VMM-teszt (DECISIONS.md 38-39): élő aréna-/leképezés-számláló a ggml-cudában, a teszt a VRAM visszatérését időzítve méri; az első hozzáférés csak az új darabokat éri, mért késleltetéssel.

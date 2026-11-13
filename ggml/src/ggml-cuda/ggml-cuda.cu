@@ -1108,7 +1108,11 @@ struct ggml_cuda_vmm_arena {
     size_t      align    = 0;
     int         refs     = 1; // the creator and every buffer in it
     std::vector<std::pair<CUdeviceptr, size_t>> pending; // mapped chunks not committed yet (not to be accessed)
+    int64_t     t_mapped = 0; // end of the last mapping (us)
 };
+
+// live arenas, mapped bytes, and of the last commit: mapping end -> first access (us), of which the sync (us)
+static std::atomic<int64_t> ggml_cuda_vmm_stat[4];
 
 static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
     if (--arena->refs > 0) {
@@ -1117,7 +1121,9 @@ static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
     ggml_cuda_set_device(arena->device);
     (void) cudaDeviceSynchronize();
     const auto r_free = cuMemAddressFree(arena->base, arena->reserved);
-    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d\n", __func__, (void *) arena->base, arena->reserved, (int) r_free);
+    const int64_t left = --ggml_cuda_vmm_stat[0];
+    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left %lld, mapped %lld bytes)\n", __func__, (void *) arena->base, arena->reserved,
+        (int) r_free, (long long) left, (long long) ggml_cuda_vmm_stat[1].load());
     delete arena;
 }
 
@@ -1151,6 +1157,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
         for (auto & m : mappings) {
             const auto r_unmap   = cuMemUnmap(m.ptr, m.size);
             const auto r_release = cuMemRelease(m.handle);
+            ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
             GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
         }
         ggml_cuda_vmm_arena_unref(arena);
@@ -1197,8 +1204,10 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             }
             mappings.push_back({ ptr, chunk, handle });
             mapped += chunk;
+            ggml_cuda_vmm_stat[1] += (int64_t) chunk;
 
             arena->pending.push_back({ ptr, chunk });
+            arena->t_mapped = ggml_time_us();
         }
         return true;
     }
@@ -1228,6 +1237,8 @@ static bool ggml_cuda_vmm_commit(ggml_cuda_vmm_arena * arena) {
         std::this_thread::sleep_for(std::chrono::milliseconds(mode.wait_ms));
     }
     const int64_t t1 = ggml_time_us();
+    ggml_cuda_vmm_stat[2] = t1 - arena->t_mapped;
+    ggml_cuda_vmm_stat[3] = t1 - t0;
     size_t bytes = 0;
     for (const auto & p : arena->pending) {
         const cudaError_t r_zero = cudaMemset((void *) p.first, 0, p.second);
@@ -1287,7 +1298,16 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
     if (!GGML_CUDA_VMM_OK(r_reserve)) {
         return nullptr;
     }
+    (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
+    ++ggml_cuda_vmm_stat[0];
     return new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
+}
+
+// stats[4]: live arenas, mapped bytes, last commit: mapping end -> first access (us), of which the sync (us)
+static void ggml_backend_cuda_vmm_stats(int64_t * stats) {
+    for (int i = 0; i < 4; ++i) {
+        stats[i] = ggml_cuda_vmm_stat[i];
+    }
 }
 
 static size_t ggml_backend_cuda_vmm_arena_alignment(void * arena) {
@@ -6881,6 +6901,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
         return (void *)ggml_backend_cuda_buffer_grow_commit;
+    }
+    if (strcmp(name, "ggml_backend_vmm_stats") == 0) {
+        return (void *)ggml_backend_cuda_vmm_stats;
     }
     if (strcmp(name, "ggml_backend_vmm_arena_free") == 0) {
         return (void *)ggml_backend_cuda_vmm_arena_free;
