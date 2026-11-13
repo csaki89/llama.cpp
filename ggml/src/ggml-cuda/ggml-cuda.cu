@@ -1070,8 +1070,9 @@ static bool ggml_cuda_vmm_debug() {
 // A mapping is not usable when hipMemSetAccess returns: on ROCm it is an amdgpu GEM_VA ioctl, which queues the page table update
 // on the VM's delayed entity and does not wait for it (the first access faults, depending on the timing). A KFD mapping waits for
 // its own update on the same entity (FIFO) and flushes the TLB, so mapping a fresh allocation larger than the ROCr 2 MiB
-// suballocation block is a barrier for all the updates queued before it.
-// GGML_CUDA_VMM_SYNC=auto|barrier|wait|both|none (auto: both on HIP, none on CUDA), GGML_CUDA_VMM_WAIT_MS (default: 5 on HIP, 0 on CUDA)
+// suballocation block is a barrier for all the updates queued before it (NAS: 0.2-0.4 ms; a blind wait is not reliable).
+// GGML_CUDA_VMM_SYNC=auto|barrier|wait|both|none (auto: barrier on HIP, none on CUDA); wait and both are for debugging only,
+// with GGML_CUDA_VMM_WAIT_MS (default 5). Without the barrier allocation the commit fails and the caller falls back to a copy.
 struct ggml_cuda_vmm_sync_mode {
     bool barrier;
     int  wait_ms;
@@ -1087,9 +1088,8 @@ static const ggml_cuda_vmm_sync_mode & ggml_cuda_vmm_sync() {
         const char * env_sync = getenv("GGML_CUDA_VMM_SYNC");
         const char * env_wait = getenv("GGML_CUDA_VMM_WAIT_MS");
         const std::string s = env_sync ? env_sync : "auto";
-        const bool   do_all = s == "both" || (s == "auto" && is_hip);
-        const int    wait   = env_wait ? atoi(env_wait) : (is_hip ? 5 : 0);
-        ggml_cuda_vmm_sync_mode m = { do_all || s == "barrier", do_all || s == "wait" ? wait : 0 };
+        const int    wait   = env_wait ? atoi(env_wait) : 5;
+        ggml_cuda_vmm_sync_mode m = { s == "both" || s == "barrier" || (s == "auto" && is_hip), s == "both" || s == "wait" ? wait : 0 };
         GGML_LOG_INFO("ggml_cuda_vmm_sync: after mapping: GGML_CUDA_VMM_SYNC=%s: KFD barrier %s, wait %d ms\n", s.c_str(), m.barrier ? "on" : "off", m.wait_ms);
         return m;
     }();
@@ -1221,16 +1221,15 @@ static bool ggml_cuda_vmm_commit(ggml_cuda_vmm_arena * arena) {
     ggml_cuda_set_device(arena->device);
     const ggml_cuda_vmm_sync_mode & mode = ggml_cuda_vmm_sync();
     const int64_t t0 = ggml_time_us();
-    bool barrier_ok = false;
+    // the barrier block is freed only after the sync at the end: cudaFree synchronizes the device, which is idle by then
+    void * barrier = nullptr;
     if (mode.barrier) {
-        void * p = nullptr;
-        const cudaError_t r_barrier = cudaMalloc(&p, 4ull << 20);
-        barrier_ok = r_barrier == cudaSuccess;
-        if (barrier_ok) {
-            (void) cudaFree(p);
-        } else {
+        const cudaError_t r_barrier = cudaMalloc(&barrier, 4ull << 20);
+        if (r_barrier != cudaSuccess) {
             (void) cudaGetLastError();
-            GGML_LOG_WARN("%s: the KFD barrier allocation failed (%d), relying on the wait\n", __func__, (int) r_barrier);
+            GGML_LOG_ERROR("%s: the KFD barrier allocation failed (%d, device memory full?): %zu new mappings not committed, "
+                "the caller falls back to a copy\n", __func__, (int) r_barrier, arena->pending.size());
+            return false;
         }
     }
     if (mode.wait_ms > 0) {
@@ -1244,13 +1243,18 @@ static bool ggml_cuda_vmm_commit(ggml_cuda_vmm_arena * arena) {
         const cudaError_t r_zero = cudaMemset((void *) p.first, 0, p.second);
         GGML_CUDA_VMM_LOG("%s: zero %p + %zu: %d\n", __func__, (void *) p.first, p.second, (int) r_zero);
         if (r_zero != cudaSuccess) {
+            (void) cudaDeviceSynchronize();
+            (void) cudaFree(barrier);
             return false;
         }
         bytes += p.second;
     }
     const cudaError_t r_sync = cudaDeviceSynchronize();
-    GGML_CUDA_VMM_LOG("%s: %zu chunks, %zu bytes: wait for the mappings %.1f ms (barrier %s, wait %d ms), zeroing %.1f ms, sync: %d\n", __func__,
-        arena->pending.size(), bytes, (t1 - t0) / 1000.0, barrier_ok ? "done" : "no", mode.wait_ms, (ggml_time_us() - t1) / 1000.0, (int) r_sync);
+    const int64_t t2 = ggml_time_us();
+    (void) cudaFree(barrier);
+    GGML_CUDA_VMM_LOG("%s: %zu chunks, %zu bytes: wait for the mappings %.2f ms (barrier %s, wait %d ms), zeroing %.2f ms, sync: %d, barrier free %.2f ms\n",
+        __func__, arena->pending.size(), bytes, (t1 - t0) / 1000.0, barrier ? "done" : "off", mode.wait_ms, (t2 - t1) / 1000.0, (int) r_sync,
+        (ggml_time_us() - t2) / 1000.0);
     arena->pending.clear();
     return r_sync == cudaSuccess;
 }

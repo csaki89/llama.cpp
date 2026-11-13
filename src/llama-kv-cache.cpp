@@ -3154,7 +3154,12 @@ typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_
 typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
 
-// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the section size, to test the in-place path without VMM
+// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the section size, to test the in-place path without VMM;
+// LLAMA_KV_VMM_SIM=2: every commit fails, 3: only the growth commits fail (the fallbacks to a copy, as when the HIP barrier allocation fails)
+static int kv_sim_level() {
+    static const int level = getenv("LLAMA_KV_VMM_SIM") ? atoi(getenv("LLAMA_KV_VMM_SIM")) : 0;
+    return level;
+}
 struct kv_sim_arena {
     ggml_backend_buffer_type_t buft;
 };
@@ -3179,11 +3184,11 @@ static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
 
 static bool kv_sim_arena_commit(void * arena) {
     GGML_UNUSED(arena);
-    return true;
+    return kv_sim_level() != 2;
 }
 static bool kv_sim_grow_commit(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
-    return true;
+    return kv_sim_level() != 2 && kv_sim_level() != 3;
 }
 
 static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name) {
@@ -3191,8 +3196,7 @@ static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name)
     if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         return nullptr;
     }
-    static const bool sim = getenv("LLAMA_KV_VMM_SIM") && atoi(getenv("LLAMA_KV_VMM_SIM")) != 0;
-    if (sim) {
+    if (kv_sim_level() != 0) {
         if (strcmp(name, "ggml_backend_vmm_arena_new")       == 0) { return (void *) kv_sim_arena_new; }
         if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0) { return (void *) kv_sim_arena_alignment; }
         if (strcmp(name, "ggml_backend_vmm_arena_buffer")    == 0) { return (void *) kv_sim_arena_buffer; }
@@ -3296,8 +3300,7 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
     std::vector<uint8_t> grown(layers.size(), 0);
     if (n > n_old && !force) {
         const int64_t t1 = ggml_time_us();
-        ggml_backend_buffer_t buf_grown = nullptr;
-        ggml_backend_buffer_type_t buft_grown = nullptr;
+        std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_t> buf_grown; // one grown buffer per device (arena)
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
             if (!dyn_vmm[ikv]) {
                 continue;
@@ -3313,18 +3316,24 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
             }
             if (ok) {
                 grown[ikv] = 1;
-                buf_grown  = layer.k->buffer;
-                buft_grown = buft;
+                buf_grown[buft] = layer.k->buffer;
             } else {
                 LLAMA_LOG_WARN("%s: layer %u: growing the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
                 dyn_vmm[ikv] = 0;
             }
         }
-        if (buf_grown) {
-            auto commit = (ggml_backend_buffer_grow_commit_t) kv_growable_fn(buft_grown, "ggml_backend_buffer_grow_commit");
-            if (!commit || !commit(buf_grown)) {
-                LLAMA_LOG_ERROR("%s: the new K/V mappings could not be committed\n", __func__);
-                return false;
+        // a failed commit: the new mappings of that device are never accessed, its layers grow by copy (the old buffers go at the end)
+        for (const auto & [buft, buf] : buf_grown) {
+            auto commit = (ggml_backend_buffer_grow_commit_t) kv_growable_fn(buft, "ggml_backend_buffer_grow_commit");
+            if (commit && commit(buf)) {
+                continue;
+            }
+            LLAMA_LOG_ERROR("%s: the new K/V mappings on %s could not be committed, falling back to new buffers and a copy\n", __func__, ggml_backend_buft_name(buft));
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                if (grown[ikv] && ggml_backend_buffer_get_type(layers[ikv].k->buffer) == buft) {
+                    grown[ikv]   = 0;
+                    dyn_vmm[ikv] = 0;
+                }
             }
         }
         t_alloc += ggml_time_us() - t1;
@@ -3402,11 +3411,17 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
                 bufs_section[ikv].push_back(std::move(b));
             }
         }
+        // a failed commit: the sections of that device are freed unaccessed, its layers get ordinary buffers and a copy
         for (auto & [buft, ar] : arenas) {
             auto commit = (ggml_backend_vmm_arena_commit_t) kv_growable_fn(buft, "ggml_backend_vmm_arena_commit");
-            if (!commit || !commit(ar.arena)) {
-                LLAMA_LOG_ERROR("%s: the new K/V mappings could not be committed\n", __func__);
-                return false;
+            if (commit && commit(ar.arena)) {
+                continue;
+            }
+            LLAMA_LOG_ERROR("%s: the new K/V sections on %s could not be committed, falling back to ordinary buffers and a copy\n", __func__, ggml_backend_buft_name(buft));
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                if (!bufs_section[ikv].empty() && ggml_backend_buffer_get_type(layers[ikv].k->buffer) == buft) {
+                    bufs_section[ikv].clear();
+                }
             }
         }
         t_alloc += ggml_time_us() - t1;

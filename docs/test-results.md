@@ -313,3 +313,7 @@ A változás a ggml-cuda-ban és a KV relayoutban van; a laptopos (Vulkan) út n
 
 ### VMM: leképezés-várakozás és commit (DECISIONS 33-35), laptop
 A valódi VMM-út a laptopon nem fut (nincs ROCm). Ellenőrzés: `bench.sh -r 1` mind a 16 md5-je és puffere a korábbi; dinamikus KV a tartalék úton és `LLAMA_KV_VMM_SIM=1`-gyel `0063c4c5`; szerveres próba dense `10476d2c` / `d640dab1` / `10476d2c` (20 mozgatás), MoE `f3980366` / `70b4fb2a` / `f3980366` (30 mozgatás).
+
+## HIP: csak a korlát, másolásos tartalék a commit hibájánál (DECISIONS.md 40)
+
+`bench.sh -r 1`: mind a 16 futás md5-je és puffere a korábbi (rövid `8e2d6759`; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`). Szerveres próba (dense, `LLAMA_ZONES_HEADROOM_MIB=30`, `-c 32768 --auto-zones -fitt 6500 --zones-ctx-init 512`): `LLAMA_KV_VMM_SIM` 0, 1, 2 és 3 mellett egyaránt `10476d2c` / `d640dab1` / `10476d2c`, 20 mozgatás. A 2-es szinten (minden commit hibát ad) 6 `could not be committed` hibasor, minden réteg közönséges pufferrel és másolással nő; a 3-as szinten (csak a helyben növelés commitja hibázik) 4 hibasor, a rétegek új szakaszba költöznek (`0 grown in place, 9 new growable, 19 new by copy`). MoE (granite, `-c 12288 ... --zones-ctx-init 1024`, `HEADROOM=20`): `f3980366` / `70b4fb2a` / `f3980366`, 30 mozgatás. A HIP-kód a laptopon nem fordul (a NAS-on a CI image-ében).

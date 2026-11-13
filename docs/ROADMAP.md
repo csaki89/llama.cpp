@@ -61,6 +61,19 @@ Mért tények:
 
 Ok (forrásból): a `hipMemSetAccess` a ROCr-en át a DRM `GEM_VA` ioctl-t hívja, amely a laptábla-frissítést sorba teszi és nem várja meg; a KFD-s leképezés megvárja a sajátját. A megoldás és a nyitott kérdés: DECISIONS.md 33-34 (KFD-korlát + kis várakozás), a NAS-teszt: `tools/dualbuf/vmm-stress.sh`.
 
+#### A szinkron módok NAS-mérése a valódi megvalósításon (image 0.40.2-dualbuf-7d20ed3, ROCm 7.2.1, gfx1030, `vmm-stress` gyors mód)
+- A teszt érzékeny: a `none` mód az impl a és b, a pattern a, b és c esetében laphibát kap. A leképezés és az első hozzáférés között legfeljebb 0,03 ms egyéb munka van, tehát a teszt semmit nem fed el. A végső felszabadítás után a VRAM 21-116 ms alatt visszajön (DECISIONS.md 38).
+- `wait` (5 ms): az impl b esetében (csökkentés, majd újranövelés) laphiba, a többi rendben. A vak várakozás 5 ms-mal sem megbízható.
+- `barrier`: az impl és a pattern minden esetben rendben; a szinkron 0,18-0,35 ms, az impl b esetében egyszer 35 ms (a korlát a nagy aréna felszabadítása után a hosszú sort várta ki).
+- `both`: minden rendben, ~5,3 ms, az impl b esetében 38 ms.
+- Korábbi önálló mérések ugyanezen a gépen: a laptábla-frissítés a leképezés után ~30-100 µs (10-30 µs vak várakozás a nagyobb darabokkal hibázik, 100 µs elég volt); a `hipDeviceSynchronize` nem segít; egy üres kernel + `hipStreamSynchronize` sem megbízható (csak ~20 µs késleltetésként hat, 64 és 256 MiB-os darabokkal 0/5). A korlát költségének nagyobb része a `hipFree` (üresjáratban `hipMalloc` 4 MiB ~78 µs, `hipFree` ~207 µs), és a `hipFree` a teljes eszközt szinkronizálja.
+- Következtetés: HIP-en az alapértelmezés a KFD-korlát várakozás nélkül; a vak várakozás csak hibakereső mód; a korlát `hipFree`-je a `commit` saját eszközszinkronja után fut (DECISIONS.md 40).
+
+#### Később: TrueNAS 27 / 6.18-as kernel / újabb ROCm (a TrueNAS 27.0 megjelenése után megvizsgálandó)
+- A 6.18-as kernel amdgpu `GEM_VA` hívása timeline syncobj-ot tud adni a laptábla-frissítés megvárására: ezzel a várakozás determinisztikus lehet, a KFD-korlát (egy friss 4 MiB-os foglalás és felszabadítás) nélkül. Ellenőrizendő, hogy a ROCr/HIP használja-e, vagy közvetlenül (libdrm) elérhető-e a mi kódunkból.
+- A `rocm/dev-ubuntu-24.04:latest` (HIP 7.16) a 6.12-es kernelen VMM nélkül működik, a VMM-úton viszont az első darabnál laphiba nélkül elakad. Az elakadás okát (a régi kernel és az új ROCr összjátéka, vagy a ROCr hibája) a 6.18-as kernellel újra meg kell nézni.
+- Teendő a megjelenés után: a `vmm-stress` (impl és pattern, minden mód) a 6.18-as kernelen a ROCm 7.2.1-es és az újabb ROCm-image-dzsel; ha a syncobj-os várakozás elérhető és megbízható, új szinkron mód (`syncobj`) és az alapértelmezés felülvizsgálata.
+
 ### Szükséges építőkockák
 - **Dinamikus KV-foglalás.** Ma a KV-cache a context létrehozásakor fix méretben foglalódik. A rugalmas sáv akkor ér valamit, ha a KV növekedhet (vagy zsugorodhat) futás közben, és a felszabaduló/lefoglalt VRAM a sávval kiegyenlíthető. Kérdés: szegmentált KV vagy újrafoglalás; a `llama_kv_cache` és a `--fit` kölcsönhatása.
 - **Rétegek áthelyezése futás közben: kész** (`--flex-layers`, DESIGN-3zone.md). Levétel: mező-csere + a GPU-puffer felszabadítása (~1 ms) + a K/V átmásolása (csak a használt cellák, DMA; a laptopon 1-20 ms, a foglalás dominál). Visszatétel: a host-példányból (6-10 ms/réteg a laptopon). A kiváltás ma csak hibakereső környezeti változóval megy; a szabály (mikor, hány réteg, hiszterézis) hiányzik.
