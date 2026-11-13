@@ -1096,8 +1096,11 @@ static const ggml_cuda_vmm_sync_mode & ggml_cuda_vmm_sync() {
     return mode;
 }
 
-static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20;   // 2 MiB
-static constexpr size_t GGML_CUDA_VMM_MAX_CHUNK = 256ull << 20; // 256 MiB (a single 1 GiB chunk is unreliable on ROCm)
+static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20; // 2 MiB: section alignment
+
+// Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
+// first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
+// GGML_CUDA_VMM_CHUNK_KIB (default 1024), rounded to the minimum granularity, a divisor of the section alignment.
 
 struct ggml_cuda_vmm_arena {
     ggml_backend_buffer_type_t buft;
@@ -1109,6 +1112,7 @@ struct ggml_cuda_vmm_arena {
     int         refs     = 1; // the creator and every buffer in it
     std::vector<std::pair<CUdeviceptr, size_t>> pending; // mapped chunks not committed yet (not to be accessed)
     int64_t     t_mapped = 0; // end of the last mapping (us)
+    size_t      chunk    = 0; // size of every mapping
 };
 
 // counters: live arenas, mapped bytes; of the last commit: mapping end -> first access (us), of which the sync (us)
@@ -1164,15 +1168,15 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
         dev_ptr = nullptr; // not from cudaMalloc
     }
 
-    // map physical memory up to size into the section; it must not be accessed before ggml_cuda_vmm_commit
+    // map whole chunks after the mapped ones until size is covered; they must not be accessed before ggml_cuda_vmm_commit
     bool map_to(size_t size) {
-        const size_t align = arena->align;
-        const size_t need  = align * ((size + align - 1) / align);
+        const size_t chunk = arena->chunk;
+        const size_t need  = chunk * ((size + chunk - 1) / chunk);
         if (need > section) {
+            GGML_LOG_ERROR("%s: %zu bytes do not fit the section (%zu)\n", __func__, size, section);
             return false;
         }
         while (mapped < need) {
-            const size_t chunk = std::min(GGML_CUDA_VMM_MAX_CHUNK - GGML_CUDA_VMM_MAX_CHUNK % align, need - mapped);
             CUmemAllocationProp prop = {};
             prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -1181,6 +1185,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             const auto r_create = cuMemCreate(&handle, chunk, &prop, 0);
             GGML_CUDA_VMM_LOG("%s: create %zu bytes on device %d: %d\n", __func__, chunk, arena->physical_device, (int) r_create);
             if (!GGML_CUDA_VMM_OK(r_create)) {
+                GGML_LOG_ERROR("%s: create %zu bytes failed (%d)\n", __func__, chunk, (int) r_create);
                 return false;
             }
             const CUdeviceptr ptr = (CUdeviceptr) ((char *) base + mapped);
@@ -1188,6 +1193,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             GGML_CUDA_VMM_LOG("%s: map %p + %zu (section offset %zu of %zu, arena offset %zu of %zu): %d\n", __func__, (void *) ptr, chunk,
                 mapped, section, (size_t) ((char *) ptr - (char *) arena->base), arena->reserved, (int) r_map);
             if (!GGML_CUDA_VMM_OK(r_map)) {
+                GGML_LOG_ERROR("%s: map %p + %zu failed (%d)\n", __func__, (void *) ptr, chunk, (int) r_map);
                 (void) cuMemRelease(handle);
                 return false;
             }
@@ -1198,6 +1204,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             const auto r_access = cuMemSetAccess(ptr, chunk, &access, 1);
             GGML_CUDA_VMM_LOG("%s: set access %p + %zu read/write for device %d: %d\n", __func__, (void *) ptr, chunk, arena->physical_device, (int) r_access);
             if (!GGML_CUDA_VMM_OK(r_access)) {
+                GGML_LOG_ERROR("%s: set access %p + %zu failed (%d)\n", __func__, (void *) ptr, chunk, (int) r_access);
                 (void) cuMemUnmap(ptr, chunk);
                 (void) cuMemRelease(handle);
                 return false;
@@ -1302,9 +1309,21 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
     if (!GGML_CUDA_VMM_OK(r_reserve)) {
         return nullptr;
     }
+    // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
+    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
+    size_t chunk = (env_chunk ? (size_t) atoll(env_chunk) : 1024) << 10;
+    if (gran_min > 0) {
+        chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
+    }
+    if (chunk == 0 || chunk > align || align % chunk != 0) {
+        chunk = align;
+    }
+    GGML_CUDA_VMM_LOG("%s: chunk %zu bytes\n", __func__, chunk);
     (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
     ++ggml_cuda_vmm_stat[0];
-    return new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
+    auto * arena = new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
+    arena->chunk = chunk;
+    return arena;
 }
 
 // stats[4]: live arenas, mapped bytes, last commit: mapping end -> first access (us), of which the sync (us)
@@ -1370,6 +1389,47 @@ static bool ggml_backend_cuda_buffer_grow(ggml_backend_buffer_t buffer, size_t s
     }
     buffer->size = size;
     GGML_CUDA_VMM_LOG("%s: buffer %p: %zu -> %zu bytes (mapped %zu of %zu)\n", __func__, (void *) ctx->base, size_old, size, ctx->mapped, ctx->section);
+    return true;
+}
+
+// shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
+// below stays); false if it is not one or an unmap fails
+static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
+    if (!ctx) {
+        return false;
+    }
+    if (size >= buffer->size) {
+        return true;
+    }
+    ggml_cuda_set_device(ctx->device);
+    (void) cudaDeviceSynchronize(); // no stream may use a chunk when it is unmapped
+    const size_t chunk      = ctx->arena->chunk;
+    const size_t keep       = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
+    const size_t size_old   = buffer->size;
+    const size_t mapped_old = ctx->mapped;
+    auto & pending = ctx->arena->pending;
+    while (!ctx->mappings.empty() && ctx->mapped - ctx->mappings.back().size >= keep) {
+        const auto m = ctx->mappings.back();
+        const auto r_unmap = cuMemUnmap(m.ptr, m.size);
+        if (!GGML_CUDA_VMM_OK(r_unmap)) {
+            GGML_LOG_ERROR("%s: buffer %p: unmap %p + %zu failed (%d)\n", __func__, (void *) ctx->base, (void *) m.ptr, m.size, (int) r_unmap);
+            (void) cudaGetLastError();
+            return false;
+        }
+        const auto r_release = cuMemRelease(m.handle);
+        pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
+        ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
+        ctx->mapped -= m.size;
+        ctx->mappings.pop_back();
+        GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
+    }
+    buffer->size = size;
+    GGML_CUDA_VMM_LOG("%s: buffer %p: %zu -> %zu bytes (mapped %zu -> %zu of %zu)\n", __func__, (void *) ctx->base, size_old, size,
+        mapped_old, ctx->mapped, ctx->section);
     return true;
 }
 #endif // defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
@@ -6905,6 +6965,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
         return (void *)ggml_backend_cuda_buffer_grow_commit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
+        return (void *)ggml_backend_cuda_buffer_shrink;
     }
     if (strcmp(name, "ggml_backend_vmm_stats") == 0) {
         return (void *)ggml_backend_cuda_vmm_stats;

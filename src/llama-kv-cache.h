@@ -286,6 +286,7 @@ public:
 private:
     uint32_t dyn_max   = 0;
     uint32_t dyn_chunk = 0;
+    uint32_t dyn_base  = 0; // size when it became dynamic: the sizes are dyn_base + k * dyn_chunk
     uint64_t n_resize  = 0;
     bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
     std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers

@@ -40,3 +40,4 @@
 - 9. A VMM-teszt a valódi megvalósítást is hívja (`vmm-stress-impl`), a tesztprogramok a ROCm-image részei (DECISIONS.md 37). Az image elkészült: `0.40.2-dualbuf-b1798d9` (DESIGN-3zone.md 7.2), a NAS-os futtatás hátravan.
 - 10. VRAM-visszaadás és gyors VMM-teszt (DECISIONS.md 38-39): élő aréna-/leképezés-számláló a ggml-cudában, a teszt a VRAM visszatérését időzítve méri; az első hozzáférés csak az új darabokat éri, mért késleltetéssel.
 - 11. HIP: csak a KFD-korlát (a vak várakozás csak hibakereső mód), a korlát felszabadítása a commit szinkronja után, a commit hibájánál másolásos tartalék (DECISIONS.md 40); a TrueNAS 27 / 6.18-as kernel vizsgálata a ROADMAP-ban.
+- 12. VMM: fix darabméret arénánként (a clr `hipMemSetAccess` hibája), a növelési lépés a kezdeti mérettől, helyben zsugorítás (`ggml_backend_buffer_shrink`), `vmm-stress-impl` e eset (DECISIONS.md 41).

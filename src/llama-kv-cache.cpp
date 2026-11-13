@@ -3123,6 +3123,7 @@ bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
     }
     dyn_max   = max_size;
     dyn_chunk = GGML_PAD(std::max<size_t>(1, chunk_bytes / per_cell), 256);
+    dyn_base  = get_size();
     const char * env = getenv("LLAMA_KV_NO_VMM");
     dyn_vmm_off = env && atoi(env) != 0;
     dyn_vmm.assign(layers.size(), 0);
@@ -3150,6 +3151,8 @@ typedef size_t                (*ggml_backend_vmm_arena_alignment_t)(void * arena
 typedef ggml_backend_buffer_t (*ggml_backend_vmm_arena_buffer_t)(void * arena, size_t offset, size_t size, size_t max_size);
 typedef void                  (*ggml_backend_vmm_arena_free_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
+// unmaps the whole chunks above size (the content below stays)
+typedef bool                  (*ggml_backend_buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
 // new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
@@ -3181,6 +3184,11 @@ static void kv_sim_arena_free(void * arena) {
 static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
     return size <= ggml_backend_buffer_get_size(buffer);
 }
+static bool kv_sim_shrink(ggml_backend_buffer_t buffer, size_t size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(size);
+    return true;
+}
 
 static bool kv_sim_arena_commit(void * arena) {
     GGML_UNUSED(arena);
@@ -3202,6 +3210,7 @@ static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name)
         if (strcmp(name, "ggml_backend_vmm_arena_buffer")    == 0) { return (void *) kv_sim_arena_buffer; }
         if (strcmp(name, "ggml_backend_vmm_arena_free")      == 0) { return (void *) kv_sim_arena_free; }
         if (strcmp(name, "ggml_backend_buffer_grow")         == 0) { return (void *) kv_sim_grow; }
+        if (strcmp(name, "ggml_backend_buffer_shrink")       == 0) { return (void *) kv_sim_shrink; }
         if (strcmp(name, "ggml_backend_vmm_arena_commit")    == 0) { return (void *) kv_sim_arena_commit; }
         if (strcmp(name, "ggml_backend_buffer_grow_commit")  == 0) { return (void *) kv_sim_grow_commit; }
         return nullptr;
@@ -3230,7 +3239,11 @@ uint32_t llama_kv_cache::dyn_round(uint32_t n) const {
     if (dyn_chunk == 0) {
         return n;
     }
-    return std::min<uint32_t>(dyn_max, ((n + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
+    // steps of dyn_chunk from the starting size (rounding to multiples of the chunk made 4096 -> 4608 with a 768 cell chunk)
+    if (n <= dyn_base) {
+        return dyn_base;
+    }
+    return std::min<uint32_t>(dyn_max, dyn_base + ((n - dyn_base + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
 }
 
 uint32_t llama_kv_cache::used_cells() const {
@@ -3339,6 +3352,31 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         t_alloc += ggml_time_us() - t1;
     }
 
+    // growable K/V shrinking: the used cells are below n, only the whole free chunks at the top are unmapped (no allocation, no copy)
+    if (n < n_old && !force) {
+        const int64_t t1 = ggml_time_us();
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if (!dyn_vmm[ikv]) {
+                continue;
+            }
+            auto & layer = layers[ikv];
+            auto shrink = (ggml_backend_buffer_shrink_t) kv_growable_fn(ggml_backend_buffer_get_type(layer.k->buffer), "ggml_backend_buffer_shrink");
+            bool ok = shrink != nullptr;
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (ok && t) {
+                    ok = shrink(t->buffer, t->nb[1]*n*t->ne[2]);
+                }
+            }
+            if (ok) {
+                grown[ikv] = 1;
+            } else {
+                LLAMA_LOG_WARN("%s: layer %u: shrinking the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
+                dyn_vmm[ikv] = 0;
+            }
+        }
+        t_free += ggml_time_us() - t1;
+    }
+
     // growable layout: one arena per device for the K and V of the layers that get a new buffer here (the tested VMM pattern);
     // the address space is virtual, so it is reserved with room for any chunk alignment (64 MiB per section)
     struct vmm_arena {
@@ -3435,7 +3473,7 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         auto & layer = layers[ikv];
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
 
-        // grown in place above: the tensors keep their address and content (no transient copy), only their shape changes
+        // grown or shrunk in place above: the tensors keep their address and content (no transient copy), only their shape changes
         if (grown[ikv]) {
             const int64_t t1 = ggml_time_us();
             {
@@ -3447,7 +3485,9 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
                     t->ne[1] = n;
                     t->nb[2] = t->nb[1]*n;
                     t->nb[3] = t->nb[2]*t->ne[2];
-                    ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
+                    if (ggml_nbytes(t) > old_bytes) {
+                        ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
+                    }
                 }
                 for (auto * views : { &layer.k_stream, &layer.v_stream }) {
                     for (ggml_tensor * v : *views) {
@@ -3603,8 +3643,8 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
     }
     n_resize++;
 
-    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu grown in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
-        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
+    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
+        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
         t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
     return true;
 }
