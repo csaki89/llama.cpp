@@ -417,6 +417,13 @@ private:
     uint32_t zones_kv_size     = 0;     // the KV size booked in the budget
     bool     zones_fa_logged   = false;
 
+    // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
+    // runtime holds back, are not booked); returns the measured free bytes
+    size_t   zones_clamp();
+    // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
+    void     zones_log_state(const char * what);
+    ggml_backend_dev_t zones_dev() const; // the device the budget is for
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

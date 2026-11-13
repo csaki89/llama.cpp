@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -279,6 +280,10 @@ public:
     // device bytes that a resize to n needs on top of the new size for a moment (the copy path holds the old and the new layer)
     size_t resize_peak(uint32_t n) const;
 
+    // called before a state load grows the cache, with the cells to add after the used ones: the owner's zone rule makes room
+    // (flex layers off) and grows; a remaining shortfall is grown by the load itself
+    void set_grow_hook(std::function<void(uint32_t n_tokens)> fn) { grow_hook = std::move(fn); }
+
     // bytes of one cell over the layers (only those whose K/V is in device memory if device_only), and of one layer at the current size
     size_t cell_bytes(bool device_only) const;
     size_t layer_bytes(int32_t il) const;
@@ -290,6 +295,7 @@ private:
     uint64_t n_resize  = 0;
     bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
     std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers
+    std::function<void(uint32_t)> grow_hook;
 
     bool relayout(uint32_t n, bool force); // force: rebuild the buffers even at the same size (one per layer, growable where possible)
 

@@ -1162,6 +1162,10 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
             const auto r_unmap   = cuMemUnmap(m.ptr, m.size);
             const auto r_release = cuMemRelease(m.handle);
             ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
+            if (!GGML_CUDA_VMM_OK(r_unmap) || !GGML_CUDA_VMM_OK(r_release)) {
+                GGML_LOG_ERROR("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
+                (void) cudaGetLastError();
+            }
             GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
         }
         ggml_cuda_vmm_arena_unref(arena);
@@ -1401,6 +1405,27 @@ static size_t ggml_backend_cuda_buffer_vmm_chunk(ggml_backend_buffer_t buffer) {
     return ctx ? ctx->arena->chunk : 0;
 }
 
+// true if unmapped chunks keep their memory until the arena's address range is freed: HIP (ROCm 7.2 measurement, ROADMAP.md:
+// unmap + release does not give the VRAM back, it is reused only by mappings in the same range), so a shrink that should give
+// the memory back must free the arena there. GGML_CUDA_VMM_SHRINK=inplace: false (in-place shrink), =free: true
+static bool ggml_backend_cuda_vmm_unmap_keeps_memory(void) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_VMM_SHRINK");
+        if (env && strcmp(env, "inplace") == 0) {
+            return 0;
+        }
+        if (env && strcmp(env, "free") == 0) {
+            return 1;
+        }
+#if defined(GGML_USE_HIP)
+        return 1;
+#else
+        return 0;
+#endif
+    }();
+    return mode != 0;
+}
+
 // shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
 // below stays); false if it is not one or an unmap fails
 static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
@@ -1430,6 +1455,10 @@ static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t
             return false;
         }
         const auto r_release = cuMemRelease(m.handle);
+        if (!GGML_CUDA_VMM_OK(r_release)) {
+            GGML_LOG_ERROR("%s: buffer %p: release of the chunk at %p failed (%d)\n", __func__, (void *) ctx->base, (void *) m.ptr, (int) r_release);
+            (void) cudaGetLastError();
+        }
         pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
         ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
         ctx->mapped -= m.size;
@@ -6980,6 +7009,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
         return (void *)ggml_backend_cuda_buffer_shrink;
+    }
+    if (strcmp(name, "ggml_backend_vmm_unmap_keeps_memory") == 0) {
+        return (void *)ggml_backend_cuda_vmm_unmap_keeps_memory;
     }
     if (strcmp(name, "ggml_backend_vmm_stats") == 0) {
         return (void *)ggml_backend_cuda_vmm_stats;
