@@ -330,6 +330,7 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool kv_reserve     = false; // dynamic KV: room for the rest of the prompt before its first batch (llama_memory_reserve)
 
     stop_type stop;
 
@@ -4341,6 +4342,7 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.kv_reserve = true;
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4371,6 +4373,12 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // dynamic KV: the cells for the rest of the prompt in one step, after the reused prefix is known and the rest removed
+                    if (slot.kv_reserve) {
+                        slot.kv_reserve = false;
+                        llama_memory_reserve(slot.ctx_tgt, (uint32_t) std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens()));
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;

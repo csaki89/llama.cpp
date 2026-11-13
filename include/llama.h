@@ -842,6 +842,11 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Dynamic KV (--auto-zones, --zones-ctx-init): make room for n_tokens new tokens after the cells in use in one step (rounded
+    // to the growth steps, with the zone rule's layer moves), e.g. for a whole prompt before its first batch; the shrink does not go
+    // below it while the prompt fills it. Without a dynamic KV it does nothing and returns true; false if the KV could not grow enough.
+    LLAMA_API bool llama_memory_reserve(struct llama_context * ctx, uint32_t n_tokens);
+
     //
     // State / sessions
     //

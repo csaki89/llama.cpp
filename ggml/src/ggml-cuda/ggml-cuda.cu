@@ -1392,6 +1392,15 @@ static bool ggml_backend_cuda_buffer_grow(ggml_backend_buffer_t buffer, size_t s
     return true;
 }
 
+// the chunk size of a growable buffer (every mapping of its arena); 0 if it is not one
+static size_t ggml_backend_cuda_buffer_vmm_chunk(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
+    return ctx ? ctx->arena->chunk : 0;
+}
+
 // shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
 // below stays); false if it is not one or an unmap fails
 static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
@@ -6965,6 +6974,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
         return (void *)ggml_backend_cuda_buffer_grow_commit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_vmm_chunk") == 0) {
+        return (void *)ggml_backend_cuda_buffer_vmm_chunk;
     }
     if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
         return (void *)ggml_backend_cuda_buffer_shrink;

@@ -3108,6 +3108,8 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
     return true;
 }
 
+static size_t kv_vmm_chunk(ggml_backend_buffer_t buffer); // the VMM chunk of a growable K/V buffer, 0 otherwise (below)
+
 bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
     // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
     if (v_trans) {
@@ -3138,8 +3140,25 @@ bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
         n_vmm += dyn_vmm[ikv];
         n_dev += layers[ikv].k->buffer && !ggml_backend_buffer_is_host(layers[ikv].k->buffer);
     }
-    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
-        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0, n_vmm, n_dev, n_dev - n_vmm,
+    // VMM: one step maps one chunk of every section: the cells of a chunk of the largest section row (K or V of a layer),
+    // a multiple of 256 cells (the KV size stays padded); the copy path keeps the steps of chunk_bytes
+    size_t vmm_chunk = 0, vmm_row = 0;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (const ggml_tensor * t : { layers[ikv].k, layers[ikv].v }) {
+            if (dyn_vmm[ikv] && t) {
+                const size_t c = kv_vmm_chunk(t->buffer);
+                vmm_chunk = vmm_chunk == 0 ? c : std::min(vmm_chunk, c);
+                vmm_row   = std::max(vmm_row, (size_t) (t->nb[1]*t->ne[2]));
+            }
+        }
+    }
+    if (vmm_chunk > 0 && vmm_row > 0) {
+        const uint32_t cells = (uint32_t) std::min<size_t>(vmm_chunk / vmm_row, dyn_max);
+        dyn_chunk = std::max<uint32_t>(256, cells - cells % 256);
+    }
+    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB%s); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
+        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0,
+        vmm_chunk > 0 ? ", one VMM chunk per section" : "", n_vmm, n_dev, n_dev - n_vmm,
         dyn_vmm_off ? " (LLAMA_KV_NO_VMM)" : (n_vmm < n_dev ? " (no VMM on this backend/device, or flex layers)" : ""));
     return true;
 }
@@ -3153,6 +3172,8 @@ typedef void                  (*ggml_backend_vmm_arena_free_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
 // unmaps the whole chunks above size (the content below stays)
 typedef bool                  (*ggml_backend_buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
+// the size of every mapping of a growable buffer (0 if it is not one)
+typedef size_t                (*ggml_backend_buffer_vmm_chunk_t)(ggml_backend_buffer_t buffer);
 // new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
@@ -3189,6 +3210,10 @@ static bool kv_sim_shrink(ggml_backend_buffer_t buffer, size_t size) {
     GGML_UNUSED(size);
     return true;
 }
+static size_t kv_sim_vmm_chunk(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    return 1u << 20;
+}
 
 static bool kv_sim_arena_commit(void * arena) {
     GGML_UNUSED(arena);
@@ -3211,12 +3236,18 @@ static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name)
         if (strcmp(name, "ggml_backend_vmm_arena_free")      == 0) { return (void *) kv_sim_arena_free; }
         if (strcmp(name, "ggml_backend_buffer_grow")         == 0) { return (void *) kv_sim_grow; }
         if (strcmp(name, "ggml_backend_buffer_shrink")       == 0) { return (void *) kv_sim_shrink; }
+        if (strcmp(name, "ggml_backend_buffer_vmm_chunk")    == 0) { return (void *) kv_sim_vmm_chunk; }
         if (strcmp(name, "ggml_backend_vmm_arena_commit")    == 0) { return (void *) kv_sim_arena_commit; }
         if (strcmp(name, "ggml_backend_buffer_grow_commit")  == 0) { return (void *) kv_sim_grow_commit; }
         return nullptr;
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+static size_t kv_vmm_chunk(ggml_backend_buffer_t buffer) {
+    auto fn = (ggml_backend_buffer_vmm_chunk_t) kv_growable_fn(ggml_backend_buffer_get_type(buffer), "ggml_backend_buffer_vmm_chunk");
+    return fn ? fn(buffer) : 0;
 }
 
 size_t llama_kv_cache::resize_peak(uint32_t n) const {

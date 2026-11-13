@@ -846,6 +846,24 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+bool llama_context::zones_reserve(uint32_t n_tokens) {
+    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    if (!kv || !kv->is_dynamic()) {
+        return true;
+    }
+    // the zone step with the whole remaining prompt: the shrink or growth and the flex moves happen once, here
+    const uint32_t used = kv->used_cells();
+    const uint32_t size = kv->get_size();
+    zones_reserved = 0;
+    zones_step(n_tokens);
+    zones_reserved      = used + n_tokens;
+    zones_reserved_from = used;
+    const bool ok = kv->get_size() >= std::min(used + n_tokens, kv->dyn_max_size());
+    LLAMA_LOG_INFO("%s: KV reserved for %u + %u tokens: %u -> %u cells%s\n", __func__, used, n_tokens, size, kv->get_size(),
+        ok ? "" : " (not enough, it grows by steps)");
+    return ok;
+}
+
 void llama_context::zones_step(uint32_t n_tokens) {
     auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
     if (!kv || !kv->is_dynamic()) {
@@ -903,9 +921,14 @@ void llama_context::zones_step(uint32_t n_tokens) {
     const uint32_t used = kv->used_cells();
     bool shrunk = false;
 
-    // shrink when the KV is empty or mostly unused (new conversation, removed sequences)
+    // a reservation holds while the prompt fills it; it ends when reached, or when cells were removed (a new conversation)
+    if (zones_reserved > 0 && (used >= zones_reserved || used < zones_reserved_from)) {
+        zones_reserved = 0;
+    }
+
+    // shrink when the KV is empty or mostly unused (new conversation, removed sequences); not below a reservation
     if (size > zones_kv_init && (used == 0 || used < size/4)) {
-        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(used + n_tokens));
+        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(std::max(used + n_tokens, zones_reserved)));
         if (n < size) {
             sync();
             const size_t per_cell = kv->cell_bytes(true);
@@ -4996,6 +5019,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_memory_reserve(llama_context * ctx, uint32_t n_tokens) {
+    return ctx ? ctx->zones_reserve(n_tokens) : false;
 }
 
 // llama state API

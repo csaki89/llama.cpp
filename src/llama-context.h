@@ -400,8 +400,15 @@ private:
     // move a flex layer (weights, host copies in the scheduler, K/V) at a batch boundary
     bool flex_move_layer(int il, bool to_gpu);
 
+public:
+    // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)
+    bool     zones_reserve(uint32_t n_tokens);
+
+private:
     // auto zones (DESIGN-3zone.md 6): dynamic KV and the zone switching rule, at a batch boundary before the next batch
     void     zones_step(uint32_t n_tokens);
+    uint32_t zones_reserved      = 0; // cells reserved by zones_reserve (0 = none): the shrink does not go below them
+    uint32_t zones_reserved_from = 0; // the cells in use then: fewer (cells removed) or reaching zones_reserved ends it
     uint32_t zones_kv_init     = 0; // initial (and minimum) KV cells, 0 = no dynamic KV
     uint64_t zones_kv_gen      = 0; // the KV generation the graph was built for
     size_t   zones_vram_margin = 0;
