@@ -1122,7 +1122,7 @@ static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
     (void) cudaDeviceSynchronize();
     const auto r_free = cuMemAddressFree(arena->base, arena->reserved);
     const int64_t left = --ggml_cuda_vmm_stat[0];
-    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left %lld, mapped %lld bytes)\n", __func__, (void *) arena->base, arena->reserved,
+    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left: %lld, mapped bytes left: %lld)\n", __func__, (void *) arena->base, arena->reserved,
         (int) r_free, (long long) left, (long long) ggml_cuda_vmm_stat[1].load());
     delete arena;
 }
