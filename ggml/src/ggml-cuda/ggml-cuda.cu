@@ -1111,7 +1111,7 @@ struct ggml_cuda_vmm_arena {
     int64_t     t_mapped = 0; // end of the last mapping (us)
 };
 
-// live arenas, mapped bytes, and of the last commit: mapping end -> first access (us), of which the sync (us)
+// counters: live arenas, mapped bytes; of the last commit: mapping end -> first access (us), of which the sync (us)
 static std::atomic<int64_t> ggml_cuda_vmm_stat[4];
 
 static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
