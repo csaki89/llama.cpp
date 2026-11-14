@@ -3116,12 +3116,12 @@ bool llama_kv_cache::flex_move(int32_t il, bool to_gpu, ggml_backend_t backend, 
 static size_t kv_vmm_chunk(ggml_backend_buffer_t buffer); // the VMM chunk of a growable K/V buffer, 0 otherwise (below)
 
 bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
-    // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
+    // every layer must own its K/V or reuse one of this cache (no sharing with another cache), V not transposed (its rows depend on the size), real buffers
     if (v_trans) {
         LLAMA_LOG_WARN("%s: dynamic KV disabled: the V cache is transposed because flash attention is off (-fa off, OLLAMA_FLASH_ATTENTION=0)\n", __func__);
         return false;
     }
-    if (other || ctxs_bufs.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || map_layer_ids.size() != layers.size() || max_size <= get_size()) {
+    if (other || ctxs_bufs.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || max_size <= get_size()) {
         return false;
     }
     const size_t per_cell = cell_bytes(false);
@@ -3317,6 +3317,9 @@ size_t llama_kv_cache::layer_bytes(int32_t il) const {
         return 0;
     }
     const auto & layer = layers[it->second];
+    if (layer.il != (uint32_t) il) {
+        return 0; // the K/V of another layer (reuse): it belongs to that one
+    }
     return (layer.k ? ggml_nbytes(layer.k) : 0) + (layer.v ? ggml_nbytes(layer.v) : 0);
 }
 

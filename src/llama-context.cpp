@@ -10,6 +10,11 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -180,6 +185,45 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.name             =*/ "fused top-k mask",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// the parts of the memory for the dynamic KV and the zones: the K/V that is resized (a plain cache, the non-SWA part of an
+// iswa cache, the attention part of a hybrid memory) and the parts with a fixed size next to it (SWA K/V, recurrent state)
+struct zones_mem_parts {
+    llama_kv_cache * kv = nullptr;
+    std::vector<std::pair<const char *, llama_memory_i *>> fixed;
+};
+
+static zones_mem_parts zones_parts(llama_memory_i * mem) {
+    zones_mem_parts res;
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        res.kv = kv;
+    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        res.kv = iswa->get_base();
+        res.fixed.push_back({ "SWA KV", iswa->get_swa() });
+    } else if (dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        // the indexer cache has one entry per cell: not resized
+    } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        res.kv = hyb->get_mem_attn();
+        res.fixed.push_back({ "recurrent state", hyb->get_mem_recr() });
+    } else if (auto * hi = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        res.kv = hi->get_mem_attn()->get_base();
+        res.fixed.push_back({ "SWA KV", hi->get_mem_attn()->get_swa() });
+        res.fixed.push_back({ "recurrent state", hi->get_mem_recr() });
+    }
+    return res;
+}
+
+// the bytes of a memory (part) in device buffers
+static size_t zones_dev_bytes(const llama_memory_i * mem) {
+    size_t res = 0;
+    for (const auto & [buft, size] : mem->memory_breakdown()) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && !ggml_backend_buft_is_host(buft)) {
+            res += size;
+        }
+    }
+    return res;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -569,6 +613,7 @@ llama_context::llama_context(
     }
 
     // init the memory module
+    zones_vram_margin = params.zone_vram_margin;
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
@@ -586,20 +631,36 @@ llama_context::llama_context(
             llama_cparams cparams_mem = cparams;
             cparams_mem.n_ctx_seq = n_init;
             memory.reset(model.create_memory(params_mem, cparams_mem));
-            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
-            if (kv && kv->set_dynamic(cparams.n_ctx_seq, (size_t) 64*1024*1024)) {
+            const auto parts = zones_parts(memory.get());
+            auto * kv = parts.kv;
+            // the SWA part keeps its size: only if it is below the initial size (not full-size SWA, not capped by the initial size)
+            const char * why = kv ? nullptr : "this memory type";
+            for (const auto & [name, part] : parts.fixed) {
+                const auto * swa = dynamic_cast<const llama_kv_cache *>(part);
+                if (kv && swa && swa->get_size() >= kv->get_size()) {
+                    why = "a SWA cache as large as the initial KV (full-size SWA, or a window above the initial size)";
+                }
+            }
+            if (!why && kv->set_dynamic(cparams.n_ctx_seq, (size_t) 64*1024*1024)) {
                 zones_kv_init = n_init;
                 // a state load (prompt cache) that grows the KV goes through the zone rule too
                 kv->set_grow_hook([this](uint32_t n_tokens) { zones_step(n_tokens); });
+                for (const auto & [name, part] : parts.fixed) {
+                    LLAMA_LOG_INFO("%s: dynamic KV: the %s keeps its size (%.2f MiB on the device)\n", __func__, name, zones_dev_bytes(part) / 1048576.0);
+                }
             } else {
-                LLAMA_LOG_WARN("%s: dynamic KV is not supported for this memory (or with a transposed V cache), allocating %u cells\n", __func__, cparams.n_ctx_seq);
+                LLAMA_LOG_WARN("%s: dynamic KV is not supported for %s, allocating %u cells\n", __func__,
+                    why ? why : "this memory (a transposed V cache, or K/V shared with another cache)", cparams.n_ctx_seq);
+                const size_t dev_init = zones_dev_bytes(memory.get());
                 memory.reset();
                 memory.reset(model.create_memory(params_mem, cparams));
+                // the zones placed the flex band for the initial size: the K/V above it takes flex layers off
+                const size_t dev_full = zones_dev_bytes(memory.get());
+                zones_static(dev_full > dev_init ? dev_full - dev_init : 0);
             }
         } else {
             memory.reset(model.create_memory(params_mem, cparams));
         }
-        zones_vram_margin = params.zone_vram_margin;
     }
 
     // init backends
@@ -851,7 +912,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 }
 
 bool llama_context::zones_reserve(uint32_t n_tokens) {
-    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    auto * kv = zones_kv_init > 0 ? zones_kv() : nullptr;
     if (!kv || !kv->is_dynamic()) {
         return true;
     }
@@ -869,7 +930,7 @@ bool llama_context::zones_reserve(uint32_t n_tokens) {
 }
 
 void llama_context::zones_step(uint32_t n_tokens) {
-    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    auto * kv = zones_kv_init > 0 ? zones_kv() : nullptr;
     if (!kv || !kv->is_dynamic()) {
         return;
     }
@@ -903,6 +964,10 @@ void llama_context::zones_step(uint32_t n_tokens) {
         }
         LLAMA_LOG_INFO("%s: zones: device memory budget %.0f MiB (free %.0f MiB, margin %.0f MiB)\n", __func__,
             zones_headroom / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
+    } else if (rule && kv->used_cells() == 0 && kv->get_size() == zones_kv_init && zones_kv_size == zones_kv_init) {
+        // at rest (empty KV at the initial size) the budget is measured again: memory taken or freed outside the zones since
+        // the first step counts from here on (the multimodal projector is loaded after the warmup run)
+        zones_clamp(true, true);
     }
 
     // a resize outside this step (state load) is booked too; over the budget, flex layers go off first
@@ -916,7 +981,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
         if (il < 0) {
             break;
         }
-        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
+        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
         if (!flex_move_layer(il, false)) {
             break;
         }
@@ -951,7 +1016,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
     if (rule && (shrunk || used == 0) && model.flex_next(true) >= 0) {
         zones_clamp(true);
         for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
-            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
+            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
             if (cost > zones_headroom) {
                 break;
             }
@@ -978,7 +1043,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
             if (il < 0) {
                 break;
             }
-            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
+            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
             if (!flex_move_layer(il, false)) {
                 break;
             }
@@ -1053,7 +1118,7 @@ ggml_backend_dev_t llama_context::zones_dev() const {
     return nullptr;
 }
 
-size_t llama_context::zones_clamp(bool up) {
+size_t llama_context::zones_clamp(bool up, bool rest) {
     ggml_backend_dev_t dev = zones_dev();
     if (!dev) {
         return 0;
@@ -1064,23 +1129,73 @@ size_t llama_context::zones_clamp(bool up) {
     size_t sys_free = 0;
     const bool sys = zones_sysfs_free(dev_total, sys_free);
     const int64_t booked = zones_headroom + (int64_t) zones_vram_margin;
-    if (sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
+    if (!rest && sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
         LLAMA_LOG_WARN("%s: zones: the booked free memory (%.0f MiB) is off from the device: driver %.0f MiB, sysfs %.0f MiB\n", __func__,
             booked / 1048576.0, dev_free / 1048576.0, sys_free / 1048576.0);
     }
     const size_t free_real = sys ? std::min(dev_free, sys_free) : dev_free;
     const int64_t real = (int64_t) free_real - (int64_t) zones_vram_margin;
     if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
-        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB: driver %.0f, sysfs %s; margin %.0f MiB)\n", __func__,
-            zones_headroom / 1048576.0, real / 1048576.0, free_real / 1048576.0, dev_free / 1048576.0,
-            sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_vram_margin / 1048576.0);
+        // at rest only a change of 64 MiB or more is logged
+        if (!rest || std::llabs(real - zones_headroom) >= ((int64_t) 64 << 20)) {
+            LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB: driver %.0f, sysfs %s; margin %.0f MiB%s)\n", __func__,
+                zones_headroom / 1048576.0, real / 1048576.0, free_real / 1048576.0, dev_free / 1048576.0,
+                sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_vram_margin / 1048576.0, rest ? ", at rest" : "");
+        }
         zones_headroom = real;
     }
     return free_real;
 }
 
+llama_kv_cache * llama_context::zones_kv() const {
+    return zones_parts(memory.get()).kv;
+}
+
+size_t llama_context::zones_layer_kv_bytes(int il) const {
+    const auto parts = zones_parts(memory.get());
+    size_t res = parts.kv ? parts.kv->layer_bytes(il) : 0;
+    for (const auto & [name, part] : parts.fixed) {
+        if (const auto * kv = dynamic_cast<const llama_kv_cache *>(part)) {
+            res += kv->layer_bytes(il);
+        }
+    }
+    return res;
+}
+
+void llama_context::zones_static(size_t extra) {
+    // the flex band was sized from the K/V of the initial size; the static K/V needs extra more device memory: the same
+    // order as the zone rule (closest to the CPU first), until it is freed
+    size_t freed = 0;
+    int n_off = 0;
+    while (freed < extra) {
+        const int il = model.flex_next(false);
+        if (il < 0) {
+            break;
+        }
+        const size_t bytes = model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0);
+        if (!flex_move_layer(il, false)) {
+            break;
+        }
+        freed += bytes;
+        n_off++;
+    }
+    if (extra > 0 && !model.flex_layers().empty()) {
+        LLAMA_LOG_INFO("%s: zones: static KV, %.0f MiB more on the device than at the initial size: %d flex layers off (%.0f MiB)%s\n", __func__,
+            extra / 1048576.0, n_off, freed / 1048576.0, freed < extra ? ", no flex layer left" : "");
+        zones_log_state("static KV");
+    }
+}
+
 void llama_context::zones_log_state(const char * what) {
-    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    const auto parts = zones_parts(memory.get());
+    auto * kv = parts.kv;
+    // the parts that keep their size, on the device
+    std::string fixed;
+    for (const auto & [name, part] : parts.fixed) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%s%s %.0f MiB", fixed.empty() ? "; fixed on the device: " : ", ", name, zones_dev_bytes(part) / 1048576.0);
+        fixed += buf;
+    }
     size_t w_gpu = 0;
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -1113,13 +1228,16 @@ void llama_context::zones_log_state(const char * what) {
     }
     size_t sys_free = 0;
     const bool sys = zones_sysfs_free(dev_total, sys_free);
+    // no budget yet (static KV): booked and budget are not known
+    const std::string booked = zones_headroom_set ? std::to_string((zones_headroom + (int64_t) zones_vram_margin) >> 20) : "-";
+    const std::string budget = zones_headroom_set ? std::to_string(zones_headroom / 1048576) : "-";
     LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s; "
-        "KV %u cells (%u used, %.0f MiB on the device); device free: booked %.0f, driver %.0f, sysfs %s MiB (budget %.0f MiB, margin %.0f MiB)\n",
+        "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %.0f, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
         __func__, what,
         w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
         off.empty() ? "" : ", off: ", off.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
-        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, (zones_headroom + (int64_t) zones_vram_margin) / 1048576.0,
-        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_headroom / 1048576.0,
+        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, fixed.c_str(), booked.c_str(),
+        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
         zones_vram_margin / 1048576.0);
 }
 
@@ -1144,9 +1262,16 @@ bool llama_context::flex_move_layer(int il, bool to_gpu) {
         flex_set_alts(il);
     }
     // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
+    // (the SWA K/V too; a recurrent state stays where it is, it is small and does not grow)
     if (flex_test_kv && model.flex_whole(il)) {
-        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
-            kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
+        const auto parts = zones_parts(memory.get());
+        if (parts.kv) {
+            parts.kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
+            for (const auto & [name, part] : parts.fixed) {
+                if (auto * kv = dynamic_cast<llama_kv_cache *>(part)) {
+                    kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
+                }
+            }
         } else {
             LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
         }

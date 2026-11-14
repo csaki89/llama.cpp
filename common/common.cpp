@@ -1300,7 +1300,8 @@ static void common_auto_zones(common_params & params, const llama_model_params &
         llama_model_params & mparams, llama_context_params & cparams, const common_fit_extra_model * extra) {
     const uint32_t n_ctx_max  = cparams.n_ctx;
     const uint32_t n_ctx_init = std::min<uint32_t>(params.zones_ctx_init, n_ctx_max);
-    cparams.zone_vram_margin  = params.fit_params_target.empty() ? 0 : params.fit_params_target[0];
+    // the projector is on the device by the time the zones measure (not at the warmup run): its part of the fit target is not kept free again
+    cparams.zone_vram_margin  = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] - std::min(params.fit_params_target[0], params.zones_margin_mmproj);
     if (n_ctx_init < n_ctx_max) {
         cparams.n_ctx_init = n_ctx_init; // dynamic KV
     }

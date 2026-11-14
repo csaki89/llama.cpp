@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_kv_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -419,10 +420,17 @@ private:
 
     // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
     // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
-    size_t   zones_clamp(bool up = false);
+    // rest: the KV is empty at its initial size, the budget is measured again (no check against the booking)
+    size_t   zones_clamp(bool up = false, bool rest = false);
     // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
     void     zones_log_state(const char * what);
     ggml_backend_dev_t zones_dev() const; // the device the budget is for
+    // the K/V the dynamic KV resizes: the cache itself, the non-SWA part of an iswa cache, the attention part of a hybrid memory
+    llama_kv_cache * zones_kv() const;
+    // the K/V bytes of a layer in every K/V part of the memory (the SWA part moves with the layer too; the recurrent state stays)
+    size_t   zones_layer_kv_bytes(int il) const;
+    // with no dynamic KV: the flex layers off for the device K/V above the initial size the zones were placed for
+    void     zones_static(size_t extra);
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

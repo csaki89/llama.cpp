@@ -2421,6 +2421,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_ZONES_CTX_INIT"));
     add_opt(common_arg(
+        {"--zones-margin-mmproj"}, "MiB",
+        "with --auto-zones: the multimodal projector part of --fit-target set by the caller; the projector is on the device when "
+        "the zones measure, so this part is not kept free again (default: 0; the part llama-server adds itself is known)",
+        [](common_params & params, int value) {
+            params.zones_margin_mmproj += (size_t) std::max(0, value) * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_ZONES_MARGIN_MMPROJ"));
+    add_opt(common_arg(
         {"--dual-buffer-limit"}, "MiB",
         "with --dual-buffer: max extra host memory for the copies, in tensor order (default: 0 = no limit)",
         [](common_params & params, int value) {

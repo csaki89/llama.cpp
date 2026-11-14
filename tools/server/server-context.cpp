@@ -1288,6 +1288,9 @@ private:
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;
+                                if (i == 0) {
+                                    params_base.zones_margin_mmproj += size;
+                                }
                             }
                             break;
                         }
