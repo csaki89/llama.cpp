@@ -418,8 +418,8 @@ private:
     bool     zones_fa_logged   = false;
 
     // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
-    // runtime holds back, are not booked); returns the measured free bytes
-    size_t   zones_clamp();
+    // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
+    size_t   zones_clamp(bool up = false);
     // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
     void     zones_log_state(const char * what);
     ggml_backend_dev_t zones_dev() const; // the device the budget is for

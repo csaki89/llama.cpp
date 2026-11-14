@@ -945,9 +945,9 @@ void llama_context::zones_step(uint32_t n_tokens) {
     }
 
     // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size);
-    // the budget is first cut to what the device really has free
+    // the budget is first set to what the device really has free (both ways: the freed memory is back by now)
     if (rule && (shrunk || used == 0) && model.flex_next(true) >= 0) {
-        zones_clamp();
+        zones_clamp(true);
         for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
             const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
             if (cost > zones_headroom) {
@@ -1024,7 +1024,7 @@ ggml_backend_dev_t llama_context::zones_dev() const {
     return nullptr;
 }
 
-size_t llama_context::zones_clamp() {
+size_t llama_context::zones_clamp(bool up) {
     ggml_backend_dev_t dev = zones_dev();
     if (!dev) {
         return 0;
@@ -1032,7 +1032,7 @@ size_t llama_context::zones_clamp() {
     size_t dev_free = 0, dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
     const int64_t real = (int64_t) dev_free - (int64_t) zones_vram_margin;
-    if (real < zones_headroom && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
+    if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
         LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB, margin %.0f MiB)\n", __func__,
             zones_headroom / 1048576.0, real / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
         zones_headroom = real;

@@ -1100,7 +1100,9 @@ static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20; // 2 MiB: section 
 
 // Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
 // first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
-// GGML_CUDA_VMM_CHUNK_KIB (default 1024), rounded to the minimum granularity, a divisor of the section alignment.
+// GGML_CUDA_VMM_CHUNK_KIB (default: the section alignment, 2 MiB), rounded to the minimum granularity, a divisor of the alignment.
+// Not smaller by default: the amdgpu KFD books every VRAM allocation aligned to 2 MiB in its free memory (VRAM_AVAILABLITY_ALIGN),
+// so 1 MiB chunks halve what hipMemGetInfo reports and what KFD allocations may still take.
 
 struct ggml_cuda_vmm_arena {
     ggml_backend_buffer_type_t buft;
@@ -1315,7 +1317,7 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
     }
     // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
     const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
-    size_t chunk = (env_chunk ? (size_t) atoll(env_chunk) : 1024) << 10;
+    size_t chunk = env_chunk ? (size_t) atoll(env_chunk) << 10 : align;
     if (gran_min > 0) {
         chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
     }
