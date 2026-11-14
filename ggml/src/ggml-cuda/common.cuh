@@ -1207,6 +1207,13 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// the runtime's memcpy/memset, split at the address reservations of growable (VMM) buffers: on HIP every chunk has its own,
+// and a call over two reservations fails (kernels are not affected); a plain call elsewhere
+cudaError_t ggml_cuda_memcpy_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream);
+cudaError_t ggml_cuda_memset_async(void * dst, int value, size_t size, cudaStream_t stream);
+cudaError_t ggml_cuda_memcpy_2d_async(void * dst, size_t dpitch, const void * src, size_t spitch, size_t width, size_t height,
+        cudaMemcpyKind kind, cudaStream_t stream);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 

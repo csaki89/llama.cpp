@@ -215,7 +215,7 @@ void ggml_cuda_mul_mat_q(
             if (size_alloc > size_data) {
                 GGML_ASSERT(ggml_is_contiguously_allocated(t));
                 GGML_ASSERT(!t->view_src);
-                CUDA_CHECK(cudaMemsetAsync((char *) t->data + size_data, 0, size_alloc - size_data, stream));
+                CUDA_CHECK(ggml_cuda_memset_async((char *) t->data + size_data, 0, size_alloc - size_data, stream));
             }
         }
     }

@@ -3182,8 +3182,9 @@ typedef size_t                (*ggml_backend_buffer_vmm_chunk_t)(ggml_backend_bu
 // new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
-// true if unmapped chunks keep their memory until the arena is freed (HIP): a shrink then frees the arena instead
-typedef bool                  (*ggml_backend_vmm_unmap_keeps_memory_t)(void);
+// true if the unmapped chunks of a growable buffer keep their memory until its arena is freed (HIP with one address
+// reservation per arena): a shrink then frees the arena instead; false with a reservation per chunk (an in-place shrink frees it)
+typedef bool                  (*ggml_backend_vmm_unmap_keeps_memory_t)(ggml_backend_buffer_t buffer);
 
 // test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the section size, to test the in-place path without VMM;
 // LLAMA_KV_VMM_SIM=2: every commit fails, 3: only the growth commits fail (the fallbacks to a copy, as when the HIP barrier allocation fails),
@@ -3231,7 +3232,8 @@ static bool kv_sim_grow_commit(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return kv_sim_level() != 2 && kv_sim_level() != 3;
 }
-static bool kv_sim_unmap_keeps_memory(void) {
+static bool kv_sim_unmap_keeps_memory(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
     return kv_sim_level() == 4;
 }
 
@@ -3417,7 +3419,7 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
             }
             auto & layer = layers[ikv];
             auto keeps = (ggml_backend_vmm_unmap_keeps_memory_t) kv_growable_fn(buft_of[ikv], "ggml_backend_vmm_unmap_keeps_memory");
-            if (keeps && keeps()) {
+            if (keeps && keeps(layer.k->buffer)) {
                 int i = 0;
                 for (ggml_tensor * t : { layer.k, layer.v }) {
                     auto & h = staged[2*ikv + i++];

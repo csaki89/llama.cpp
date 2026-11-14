@@ -51,7 +51,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
     // Bulk copy B -> X (contiguous tensors)
     if (X != B) {
         const int64_t total_elements_BX = n * k * total_batches;
-        CUDA_CHECK(cudaMemcpyAsync(X, B, total_elements_BX * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(ggml_cuda_memcpy_async(X, B, total_elements_BX * sizeof(float), cudaMemcpyDeviceToDevice, stream));
     }
 
     const int id = ggml_cuda_get_device();

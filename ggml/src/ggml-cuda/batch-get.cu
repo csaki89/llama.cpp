@@ -176,7 +176,7 @@ bool ggml_cuda_get_tensor_n(int device,
             const size_t blocks_per_copy = std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + n_batch - 1) / n_batch));
             const dim3 blocks((unsigned int) n_batch, (unsigned int) blocks_per_copy);
             // Stream ordering keeps each kernel ahead of the next descriptor overwrite.
-            CUDA_CHECK(cudaMemcpyAsync(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_async(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread));
             ggml_cuda_batch_get_kernel<<<blocks, threads, 0, cudaStreamPerThread>>>(device_copies, n_batch);
             CUDA_CHECK(cudaGetLastError());
             if (first + n_batch < n_reads_gather) {
@@ -188,7 +188,7 @@ bool ggml_cuda_get_tensor_n(int device,
     // Keep the destination pinned for DMA too; overlapping destinations already declined above.
     for (size_t i = 0; i < n_tensors; ++i) {
         if (sizes[i] && (!n_reads_gather || sizes[i] > max_gather_read_bytes)) {
-            CUDA_CHECK(cudaMemcpyAsync(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i], cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_async(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i], cudaMemcpyDeviceToHost, cudaStreamPerThread));
         }
     }
     // Wait for GPU writes before releasing the CPU mapping and descriptor buffers.

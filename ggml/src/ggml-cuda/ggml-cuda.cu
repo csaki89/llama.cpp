@@ -766,6 +766,105 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 
+// growable (VMM) buffers with an address reservation per chunk (HIP): the runtime's memset/memcpy reject a range over two
+// reservations (kernels do not), so every such call goes through these wrappers, which split at the chunk boundaries there
+struct ggml_cuda_vmm_range {
+    uintptr_t begin;
+    uintptr_t end;
+    size_t    piece;
+};
+static std::mutex ggml_cuda_vmm_ranges_mtx;
+static std::vector<ggml_cuda_vmm_range> ggml_cuda_vmm_ranges;
+static std::atomic<int> ggml_cuda_vmm_n_ranges{0};
+
+[[maybe_unused]] static void ggml_cuda_vmm_ranges_add(const void * base, size_t size, size_t piece) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_vmm_ranges_mtx);
+    ggml_cuda_vmm_ranges.push_back({ (uintptr_t) base, (uintptr_t) base + size, piece });
+    ggml_cuda_vmm_n_ranges = (int) ggml_cuda_vmm_ranges.size();
+}
+
+[[maybe_unused]] static void ggml_cuda_vmm_ranges_remove(const void * base) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_vmm_ranges_mtx);
+    auto & v = ggml_cuda_vmm_ranges;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const ggml_cuda_vmm_range & r) { return r.begin == (uintptr_t) base; }), v.end());
+    ggml_cuda_vmm_n_ranges = (int) v.size();
+}
+
+// at most size bytes from p that lie in one address reservation
+static size_t ggml_cuda_vmm_piece(const void * p, size_t size) {
+    if (ggml_cuda_vmm_n_ranges.load(std::memory_order_relaxed) == 0) {
+        return size;
+    }
+    const uintptr_t a = (uintptr_t) p;
+    std::lock_guard<std::mutex> lock(ggml_cuda_vmm_ranges_mtx);
+    for (const auto & r : ggml_cuda_vmm_ranges) {
+        if (a >= r.begin && a < r.end) {
+            return std::min(size, r.piece - (size_t) ((a - r.begin) % r.piece));
+        }
+    }
+    return size;
+}
+
+cudaError_t ggml_cuda_memcpy_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    while (size > 0) {
+        const size_t n = ggml_cuda_vmm_piece(src, ggml_cuda_vmm_piece(dst, size));
+        const cudaError_t r = cudaMemcpyAsync(dst, src, n, kind, stream);
+        if (r != cudaSuccess) {
+            return r;
+        }
+        dst  = (char *) dst + n;
+        src  = (const char *) src + n;
+        size -= n;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t ggml_cuda_memset_async(void * dst, int value, size_t size, cudaStream_t stream) {
+    while (size > 0) {
+        const size_t n = ggml_cuda_vmm_piece(dst, size);
+        const cudaError_t r = cudaMemsetAsync(dst, value, n, stream);
+        if (r != cudaSuccess) {
+            return r;
+        }
+        dst  = (char *) dst + n;
+        size -= n;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t ggml_cuda_memcpy_2d_async(void * dst, size_t dpitch, const void * src, size_t spitch, size_t width, size_t height,
+        cudaMemcpyKind kind, cudaStream_t stream) {
+    if (height == 0 || width == 0) {
+        return cudaSuccess;
+    }
+    const size_t dspan = dpitch*(height - 1) + width;
+    const size_t sspan = spitch*(height - 1) + width;
+    if (ggml_cuda_vmm_piece(dst, dspan) == dspan && ggml_cuda_vmm_piece(src, sspan) == sspan) {
+        return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream);
+    }
+    for (size_t i = 0; i < height; ++i) {
+        const cudaError_t r = ggml_cuda_memcpy_async((char *) dst + i*dpitch, (const char *) src + i*spitch, width, kind, stream);
+        if (r != cudaSuccess) {
+            return r;
+        }
+    }
+    return cudaSuccess;
+}
+
+[[maybe_unused]] static cudaError_t ggml_cuda_memcpy_peer_async(void * dst, int dst_dev, const void * src, int src_dev, size_t size, cudaStream_t stream) {
+    while (size > 0) {
+        const size_t n = ggml_cuda_vmm_piece(src, ggml_cuda_vmm_piece(dst, size));
+        const cudaError_t r = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, n, stream);
+        if (r != cudaSuccess) {
+            return r;
+        }
+        dst  = (char *) dst + n;
+        src  = (const char *) src + n;
+        size -= n;
+    }
+    return cudaSuccess;
+}
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
@@ -812,7 +911,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memset_async((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
             CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         }
     }
@@ -823,7 +922,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memset_async((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -831,7 +930,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -839,7 +938,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_async(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -848,7 +947,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    CUDA_CHECK(ggml_cuda_memcpy_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -858,7 +957,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    CUDA_CHECK(ggml_cuda_memcpy_2d_async(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -872,7 +971,7 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
         if (sizes[i] == 0) {
             continue;
         }
-        CUDA_CHECK(cudaMemcpyAsync(
+        CUDA_CHECK(ggml_cuda_memcpy_async(
             (char *) tensors[i]->data + offsets[i],
             data[i],
             sizes[i],
@@ -897,7 +996,7 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
         if (sizes[i] == 0) {
             continue;
         }
-        CUDA_CHECK(cudaMemcpyAsync(
+        CUDA_CHECK(ggml_cuda_memcpy_async(
             data[i],
             (const char *) tensors[i]->data + offsets[i],
             sizes[i],
@@ -917,12 +1016,12 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_async(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_peer_async(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -967,12 +1066,12 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, 
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx_i->device);
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_async(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             GGML_ABORT("peer copy not supported");
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), cudaStreamPerThread));
+            CUDA_CHECK(ggml_cuda_memcpy_peer_async(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), cudaStreamPerThread));
 #endif
         }
     }
@@ -985,7 +1084,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memset_async(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1116,18 +1215,39 @@ struct ggml_cuda_vmm_arena {
     std::vector<std::pair<CUdeviceptr, size_t>> pending; // mapped chunks not committed yet (not to be accessed)
     int64_t     t_mapped = 0; // end of the last mapping (us)
     size_t      chunk    = 0; // size of every mapping
+    // every chunk has its own address reservation, at its place in the range (which is given back right after it is found):
+    // on HIP an unmapped and released chunk keeps its VRAM until its reservation is freed (NAS test), so this is what makes an
+    // in-place shrink give the memory back; one reservation for the whole range otherwise
+    bool        per_chunk = false;
 };
 
 // counters: live arenas, mapped bytes; of the last commit: mapping end -> first access (us), of which the sync (us)
 static std::atomic<int64_t> ggml_cuda_vmm_stat[4];
+
+// set when the runtime did not give a chunk reservation at the asked address: the later arenas use one range
+static std::atomic<bool> ggml_cuda_vmm_per_chunk_failed{false};
 
 static void ggml_cuda_vmm_arena_unref(ggml_cuda_vmm_arena * arena) {
     if (--arena->refs > 0) {
         return;
     }
     ggml_cuda_set_device(arena->device);
-    (void) cudaDeviceSynchronize();
-    const auto r_free = cuMemAddressFree(arena->base, arena->reserved);
+    const cudaError_t r_sync = cudaDeviceSynchronize();
+    if (r_sync != cudaSuccess) {
+        GGML_LOG_ERROR("%s: device synchronize before freeing the arena failed (%d)\n", __func__, (int) r_sync);
+        (void) cudaGetLastError();
+    }
+    int r_free = 0;
+    if (arena->per_chunk) {
+        ggml_cuda_vmm_ranges_remove((void *) arena->base); // the chunk reservations went with the sections
+    } else {
+        const auto r = cuMemAddressFree(arena->base, arena->reserved);
+        r_free = (int) r;
+        if (!GGML_CUDA_VMM_OK(r)) {
+            GGML_LOG_ERROR("%s: address free %p + %zu failed (%d): the range and its VRAM stay\n", __func__, (void *) arena->base, arena->reserved, r_free);
+            (void) cudaGetLastError();
+        }
+    }
     const int64_t left = --ggml_cuda_vmm_stat[0];
     GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left: %lld, mapped bytes left: %lld)\n", __func__, (void *) arena->base, arena->reserved,
         (int) r_free, (long long) left, (long long) ggml_cuda_vmm_stat[1].load());
@@ -1146,6 +1266,7 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
     size_t      section; // size of the section
     size_t      mapped = 0;
     std::vector<mapping> mappings;
+    std::vector<CUdeviceptr> resv; // per-chunk arena: the chunk reservations of the section, contiguous from base
 
     ggml_backend_cuda_growable_buffer_context(ggml_cuda_vmm_arena * arena, CUdeviceptr base, size_t section) :
         ggml_backend_cuda_buffer_context(arena->device, (void *) base), arena(arena), base(base), section(section) {
@@ -1153,34 +1274,122 @@ struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_cont
     }
 
     ~ggml_backend_cuda_growable_buffer_context() override {
-        // each mapping on its own (ROCR-Runtime issue 285), its handle only after the unmap; the address range goes with the arena
-        // no stream may use a chunk when it is unmapped
+        // each mapping on its own (ROCR-Runtime issue 285), its handle only after the unmap; then the chunk reservations, or the
+        // range with the arena; no stream may use a chunk when it is unmapped
         ggml_cuda_set_device(device);
-        (void) cudaDeviceSynchronize();
+        const cudaError_t r_sync = cudaDeviceSynchronize();
+        if (r_sync != cudaSuccess) {
+            GGML_LOG_ERROR("%s: device synchronize before the unmap failed (%d)\n", __func__, (int) r_sync);
+            (void) cudaGetLastError();
+        }
         auto & pending = arena->pending;
         for (auto & m : mappings) {
             pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
         }
+        size_t n_kept = 0; // chunks whose unmap failed: their handle and reservation stay (a visible leak, not a release under a mapping)
         for (auto & m : mappings) {
-            const auto r_unmap   = cuMemUnmap(m.ptr, m.size);
+            const auto r_unmap = cuMemUnmap(m.ptr, m.size);
+            if (!GGML_CUDA_VMM_OK(r_unmap)) {
+                GGML_LOG_ERROR("%s: unmap %p + %zu failed (%d): the chunk is kept\n", __func__, (void *) m.ptr, m.size, (int) r_unmap);
+                (void) cudaGetLastError();
+                n_kept++;
+                continue;
+            }
             const auto r_release = cuMemRelease(m.handle);
             ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
-            if (!GGML_CUDA_VMM_OK(r_unmap) || !GGML_CUDA_VMM_OK(r_release)) {
-                GGML_LOG_ERROR("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
+            if (!GGML_CUDA_VMM_OK(r_release)) {
+                GGML_LOG_ERROR("%s: release of the chunk at %p failed (%d)\n", __func__, (void *) m.ptr, (int) r_release);
                 (void) cudaGetLastError();
             }
             GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
         }
+        if (n_kept == 0) {
+            free_reservations(0);
+        }
         ggml_cuda_vmm_arena_unref(arena);
         dev_ptr = nullptr; // not from cudaMalloc
+    }
+
+    // per-chunk arena: a reservation of one chunk exactly at want; false if the runtime puts it elsewhere (then given back)
+    bool reserve_at(CUdeviceptr want) {
+        CUdeviceptr got = 0;
+        const auto r = cuMemAddressReserve(&got, arena->chunk, 0, want, 0);
+        GGML_CUDA_VMM_LOG("%s: reserve %zu bytes at %p: %p, %d\n", __func__, arena->chunk, (void *) want, (void *) got, (int) r);
+        if (!GGML_CUDA_VMM_OK(r)) {
+            GGML_LOG_WARN("%s: reserving %zu bytes at %p failed (%d)\n", __func__, arena->chunk, (void *) want, (int) r);
+            (void) cudaGetLastError();
+            return false;
+        }
+        if (got != want) {
+            GGML_LOG_WARN("%s: asked for the chunk reservation at %p, the runtime gave %p\n", __func__, (void *) want, (void *) got);
+            (void) cuMemAddressFree(got, arena->chunk);
+            return false;
+        }
+        resv.push_back(got);
+        return true;
+    }
+
+    // per-chunk arena: a reservation for every chunk of the section, at its place; false (none kept) if one is not there
+    bool reserve_chunks() {
+        for (size_t off = 0; off < section; off += arena->chunk) {
+            if (!reserve_at((CUdeviceptr) ((char *) base + off))) {
+                free_reservations(0);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the chunk reservations from index from on
+    void free_reservations(size_t from) {
+        while (resv.size() > from) {
+            const auto r = cuMemAddressFree(resv.back(), arena->chunk);
+            if (!GGML_CUDA_VMM_OK(r)) {
+                GGML_LOG_ERROR("%s: address free %p + %zu failed (%d)\n", __func__, (void *) resv.back(), arena->chunk, (int) r);
+                (void) cudaGetLastError();
+            }
+            resv.pop_back();
+        }
+    }
+
+    // per-chunk arena: the reservation of the unmapped chunk i is freed (its VRAM comes back) and made again in place; false if the
+    // runtime does not give the address again: the section then ends below chunk i (the reservations above are given back too)
+    bool renew(size_t i) {
+        const CUdeviceptr p = resv[i];
+        const auto r_free = cuMemAddressFree(p, arena->chunk);
+        if (!GGML_CUDA_VMM_OK(r_free)) {
+            GGML_LOG_ERROR("%s: address free %p + %zu failed (%d): the chunk keeps its VRAM\n", __func__, (void *) p, arena->chunk, (int) r_free);
+            (void) cudaGetLastError();
+            return true; // still reserved, the section is intact
+        }
+        CUdeviceptr got = 0;
+        const auto r = cuMemAddressReserve(&got, arena->chunk, 0, p, 0);
+        GGML_CUDA_VMM_LOG("%s: reserve %zu bytes at %p again: %p, %d\n", __func__, arena->chunk, (void *) p, (void *) got, (int) r);
+        if (GGML_CUDA_VMM_OK(r) && got == p) {
+            return true;
+        }
+        if (GGML_CUDA_VMM_OK(r)) {
+            (void) cuMemAddressFree(got, arena->chunk);
+        } else {
+            (void) cudaGetLastError();
+        }
+        resv[i] = resv.back(); // slot i is gone: drop it with the ones above
+        resv.pop_back();
+        free_reservations(i);
+        return false;
+    }
+
+    // the bytes of the section that can be mapped (per-chunk arena: up to the first missing reservation)
+    size_t capacity() const {
+        return arena->per_chunk ? resv.size()*arena->chunk : section;
     }
 
     // map whole chunks after the mapped ones until size is covered; they must not be accessed before ggml_cuda_vmm_commit
     bool map_to(size_t size) {
         const size_t chunk = arena->chunk;
         const size_t need  = chunk * ((size + chunk - 1) / chunk);
-        if (need > section) {
-            GGML_LOG_ERROR("%s: %zu bytes do not fit the section (%zu)\n", __func__, size, section);
+        if (need > capacity()) {
+            GGML_LOG_ERROR("%s: %zu bytes do not fit the section (%zu, reserved %zu)\n", __func__, size, section, capacity());
             return false;
         }
         while (mapped < need) {
@@ -1378,11 +1587,34 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
     if (!GGML_CUDA_VMM_OK(r_reserve)) {
         return nullptr;
     }
-    GGML_CUDA_VMM_LOG("%s: chunk %zu bytes\n", __func__, chunk);
+    // a reservation per chunk (HIP, unless GGML_CUDA_VMM_RESERVE=range or one failed before): the range found here is given
+    // back, the sections reserve their chunks in it at the same addresses (checked)
+#if defined(GGML_USE_HIP)
+    bool per_chunk = true;
+#else
+    bool per_chunk = false;
+#endif
+    if (const char * env = getenv("GGML_CUDA_VMM_RESERVE")) {
+        per_chunk = strcmp(env, "range") != 0;
+    }
+    per_chunk = per_chunk && !ggml_cuda_vmm_per_chunk_failed;
+    if (per_chunk) {
+        const auto r_free = cuMemAddressFree(base, reserved);
+        if (!GGML_CUDA_VMM_OK(r_free)) {
+            GGML_LOG_WARN("%s: giving back the range for the chunk reservations failed (%d), one range is kept\n", __func__, (int) r_free);
+            (void) cudaGetLastError();
+            per_chunk = false;
+        }
+    }
+    GGML_CUDA_VMM_LOG("%s: chunk %zu bytes, %s\n", __func__, chunk, per_chunk ? "a reservation per chunk" : "one reservation");
     (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
     ++ggml_cuda_vmm_stat[0];
     auto * arena = new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
-    arena->chunk = chunk;
+    arena->chunk     = chunk;
+    arena->per_chunk = per_chunk;
+    if (per_chunk) {
+        ggml_cuda_vmm_ranges_add((void *) base, reserved, chunk);
+    }
     return arena;
 }
 
@@ -1412,6 +1644,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_vmm_arena_buffer(void * arena_ptr
     }
     ggml_cuda_set_device(arena->device);
     auto * ctx = new ggml_backend_cuda_growable_buffer_context(arena, (CUdeviceptr) ((char *) arena->base + offset), section);
+    if (arena->per_chunk && !ctx->reserve_chunks()) {
+        GGML_LOG_WARN("%s: the chunk reservations of a section are not where asked: no growable buffer here, the later arenas use one "
+            "range (an unmapped chunk then keeps its VRAM until the arena is freed)\n", __func__);
+        ggml_cuda_vmm_per_chunk_failed = true;
+        delete ctx;
+        (void) cudaGetLastError();
+        return nullptr;
+    }
     if (!ctx->map_to(std::max<size_t>(size, 1))) {
         GGML_CUDA_VMM_LOG("%s: mapping %zu bytes failed, no growable buffer\n", __func__, size);
         delete ctx;
@@ -1461,25 +1701,27 @@ static size_t ggml_backend_cuda_buffer_vmm_chunk(ggml_backend_buffer_t buffer) {
     return ctx ? ctx->arena->chunk : 0;
 }
 
-// true if unmapped chunks keep their memory until the arena's address range is freed: HIP (ROCm 7.2 measurement, ROADMAP.md:
-// unmap + release does not give the VRAM back, it is reused only by mappings in the same range), so a shrink that should give
-// the memory back must free the arena there. GGML_CUDA_VMM_SHRINK=inplace: false (in-place shrink), =free: true
-static bool ggml_backend_cuda_vmm_unmap_keeps_memory(void) {
-    static const int mode = [] {
-        const char * env = getenv("GGML_CUDA_VMM_SHRINK");
-        if (env && strcmp(env, "inplace") == 0) {
-            return 0;
-        }
-        if (env && strcmp(env, "free") == 0) {
-            return 1;
-        }
+// true if the unmapped chunks of this growable buffer keep their memory until its arena's range is freed: on HIP an unmap and
+// release give the VRAM back only with the address reservation (NAS tests), so an arena with one reservation keeps it (the KV
+// then frees the arena on a shrink), one with a reservation per chunk does not. GGML_CUDA_VMM_SHRINK=inplace: false, =free: true
+static bool ggml_backend_cuda_vmm_unmap_keeps_memory(ggml_backend_buffer_t buffer) {
+    const char * env = getenv("GGML_CUDA_VMM_SHRINK");
+    if (env && strcmp(env, "inplace") == 0) {
+        return false;
+    }
+    if (env && strcmp(env, "free") == 0) {
+        return true;
+    }
+    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
 #if defined(GGML_USE_HIP)
-        return 1;
+    return ctx && !ctx->arena->per_chunk;
 #else
-        return 0;
+    GGML_UNUSED(ctx);
+    return false;
 #endif
-    }();
-    return mode != 0;
 }
 
 // shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
@@ -1520,6 +1762,18 @@ static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t
         ctx->mapped -= m.size;
         ctx->mappings.pop_back();
         GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
+        // per-chunk arena: the VRAM comes back with the chunk's reservation; it is reserved again at once at the same address
+        // (the section stays contiguous for the next growth); if it is not given there, the section ends below it
+        if (ctx->arena->per_chunk) {
+            const size_t i = (size_t) ((char *) m.ptr - (char *) ctx->base) / chunk;
+            if (i < ctx->resv.size()) {
+                if (!ctx->renew(i)) {
+                    GGML_LOG_WARN("%s: buffer %p: the chunk at %p could not be reserved again in place, the section can grow to %zu bytes "
+                        "only; the later arenas use one range\n", __func__, (void *) ctx->base, (void *) m.ptr, ctx->capacity());
+                    ggml_cuda_vmm_per_chunk_failed = true;
+                }
+            }
+        }
     }
     buffer->size = size;
     GGML_CUDA_VMM_LOG("%s: buffer %p: %zu -> %zu bytes (mapped %zu -> %zu of %zu)\n", __func__, (void *) ctx->base, size_old, size,
@@ -1665,7 +1919,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
                 ggml_cuda_set_device(cuda_ctx->device);
-                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+                CUDA_CHECK(ggml_cuda_memset_async(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
             }
         }
         NCCL_CHECK(ncclGroupStart());
@@ -1691,7 +1945,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
             to_bf16(tensors[i]->data, tmp[i].get(), ne, cuda_ctx->stream());
         } else {
-            CUDA_CHECK(cudaMemsetAsync(tmp[i].get(), 0, ne * sizeof(nv_bfloat16), cuda_ctx->stream()));
+            CUDA_CHECK(ggml_cuda_memset_async(tmp[i].get(), 0, ne * sizeof(nv_bfloat16), cuda_ctx->stream()));
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -2906,7 +3160,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(ggml_cuda_memcpy_async(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
@@ -2927,7 +3181,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(ggml_cuda_memcpy_async(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
@@ -3385,7 +3639,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3394,7 +3648,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_async(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3404,7 +3658,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    CUDA_CHECK(ggml_cuda_memcpy_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3415,7 +3669,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    CUDA_CHECK(ggml_cuda_memcpy_2d_async(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3452,12 +3706,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            CUDA_CHECK(ggml_cuda_memcpy_async(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            CUDA_CHECK(ggml_cuda_memcpy_peer_async(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -3473,7 +3727,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        CUDA_CHECK(ggml_cuda_memcpy_async(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
     return true;
 }

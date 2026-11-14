@@ -270,7 +270,7 @@ static void top_k_argsort_cuda(
         } else {
             argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
         }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+        CUDA_CHECK(ggml_cuda_memcpy_2d_async(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
                                      cudaMemcpyDeviceToDevice, stream));
 
         src += (size_t) ncols * iter_nrows;

@@ -46,7 +46,7 @@ void ggml_cuda_count_equal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne < (1 << 30) && "atomicAdd implementation only supports int");
     const int64_t dne = GGML_PAD((ne + 4*nsm - 1) / (4*nsm), CUDA_COUNT_EQUAL_CHUNK_SIZE);
 
-    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+    CUDA_CHECK(ggml_cuda_memset_async(dst_d, 0, ggml_nbytes(dst), stream));
 
     const dim3 blocks_dim(WARP_SIZE, 1, 1);
     const dim3 blocks_num(std::min((int64_t)4*nsm, (ne + CUDA_COUNT_EQUAL_CHUNK_SIZE - 1)/CUDA_COUNT_EQUAL_CHUNK_SIZE), 1, 1);
