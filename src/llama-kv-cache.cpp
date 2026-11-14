@@ -3408,6 +3408,7 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
     std::vector<std::vector<uint8_t>> staged(2*layers.size());
     std::vector<uint8_t> via_host(layers.size(), 0);
     size_t n_via_host = 0;
+    size_t n_lost_vmm = 0, n_on_cpu = 0; // of those: no new section, an ordinary device buffer / the CPU instead
     if (n < n_old && !force) {
         const int64_t t1 = ggml_time_us();
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -3647,11 +3648,23 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         dyn_vmm[ikv] = !bufs_layer.empty();
         if (bufs_layer.empty()) {
             ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (via_host[ikv]) {
+                // the old K/V is gone (its range was freed): an ordinary device buffer, else the CPU; stop only if both fail
+                if (b) {
+                    n_lost_vmm++;
+                } else {
+                    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    ggml_backend_buffer_type_t buft_cpu = cpu ? ggml_backend_dev_buffer_type(cpu) : nullptr;
+                    b.reset(buft_cpu ? ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft_cpu) : nullptr);
+                    if (!b) {
+                        GGML_ABORT("layer %u: the K/V was freed for the shrink and no buffer for %u cells could be allocated, "
+                            "neither on %s nor on the CPU", layer.il, n, ggml_backend_buft_name(buft));
+                    }
+                    n_on_cpu++;
+                }
+            }
             if (!b) {
                 LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
-                if (via_host[ikv]) {
-                    GGML_ABORT("the K/V of layer %u was freed for the shrink, a new buffer could not be allocated", layer.il);
-                }
                 return false;
             }
             ggml_backend_buffer_clear(b.get(), 0);
@@ -3730,6 +3743,11 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
     }
     n_resize++;
 
+    if (n_lost_vmm > 0 || n_on_cpu > 0) {
+        LLAMA_LOG_ERROR("%s: the VMM range was freed for the shrink, but %zu of %zu layers got no new section: %zu restored by copy into "
+            "ordinary device buffers, %zu kept on the CPU (no device memory; they stay there)\n", __func__,
+            n_lost_vmm + n_on_cpu, n_via_host, n_lost_vmm, n_on_cpu);
+    }
     LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy; %zu with the VMM range freed), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
         __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, n_via_host, (ggml_time_us() - t0) / 1000.0,
         t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
