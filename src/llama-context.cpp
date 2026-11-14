@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1010,6 +1012,33 @@ void llama_context::zones_step(uint32_t n_tokens) {
     }
 }
 
+// the free VRAM by the kernel driver (amdgpu sysfs: mem_info_vram_total - mem_info_vram_used) of the card whose total is closest
+// to total (within 1/16); false if there is none (not Linux, not amdgpu)
+static bool zones_sysfs_free(size_t total, size_t & free_out) {
+#if defined(__linux__)
+    size_t best = SIZE_MAX;
+    for (int c = 0; c < 16; ++c) {
+        unsigned long long t = 0, u = 0;
+        const std::string base = "/sys/class/drm/card" + std::to_string(c) + "/device/mem_info_vram_";
+        FILE * ft = fopen((base + "total").c_str(), "r");
+        FILE * fu = ft ? fopen((base + "used").c_str(), "r") : nullptr;
+        const bool ok = ft && fu && fscanf(ft, "%llu", &t) == 1 && fscanf(fu, "%llu", &u) == 1 && u <= t;
+        if (fu) { fclose(fu); }
+        if (ft) { fclose(ft); }
+        const size_t diff = (size_t) (t > total ? t - total : total - t);
+        if (ok && diff <= total/16 && diff < best) {
+            best     = diff;
+            free_out = (size_t) (t - u);
+        }
+    }
+    return best != SIZE_MAX;
+#else
+    GGML_UNUSED(total);
+    GGML_UNUSED(free_out);
+    return false;
+#endif
+}
+
 ggml_backend_dev_t llama_context::zones_dev() const {
     const auto flex = model.flex_layers();
     if (!flex.empty()) {
@@ -1031,13 +1060,23 @@ size_t llama_context::zones_clamp(bool up) {
     }
     size_t dev_free = 0, dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-    const int64_t real = (int64_t) dev_free - (int64_t) zones_vram_margin;
+    // the kernel's own figure where there is one: the booked free memory is checked against it, the lower one counts
+    size_t sys_free = 0;
+    const bool sys = zones_sysfs_free(dev_total, sys_free);
+    const int64_t booked = zones_headroom + (int64_t) zones_vram_margin;
+    if (sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
+        LLAMA_LOG_WARN("%s: zones: the booked free memory (%.0f MiB) is off from the device: driver %.0f MiB, sysfs %.0f MiB\n", __func__,
+            booked / 1048576.0, dev_free / 1048576.0, sys_free / 1048576.0);
+    }
+    const size_t free_real = sys ? std::min(dev_free, sys_free) : dev_free;
+    const int64_t real = (int64_t) free_real - (int64_t) zones_vram_margin;
     if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
-        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB, margin %.0f MiB)\n", __func__,
-            zones_headroom / 1048576.0, real / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
+        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB: driver %.0f, sysfs %s; margin %.0f MiB)\n", __func__,
+            zones_headroom / 1048576.0, real / 1048576.0, free_real / 1048576.0, dev_free / 1048576.0,
+            sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_vram_margin / 1048576.0);
         zones_headroom = real;
     }
-    return dev_free;
+    return free_real;
 }
 
 void llama_context::zones_log_state(const char * what) {
@@ -1072,11 +1111,15 @@ void llama_context::zones_log_state(const char * what) {
     if (ggml_backend_dev_t dev = zones_dev()) {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
     }
+    size_t sys_free = 0;
+    const bool sys = zones_sysfs_free(dev_total, sys_free);
     LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s; "
-        "KV %u cells (%u used, %.0f MiB on the device); device free %.0f MiB (budget %.0f MiB, margin %.0f MiB)\n", __func__, what,
+        "KV %u cells (%u used, %.0f MiB on the device); device free: booked %.0f, driver %.0f, sysfs %s MiB (budget %.0f MiB, margin %.0f MiB)\n",
+        __func__, what,
         w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
         off.empty() ? "" : ", off: ", off.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
-        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, dev_free / 1048576.0, zones_headroom / 1048576.0,
+        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, (zones_headroom + (int64_t) zones_vram_margin) / 1048576.0,
+        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_headroom / 1048576.0,
         zones_vram_margin / 1048576.0);
 }
 

@@ -88,6 +88,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -1100,9 +1101,9 @@ static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20; // 2 MiB: section 
 
 // Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
 // first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
-// GGML_CUDA_VMM_CHUNK_KIB (default: the section alignment, 2 MiB), rounded to the minimum granularity, a divisor of the alignment.
-// Not smaller by default: the amdgpu KFD books every VRAM allocation aligned to 2 MiB in its free memory (VRAM_AVAILABLITY_ALIGN),
-// so 1 MiB chunks halve what hipMemGetInfo reports and what KFD allocations may still take.
+// The chunk is chosen at runtime from the granularities, the section alignment and the booking unit of the driver, measured at the
+// first arena (ggml_cuda_vmm_booking_unit; the amdgpu KFD books every allocation rounded to 2 MiB in its free memory, so smaller
+// chunks would count double in hipMemGetInfo); GGML_CUDA_VMM_CHUNK_KIB overrides it.
 
 struct ggml_cuda_vmm_arena {
     ggml_backend_buffer_type_t buft;
@@ -1276,6 +1277,40 @@ static bool ggml_backend_cuda_vmm_arena_commit(void * arena) {
     return ggml_cuda_vmm_commit((ggml_cuda_vmm_arena *) arena);
 }
 
+// the unit the driver books a device allocation with in its free memory (amdgpu KFD: 2 MiB, more than the granularity), measured
+// once per device: the free memory before and after a minimal handle, twice; 0 if unclear (the probes differ, nothing booked)
+static size_t ggml_cuda_vmm_booking_unit(int device, const CUmemAllocationProp & prop, size_t gran_min) {
+    static std::mutex mtx;
+    static size_t unit[GGML_CUDA_MAX_DEVICES] = {};
+    static bool   done[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (done[device]) {
+        return unit[device];
+    }
+    done[device] = true;
+    const size_t size = std::max<size_t>(gran_min, 1);
+    size_t d[2] = { 0, 1 };
+    for (int i = 0; i < 2; ++i) {
+        size_t f0 = 0, f1 = 0, total = 0;
+        CUmemGenericAllocationHandle h;
+        if (cudaMemGetInfo(&f0, &total) != cudaSuccess || !GGML_CUDA_VMM_OK(cuMemCreate(&h, size, &prop, 0))) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        const cudaError_t r = cudaMemGetInfo(&f1, &total);
+        (void) cuMemRelease(h);
+        if (r != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        d[i] = f0 > f1 ? f0 - f1 : 0;
+    }
+    if (d[0] > 0 && d[0] == d[1] && d[0] % size == 0) {
+        unit[device] = d[0];
+    }
+    return unit[device];
+}
+
 // a new arena of size bytes on the device of buft; NULL if the device has no VMM (the caller falls back)
 static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
     if (buft->iface.get_name != ggml_backend_cuda_buffer_type_get_name) {
@@ -1307,6 +1342,34 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
     if (gran_min > 0) {
         align = gran_min * ((align + gran_min - 1) / gran_min);
     }
+    // the chunk: a common multiple of every known bound, the granularities, the section alignment and the unit the driver books an
+    // allocation with in its free memory (measured, the API does not give it); not below the alignment (more mappings per step)
+    // (at most 32 alignments: the KV reserves 64 MiB of address space per section for the alignment)
+    const size_t unit = ggml_cuda_vmm_booking_unit(device, prop, gran_min);
+    size_t chunk = align;
+    if (unit > 0 && std::lcm(align, unit) <= 32*align) {
+        chunk = std::lcm(align, unit);
+    }
+    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
+    if (env_chunk && atoll(env_chunk) > 0) {
+        chunk = (size_t) atoll(env_chunk) << 10;
+        if (gran_min > 0) {
+            chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
+        }
+        if (align % chunk != 0 && chunk % align != 0) {
+            chunk = align;
+        }
+    }
+    align = std::max(align, chunk); // the sections start on chunk boundaries
+    {
+        static bool logged[GGML_CUDA_MAX_DEVICES] = {};
+        if (!logged[device]) {
+            logged[device] = true;
+            GGML_LOG_INFO("%s: device %d: VMM granularity minimum %zu, recommended %zu; section alignment %zu; driver booking unit %zu%s; chunk %zu%s\n",
+                __func__, device, gran_min, gran_rec, align, unit,
+                unit > 0 ? " (measured)" : " (unclear: the largest known bound is used)", chunk, env_chunk ? " (GGML_CUDA_VMM_CHUNK_KIB)" : "");
+        }
+    }
     const size_t reserved = align * ((std::max<size_t>(size, 1) + align - 1) / align);
     CUdeviceptr base = 0;
     const auto r_reserve = cuMemAddressReserve(&base, reserved, align, 0, 0);
@@ -1314,15 +1377,6 @@ static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, s
         __func__, device, physical, reserved, (void *) base, gran_rec, gran_min, align, (int) r_reserve);
     if (!GGML_CUDA_VMM_OK(r_reserve)) {
         return nullptr;
-    }
-    // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
-    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
-    size_t chunk = env_chunk ? (size_t) atoll(env_chunk) << 10 : align;
-    if (gran_min > 0) {
-        chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
-    }
-    if (chunk == 0 || chunk > align || align % chunk != 0) {
-        chunk = align;
     }
     GGML_CUDA_VMM_LOG("%s: chunk %zu bytes\n", __func__, chunk);
     (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
