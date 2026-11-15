@@ -1443,6 +1443,9 @@ struct llama_model::impl {
         size_t buf_idx = SIZE_MAX;
         bool   on_gpu  = true;
         bool   whole   = false; // the whole layer is in the band (its device and K/V move), else only some tensors (e.g. MoE experts)
+        // a whole layer's experts in their own buffer: they go to the CPU first, the layer stays a GPU layer (on_gpu is the rest)
+        size_t buf_idx_exps  = SIZE_MAX;
+        bool   exps_on_gpu   = true;
         std::vector<llama_model_loader::flex_pair> pairs;
     };
     std::map<int, flex_layer> flex;
@@ -2369,7 +2372,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         if (ctx_key.flex >= 0) {
-            pimpl->flex[ctx_key.flex].buf_idx = pimpl->ctxs_bufs.size();
+            (ctx_key.exps ? pimpl->flex[ctx_key.flex].buf_idx_exps : pimpl->flex[ctx_key.flex].buf_idx) = pimpl->ctxs_bufs.size();
         }
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
@@ -2430,8 +2433,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!pimpl->flex.empty()) {
         // the loader is not used after load_tensors, keep its files to reload the GPU copies
         pimpl->flex_files = std::move(ml.files);
-        size_t n_pairs = 0, n_bytes_flex = 0, n_host = 0, n_bytes_host = 0;
-        for (const auto & [il, fl] : pimpl->flex) {
+        size_t n_pairs = 0, n_bytes_flex = 0, n_host = 0, n_bytes_host = 0, n_exps = 0;
+        for (auto & [il, fl] : pimpl->flex) {
+            // a layer with only experts in the band has a single buffer
+            if (fl.buf_idx == SIZE_MAX && fl.buf_idx_exps != SIZE_MAX) {
+                std::swap(fl.buf_idx, fl.buf_idx_exps);
+                for (auto & p : fl.pairs) {
+                    p.exps = false;
+                }
+            }
+            n_exps += fl.buf_idx_exps != SIZE_MAX;
             for (const auto & p : fl.pairs) {
                 n_pairs++;
                 n_bytes_flex += ggml_nbytes(p.gpu);
@@ -2441,8 +2452,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             }
         }
-        LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB), %zu with a host copy (%.2f MiB)\n", __func__,
-            pimpl->flex.begin()->first, pimpl->flex.rbegin()->first, n_pairs, n_bytes_flex / 1024.0 / 1024.0, n_host, n_bytes_host / 1024.0 / 1024.0);
+        LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB), %zu with a host copy (%.2f MiB); %zu whole layers move their experts first\n", __func__,
+            pimpl->flex.begin()->first, pimpl->flex.rbegin()->first, n_pairs, n_bytes_flex / 1024.0 / 1024.0, n_host, n_bytes_host / 1024.0 / 1024.0, n_exps);
     }
 
     return true;
@@ -2454,30 +2465,51 @@ static void flex_swap_storage(ggml_tensor * a, ggml_tensor * b) {
     std::swap(a->extra,  b->extra);
 }
 
-int llama_model::flex_next(bool to_gpu) const {
+std::vector<std::pair<int, bool>> llama_model::flex_order() const {
     // take order: the partial layers (only some tensors, e.g. MoE experts) from the last one down, they end the zone 1 run of
-    // full layers; then the whole layers from the CPU boundary up. Put back: the reverse.
-    std::vector<int> order;
+    // full layers; then the experts of the whole layers, then the whole layers (attention and K/V), both from the CPU boundary up.
+    // Put back: the reverse. (layer, experts of a whole layer)
+    std::vector<std::pair<int, bool>> order;
     for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
         if (!it->second.whole && it->second.buf_idx != SIZE_MAX) {
-            order.push_back(it->first);
+            order.emplace_back(it->first, false);
+        }
+    }
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.whole && fl.buf_idx != SIZE_MAX && fl.buf_idx_exps != SIZE_MAX) {
+            order.emplace_back(il, true);
         }
     }
     for (const auto & [il, fl] : pimpl->flex) {
         if (fl.whole && fl.buf_idx != SIZE_MAX) {
-            order.push_back(il);
+            order.emplace_back(il, false);
         }
     }
+    return order;
+}
+
+int llama_model::flex_next(bool to_gpu, bool * exps) const {
+    const auto order = flex_order();
+    auto on = [&](const std::pair<int, bool> & s) {
+        const auto & fl = pimpl->flex.at(s.first);
+        return s.second ? fl.exps_on_gpu : fl.on_gpu;
+    };
+    auto found = [&](const std::pair<int, bool> & s) {
+        if (exps) {
+            *exps = s.second;
+        }
+        return s.first;
+    };
     if (to_gpu) {
         for (auto it = order.rbegin(); it != order.rend(); ++it) {
-            if (!pimpl->flex.at(*it).on_gpu) {
-                return *it;
+            if (!on(*it)) {
+                return found(*it);
             }
         }
     } else {
-        for (int il : order) {
-            if (pimpl->flex.at(il).on_gpu) {
-                return il;
+        for (const auto & s : order) {
+            if (on(s)) {
+                return found(s);
             }
         }
     }
@@ -2499,25 +2531,34 @@ bool llama_model::flex_on_gpu(int il) const {
     return it == pimpl->flex.end() || it->second.on_gpu;
 }
 
-std::vector<std::pair<ggml_tensor *, ggml_tensor *>> llama_model::flex_host_copies(int il) const {
+bool llama_model::flex_exps_off(int il) const {
+    auto it = pimpl->flex.find(il);
+    return it != pimpl->flex.end() && it->second.buf_idx_exps != SIZE_MAX && !it->second.exps_on_gpu;
+}
+
+std::vector<std::pair<ggml_tensor *, ggml_tensor *>> llama_model::flex_host_alts(int il) const {
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> res;
     auto it = pimpl->flex.find(il);
     if (it != pimpl->flex.end()) {
-        for (const auto & p : it->second.pairs) {
+        const auto & fl = it->second;
+        for (const auto & p : fl.pairs) {
             if (p.host) {
-                res.emplace_back(p.gpu, p.host);
+                const bool off = p.exps ? !fl.exps_on_gpu : !fl.on_gpu;
+                res.emplace_back(p.gpu, off ? p.host : nullptr);
             }
         }
     }
     return res;
 }
 
-size_t llama_model::flex_layer_bytes(int il) const {
+size_t llama_model::flex_layer_bytes(int il, int part) const {
     size_t res = 0;
     auto it = pimpl->flex.find(il);
     if (it != pimpl->flex.end()) {
         for (const auto & p : it->second.pairs) {
-            res += ggml_nbytes(p.gpu);
+            if (part == LLAMA_FLEX_ALL || (part == LLAMA_FLEX_EXPS) == p.exps) {
+                res += ggml_nbytes(p.gpu);
+            }
         }
     }
     return res;
@@ -2533,45 +2574,69 @@ std::vector<int> llama_model::flex_layers() const {
     return res;
 }
 
-bool llama_model::flex_move(int il, bool to_gpu, bool from_file) const {
+bool llama_model::flex_move(int il, bool to_gpu, bool from_file, int part) const {
     auto it = pimpl->flex.find(il);
     if (it == pimpl->flex.end() || it->second.buf_idx == SIZE_MAX) {
         LLAMA_LOG_WARN("%s: layer %d is not a flex layer\n", __func__, il);
         return false;
     }
-    auto & fl = it->second;
-    if (fl.on_gpu == to_gpu) {
+    const bool has_exps = it->second.buf_idx_exps != SIZE_MAX;
+    if (part == LLAMA_FLEX_EXPS) {
+        return !has_exps || flex_move_part(il, true, to_gpu, from_file);
+    }
+    if (part == LLAMA_FLEX_REST || !has_exps) {
+        return flex_move_part(il, false, to_gpu, from_file);
+    }
+    // the whole layer: the experts leave first and come back last
+    return to_gpu ? flex_move_part(il, false, true, from_file) && flex_move_part(il, true, true, from_file)
+                  : flex_move_part(il, true, false, from_file) && flex_move_part(il, false, false, from_file);
+}
+
+bool llama_model::flex_move_part(int il, bool exps, bool to_gpu, bool from_file) const {
+    auto & fl = pimpl->flex.at(il);
+    bool & on_gpu = exps ? fl.exps_on_gpu : fl.on_gpu;
+    if (on_gpu == to_gpu) {
+        return true;
+    }
+    std::vector<llama_model_loader::flex_pair *> pairs;
+    for (auto & p : fl.pairs) {
+        if (p.exps == exps) {
+            pairs.push_back(&p);
+        }
+    }
+    if (pairs.empty()) {
+        on_gpu = to_gpu;
         return true;
     }
 
     const int64_t t0 = ggml_time_us();
     int64_t t_alloc = 0, t_copy = 0, t_free = 0;
-    auto & bufs = pimpl->ctxs_bufs[fl.buf_idx].second;
-    ggml_backend_buffer_type_t buft = fl.pairs[0].buft;
+    auto & bufs = pimpl->ctxs_bufs[exps ? fl.buf_idx_exps : fl.buf_idx].second;
+    ggml_backend_buffer_type_t buft = pairs[0]->buft;
     size_t nbytes = 0;
     int n_host = 0, n_cpu = 0, n_file = 0;
 
     if (!to_gpu) {
-        // the model tensors take the CPU storage, then the layer's GPU buffer is freed
-        for (auto & p : fl.pairs) {
-            flex_swap_storage(p.gpu, p.cpu);
-            nbytes += ggml_nbytes(p.gpu);
+        // the model tensors take the CPU storage, then the GPU buffer is freed
+        for (auto * p : pairs) {
+            flex_swap_storage(p->gpu, p->cpu);
+            nbytes += ggml_nbytes(p->gpu);
         }
         const int64_t t1 = ggml_time_us();
         bufs.clear();
         t_free = ggml_time_us() - t1;
-        for (auto & p : fl.pairs) {
-            p.cpu->buffer = nullptr;
-            p.cpu->data   = nullptr;
-            p.cpu->extra  = nullptr;
+        for (auto * p : pairs) {
+            p->cpu->buffer = nullptr;
+            p->cpu->data   = nullptr;
+            p->cpu->extra  = nullptr;
         }
     } else {
         // new GPU buffer for the twins, then swap back
         // data source: the host copy (zone 2), else the CPU copy if it is host-readable (not repacked), else the model file
         const size_t align = ggml_backend_buft_get_alignment(buft);
         size_t size = 0;
-        for (auto & p : fl.pairs) {
-            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, p.cpu), align);
+        for (auto * p : pairs) {
+            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, p->cpu), align);
         }
         const int64_t t1 = ggml_time_us();
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
@@ -2581,52 +2646,52 @@ bool llama_model::flex_move(int il, bool to_gpu, bool from_file) const {
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_tallocr talloc = ggml_tallocr_new(buf);
-        for (auto & p : fl.pairs) {
-            ggml_tallocr_alloc(&talloc, p.cpu);
+        for (auto * p : pairs) {
+            ggml_tallocr_alloc(&talloc, p->cpu);
         }
         t_alloc = ggml_time_us() - t1;
 
         const int64_t t2 = ggml_time_us();
         std::vector<uint8_t> tmp;
-        for (auto & p : fl.pairs) {
-            const size_t n = ggml_nbytes(p.cpu);
-            // p.gpu holds the CPU storage while the layer is off
+        for (auto * p : pairs) {
+            const size_t n = ggml_nbytes(p->cpu);
+            // p->gpu holds the CPU storage while the layer is off
             // a synchronous set: the backend picks its path (DMA from pinned memory, or a direct write on UMA), see DECISIONS.md 19
             const void * src = nullptr;
-            if (!from_file && p.host) {
-                src = p.host->data;
+            if (!from_file && p->host) {
+                src = p->host->data;
                 n_host++;
-            } else if (!from_file && ggml_backend_buffer_is_host(p.gpu->buffer)) {
-                src = p.gpu->data;
+            } else if (!from_file && ggml_backend_buffer_is_host(p->gpu->buffer)) {
+                src = p->gpu->data;
                 n_cpu++;
             }
             if (src) {
-                ggml_backend_tensor_set(p.cpu, src, 0, n);
+                ggml_backend_tensor_set(p->cpu, src, 0, n);
             } else {
                 tmp.resize(n);
-                auto & file = pimpl->flex_files.at(p.file_idx);
-                file->seek(p.offs, SEEK_SET);
+                auto & file = pimpl->flex_files.at(p->file_idx);
+                file->seek(p->offs, SEEK_SET);
                 file->read_raw(tmp.data(), n);
-                ggml_backend_tensor_set(p.cpu, tmp.data(), 0, n);
+                ggml_backend_tensor_set(p->cpu, tmp.data(), 0, n);
                 n_file++;
             }
             nbytes += n;
         }
-        for (auto & p : fl.pairs) {
-            flex_swap_storage(p.gpu, p.cpu);
+        for (auto * p : pairs) {
+            flex_swap_storage(p->gpu, p->cpu);
         }
         t_copy = ggml_time_us() - t2;
         bufs.emplace_back(buf);
     }
-    fl.on_gpu = to_gpu;
+    on_gpu = to_gpu;
     const double t_ms = (ggml_time_us() - t0) / 1000.0;
 
     size_t dev_free = 0, dev_total = 0;
     if (auto * dev = ggml_backend_buft_get_device(buft)) {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
     }
-    LLAMA_LOG_INFO("%s: layer %d moved to %s (%.2f MiB, %.1f ms: alloc %.1f, copy %.1f, free %.1f; source host/cpu/file %d/%d/%d), device free memory %.2f MiB\n",
-        __func__, il, to_gpu ? ggml_backend_buft_name(buft) : "CPU", nbytes / 1024.0 / 1024.0, t_ms,
+    LLAMA_LOG_INFO("%s: layer %d%s moved to %s (%.2f MiB, %.1f ms: alloc %.1f, copy %.1f, free %.1f; source host/cpu/file %d/%d/%d), device free memory %.2f MiB\n",
+        __func__, il, exps ? " experts" : "", to_gpu ? ggml_backend_buft_name(buft) : "CPU", nbytes / 1024.0 / 1024.0, t_ms,
         t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0, n_host, n_cpu, n_file, dev_free / 1024.0 / 1024.0);
     return true;
 }

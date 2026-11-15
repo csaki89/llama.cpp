@@ -270,6 +270,7 @@ public:
     bool     is_dynamic()   const { return dyn_max > 0; }
     uint32_t dyn_max_size() const { return dyn_max; }
     uint32_t dyn_round(uint32_t n) const; // n rounded up to the next chunk, at most max_size
+    uint32_t dyn_round_down(uint32_t n) const; // the largest size step not above n (at least the starting size)
     uint32_t used_cells()   const;        // max used_max_p1() over the streams
     uint64_t generation()   const { return n_resize; } // changes when the K/V tensors are reallocated
 

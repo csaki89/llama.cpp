@@ -1132,8 +1132,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int flex = -1) -> ggml_context * {
-        const ctx_key key { buft, is_lazy, flex };
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int flex = -1, bool exps = false) -> ggml_context * {
+        const ctx_key key { buft, is_lazy, flex, exps };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1431,7 +1431,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
-    ggml_context * ctx = ctx_for_buft(buft, flex_cpu_buft ? tn.bid : -1);
+    // the experts of a whole flex layer get their own buffer: they go to the CPU before the rest of the layer (attention, K/V)
+    const bool flex_exps = flex_cpu_buft && flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi && tn.str().find("_exps") != std::string::npos;
+    ggml_context * ctx = ctx_for_buft(buft, flex_cpu_buft ? tn.bid : -1, flex_exps);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1471,7 +1473,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const auto it_w = weights_map.find(tn.str());
         GGML_ASSERT(it_w != weights_map.end());
-        flex_pairs.push_back({ tensor, twin, host, tn.bid, buft, it_w->second.idx, it_w->second.offs });
+        flex_pairs.push_back({ tensor, twin, host, tn.bid, buft, it_w->second.idx, it_w->second.offs, flex_exps });
     }
 
     return tensor;

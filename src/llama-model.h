@@ -763,6 +763,9 @@ struct llama_rope_params {
     ggml_tensor * k_norm  = nullptr; // K norm weight applied after RoPE, a K-shift has to undo it
 };
 
+// the part of a flex layer a move works on
+enum llama_flex_part { LLAMA_FLEX_ALL = 0, LLAMA_FLEX_EXPS = 1, LLAMA_FLEX_REST = 2 };
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -974,15 +977,20 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
 
     // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
-    bool flex_move(int il, bool to_gpu, bool from_file = false) const;
+    // part: LLAMA_FLEX_ALL (the whole layer), LLAMA_FLEX_EXPS (the experts of a whole layer), LLAMA_FLEX_REST (the rest)
+    bool flex_move(int il, bool to_gpu, bool from_file = false, int part = LLAMA_FLEX_ALL) const;
     bool flex_has_layer(int il) const;
     bool flex_whole(int il) const; // the whole layer moves (device and K/V), not only some tensors (MoE experts)
-    bool flex_on_gpu(int il) const;
+    bool flex_on_gpu(int il) const; // the layer is a GPU layer (its experts may be off)
+    bool flex_exps_off(int il) const; // the experts of a whole layer are on the CPU
     std::vector<int> flex_layers() const;
-    size_t flex_layer_bytes(int il) const; // the layer's weights in its GPU buffer
-    // (model tensor, original-format host copy) of a flex layer, registered with the scheduler while the layer is off
-    std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> flex_host_copies(int il) const;
-    int  flex_next(bool to_gpu) const; // next layer to take (to_gpu = false) or put back, -1 if none
+    size_t flex_layer_bytes(int il, int part = LLAMA_FLEX_ALL) const; // the layer's weights in its GPU buffer
+    // (model tensor, original-format host copy while its part is off, else NULL), registered with the scheduler
+    std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> flex_host_alts(int il) const;
+    // the move steps (layer, experts of a whole layer) in take order, put back in reverse
+    std::vector<std::pair<int, bool>> flex_order() const;
+    // next step to take (to_gpu = false) or put back, -1 if none; exps: the step is the experts of a whole layer
+    int  flex_next(bool to_gpu, bool * exps = nullptr) const;
     ggml_backend_dev_t flex_gpu_dev(int il) const; // the GPU device of a flex layer (dev_layer() is the CPU while it is taken off)
     llama_split_mode split_mode() const;
     bool no_alloc() const;
@@ -1029,6 +1037,8 @@ struct llama_model {
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:
+    bool flex_move_part(int il, bool exps, bool to_gpu, bool from_file) const; // one buffer of a flex layer
+
     llama_model_params params;
 
     struct impl;

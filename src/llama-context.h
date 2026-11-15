@@ -399,7 +399,8 @@ private:
     void flex_set_alts(int il);
 
     // move a flex layer (weights, host copies in the scheduler, K/V) at a batch boundary
-    bool flex_move_layer(int il, bool to_gpu);
+    // part: LLAMA_FLEX_ALL (0, the whole layer), LLAMA_FLEX_EXPS (its experts), LLAMA_FLEX_REST (the rest, with the K/V)
+    bool flex_move_layer(int il, bool to_gpu, int part = 0);
 
 public:
     // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)
@@ -417,6 +418,13 @@ private:
     bool     zones_headroom_set = false;
     uint32_t zones_kv_size     = 0;     // the KV size booked in the budget
     bool     zones_fa_logged   = false;
+    bool     zones_at_start    = false; // in zones_reserve (the start of a request): the flex steps that are off are tried again
+    bool     zones_shrink      = true;  // LLAMA_ZONES_SHRINK=0: the KV never shrinks
+    int64_t  zones_shrink_idle_us = 0;  // LLAMA_ZONES_SHRINK_IDLE=<s>: a shrink only after that long without a batch
+    int64_t  zones_t_batch_us  = 0;     // the start of the last batch
+    int64_t  zones_t_shrink_us = 0;     // the last check whether a shrink lets flex steps back
+    size_t   zones_compute_bytes = 0;   // the compute buffer on the device, booked in the budget
+    bool     zones_retry_put_back = false; // the compute buffer got smaller: try the flex steps that are off after the reservation
 
     // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
     // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
@@ -431,6 +439,14 @@ private:
     size_t   zones_layer_kv_bytes(int il) const;
     // with no dynamic KV: the flex layers off for the device K/V above the initial size the zones were placed for
     void     zones_static(size_t extra);
+    // a flex step (a layer, or the experts of a whole layer): its device bytes; take the next one off; put back while the budget allows
+    int64_t  zones_step_cost(int il, bool exps) const;
+    bool     zones_take();
+    int      zones_put_back();
+    // the KV size to shrink to: the largest one, not below n_min, that lets the most flex steps that are off come back (the size: none)
+    uint32_t zones_shrink_target(uint32_t n_min) const;
+    // after a scheduler reservation: the change of the device compute buffer is booked
+    void     zones_compute_booked();
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

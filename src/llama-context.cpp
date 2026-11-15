@@ -648,6 +648,15 @@ llama_context::llama_context(
                 for (const auto & [name, part] : parts.fixed) {
                     LLAMA_LOG_INFO("%s: dynamic KV: the %s keeps its size (%.2f MiB on the device)\n", __func__, name, zones_dev_bytes(part) / 1048576.0);
                 }
+                // LLAMA_ZONES_SHRINK=0: the KV never shrinks; LLAMA_ZONES_SHRINK_IDLE=<s>: only after that long without a batch
+                if (const char * env = getenv("LLAMA_ZONES_SHRINK")) {
+                    zones_shrink = atoi(env) != 0;
+                }
+                if (const char * env = getenv("LLAMA_ZONES_SHRINK_IDLE")) {
+                    zones_shrink_idle_us = (int64_t) (std::max(0.0, atof(env))*1e6);
+                }
+                LLAMA_LOG_INFO("%s: dynamic KV: shrink %s, idle time before a shrink %.0f s\n", __func__,
+                    zones_shrink ? "on" : "off (LLAMA_ZONES_SHRINK=0)", zones_shrink_idle_us / 1e6);
             } else {
                 LLAMA_LOG_WARN("%s: dynamic KV is not supported for %s, allocating %u cells\n", __func__,
                     why ? why : "this memory (a transposed V cache, or K/V shared with another cache)", cparams.n_ctx_seq);
@@ -917,16 +926,92 @@ bool llama_context::zones_reserve(uint32_t n_tokens) {
         return true;
     }
     // the zone step with the whole remaining prompt: the shrink or growth and the flex moves happen once, here
+    // (the start of a request: the flex layers that are off are tried again with the measured free memory)
     const uint32_t used = kv->used_cells();
     const uint32_t size = kv->get_size();
     zones_reserved = 0;
+    zones_at_start = true;
     zones_step(n_tokens);
+    zones_at_start = false;
     zones_reserved      = used + n_tokens;
     zones_reserved_from = used;
     const bool ok = kv->get_size() >= std::min(used + n_tokens, kv->dyn_max_size());
     LLAMA_LOG_INFO("%s: KV reserved for %u + %u tokens: %u -> %u cells%s\n", __func__, used, n_tokens, size, kv->get_size(),
         ok ? "" : " (not enough, it grows by steps)");
     return ok;
+}
+
+int64_t llama_context::zones_step_cost(int il, bool exps) const {
+    // the weights of the step, and the K/V of the layer when the whole layer moves (not with its experts only)
+    return (int64_t) (model.flex_layer_bytes(il, exps ? LLAMA_FLEX_EXPS : LLAMA_FLEX_REST) +
+        (!exps && model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
+}
+
+bool llama_context::zones_take() {
+    bool exps = false;
+    const int il = model.flex_next(false, &exps);
+    if (il < 0) {
+        return false;
+    }
+    const int64_t freed = zones_step_cost(il, exps);
+    if (!flex_move_layer(il, false, exps ? LLAMA_FLEX_EXPS : LLAMA_FLEX_REST)) {
+        return false;
+    }
+    zones_headroom += freed;
+    return true;
+}
+
+int llama_context::zones_put_back() {
+    int n = 0;
+    bool exps = false;
+    for (int il = model.flex_next(true, &exps); il >= 0; il = model.flex_next(true, &exps)) {
+        const int64_t cost = zones_step_cost(il, exps);
+        if (cost > zones_headroom || !flex_move_layer(il, true, exps ? LLAMA_FLEX_EXPS : LLAMA_FLEX_REST)) {
+            break;
+        }
+        zones_headroom -= cost;
+        n++;
+    }
+    return n;
+}
+
+uint32_t llama_context::zones_shrink_target(uint32_t n_min) const {
+    // the steps that are off, in put-back order: each one needs its weights, a whole layer also its K/V at the new size n;
+    // the shrink frees (size - n) cells of the device K/V. The largest n that lets the most steps back, not below n_min.
+    auto * kv = zones_kv();
+    const uint32_t size = kv->get_size();
+    const int64_t cb = (int64_t) kv->cell_bytes(true);
+    int64_t w = 0, k = 0, s = 0; // weights, K/V bytes per cell of the whole layers, fixed K/V bytes (SWA part)
+    uint32_t res = size;
+    const auto order = model.flex_order();
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        const int  il   = it->first;
+        const bool exps = it->second;
+        if (exps ? !model.flex_exps_off(il) : model.flex_on_gpu(il)) {
+            continue;
+        }
+        w += (int64_t) model.flex_layer_bytes(il, exps ? LLAMA_FLEX_EXPS : LLAMA_FLEX_REST);
+        if (!exps && model.flex_whole(il)) {
+            const size_t own = kv->layer_bytes(il);
+            k += (int64_t) (own / size);
+            s += (int64_t) (zones_layer_kv_bytes(il) - own);
+        }
+        // room at n: headroom + (size - n)*cb >= w + n*k + s
+        const int64_t num = zones_headroom + (int64_t) size*cb - w - s;
+        const int64_t den = cb + k;
+        if (num < 0 || den <= 0) {
+            break;
+        }
+        const int64_t bound = num/den;
+        if (bound >= (int64_t) size) {
+            continue; // this step fits without a shrink
+        }
+        if (bound < (int64_t) n_min) {
+            break;
+        }
+        res = kv->dyn_round_down((uint32_t) bound);
+    }
+    return res;
 }
 
 void llama_context::zones_step(uint32_t n_tokens) {
@@ -976,16 +1061,7 @@ void llama_context::zones_step(uint32_t n_tokens) {
     if (rule && zones_kv_size != 0 && kv->get_size() != zones_kv_size) {
         zones_headroom -= ((int64_t) kv->get_size() - (int64_t) zones_kv_size)*(int64_t) kv->cell_bytes(true);
     }
-    while (rule && zones_headroom < 0) {
-        const int il = model.flex_next(false);
-        if (il < 0) {
-            break;
-        }
-        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
-        if (!flex_move_layer(il, false)) {
-            break;
-        }
-        zones_headroom += freed;
+    while (rule && zones_headroom < 0 && zones_take()) {
         n_off++;
     }
 
@@ -998,9 +1074,29 @@ void llama_context::zones_step(uint32_t n_tokens) {
         zones_reserved = 0;
     }
 
-    // shrink when the KV is empty or mostly unused (new conversation, removed sequences); not below a reservation
-    if (size > zones_kv_init && (used == 0 || used < size/4)) {
-        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(std::max(used + n_tokens, zones_reserved)));
+    // shrink when the KV is empty or mostly unused (new conversation, removed sequences), not below a reservation;
+    // with flex layers only as far as the ones that are off can come back (none: no shrink), after the idle time
+    const int64_t t_now = ggml_time_us();
+    if (zones_shrink && size > zones_kv_init && (used == 0 || used < size/4)) {
+        const uint32_t n_min = std::max(zones_kv_init, kv->dyn_round(std::max(used + n_tokens, zones_reserved)));
+        const double idle = zones_t_batch_us > 0 ? (t_now - zones_t_batch_us) / 1e6 : 1e9;
+        uint32_t n = n_min;
+        std::string why;
+        if (zones_shrink_idle_us > 0 && idle*1e6 < zones_shrink_idle_us) {
+            n = size;
+            why = format("idle %.0f s < %.0f s", idle, zones_shrink_idle_us / 1e6);
+        } else if (rule && n_min < size && model.flex_next(true) < 0) {
+            n = size;
+            why = "no flex layer is off";
+        } else if (rule && n_min < size && !zones_at_start && used != 0 && t_now - zones_t_shrink_us < 1000000) {
+            n = size; // between the checks (at most one a second while the KV is mostly unused)
+        } else if (rule && n_min < size) {
+            zones_t_shrink_us = t_now;
+            sync();
+            zones_clamp(true);
+            n = zones_shrink_target(n_min);
+            why = "a shrink lets no more flex steps back";
+        }
         if (n < size) {
             sync();
             const size_t per_cell = kv->cell_bytes(true);
@@ -1008,27 +1104,20 @@ void llama_context::zones_step(uint32_t n_tokens) {
                 zones_headroom += (int64_t) ((size - n)*per_cell);
                 shrunk = true;
             }
+        } else if (zones_at_start && n_min < size) {
+            LLAMA_LOG_INFO("%s: zones: the KV keeps %u cells (%u needed): %s\n", __func__, size, n_min, why.c_str());
         }
     }
 
-    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size);
+    // put the flex steps back, in reverse order, while the budget allows (weights, a whole layer also its K/V at the current size);
     // the budget is first set to what the device really has free (both ways: the freed memory is back by now)
-    if (rule && (shrunk || used == 0) && model.flex_next(true) >= 0) {
+    if (rule && (shrunk || used == 0 || zones_at_start) && model.flex_next(true) >= 0) {
+        sync();
         zones_clamp(true);
-        for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
-            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
-            if (cost > zones_headroom) {
-                break;
-            }
-            if (!flex_move_layer(il, true)) {
-                break;
-            }
-            zones_headroom -= cost;
-            n_on++;
-        }
+        n_on += zones_put_back();
     }
 
-    // grow in chunks when the next batch does not fit; take flex layers off (closest to the CPU first) to make room
+    // grow in chunks when the next batch does not fit; take flex steps off (experts first, closest to the CPU first) to make room
     if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
         sync();
         if (rule) {
@@ -1037,23 +1126,12 @@ void llama_context::zones_step(uint32_t n_tokens) {
         const uint32_t n = kv->dyn_round(used + n_tokens);
         // the copy path also needs the old and the new K/V of a layer at the same time (resize_peak), the VMM path does not
         auto need = [&]() { return (int64_t) ((n - kv->get_size())*kv->cell_bytes(true) + kv->resize_peak(n)); };
-        int64_t delta = need();
-        while (rule && delta > zones_headroom) {
-            const int il = model.flex_next(false);
-            if (il < 0) {
-                break;
-            }
-            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0));
-            if (!flex_move_layer(il, false)) {
-                break;
-            }
-            zones_headroom += freed;
+        while (rule && need() > zones_headroom && zones_take()) {
             n_off++;
-            delta = need();
         }
-        if (rule && delta > zones_headroom) {
+        if (rule && need() > zones_headroom) {
             LLAMA_LOG_WARN("%s: zones: the KV grows beyond the device memory budget (%.0f MiB over), no flex layer left\n", __func__,
-                (delta - zones_headroom) / 1048576.0);
+                (need() - zones_headroom) / 1048576.0);
         }
         // the budget books the final growth (the transient peak is gone after the resize)
         const int64_t growth = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
@@ -1072,9 +1150,31 @@ void llama_context::zones_step(uint32_t n_tokens) {
 
     if (size_in != zones_kv_size || n_off > 0 || n_on > 0) {
         char what[96];
-        snprintf(what, sizeof(what), "KV %u -> %u cells, %d flex layers off, %d back", size_in, zones_kv_size, n_off, n_on);
+        snprintf(what, sizeof(what), "KV %u -> %u cells, %d flex steps off, %d back", size_in, zones_kv_size, n_off, n_on);
         zones_log_state(what);
     }
+}
+
+void llama_context::zones_compute_booked() {
+    // the compute buffer on the device is reserved again for the current KV size: the budget books the change; a smaller
+    // one is memory back, the flex steps that are off are tried again after the reservation
+    ggml_backend_dev_t dev = zones_dev();
+    size_t bytes = 0;
+    for (size_t i = 0; i < backend_ptrs.size() && dev; ++i) {
+        if (ggml_backend_buft_get_device(backend_buft[i]) == dev && !ggml_backend_buft_is_host(backend_buft[i])) {
+            bytes += backend_buf_exp_size[i];
+        }
+    }
+    if (zones_headroom_set && bytes != zones_compute_bytes) {
+        const int64_t delta = (int64_t) bytes - (int64_t) zones_compute_bytes;
+        zones_headroom -= delta;
+        if (std::llabs(delta) >= ((int64_t) 16 << 20)) {
+            LLAMA_LOG_INFO("%s: zones: compute buffer %.0f -> %.0f MiB, budget %.0f MiB\n", __func__,
+                zones_compute_bytes / 1048576.0, bytes / 1048576.0, zones_headroom / 1048576.0);
+        }
+        zones_retry_put_back = delta < 0;
+    }
+    zones_compute_bytes = bytes;
 }
 
 // the free VRAM by the kernel driver (amdgpu sysfs: mem_info_vram_total - mem_info_vram_used) of the card whose total is closest
@@ -1164,23 +1264,17 @@ size_t llama_context::zones_layer_kv_bytes(int il) const {
 
 void llama_context::zones_static(size_t extra) {
     // the flex band was sized from the K/V of the initial size; the static K/V needs extra more device memory: the same
-    // order as the zone rule (closest to the CPU first), until it is freed
+    // order as the zone rule (experts first, closest to the CPU first), until it is freed (no budget yet, it is not booked)
+    const int64_t h0 = zones_headroom;
     size_t freed = 0;
     int n_off = 0;
-    while (freed < extra) {
-        const int il = model.flex_next(false);
-        if (il < 0) {
-            break;
-        }
-        const size_t bytes = model.flex_layer_bytes(il) + (model.flex_whole(il) ? zones_layer_kv_bytes(il) : 0);
-        if (!flex_move_layer(il, false)) {
-            break;
-        }
-        freed += bytes;
+    while (freed < extra && zones_take()) {
+        freed = (size_t) (zones_headroom - h0);
         n_off++;
     }
+    zones_headroom = h0;
     if (extra > 0 && !model.flex_layers().empty()) {
-        LLAMA_LOG_INFO("%s: zones: static KV, %.0f MiB more on the device than at the initial size: %d flex layers off (%.0f MiB)%s\n", __func__,
+        LLAMA_LOG_INFO("%s: zones: static KV, %.0f MiB more on the device than at the initial size: %d flex steps off (%.0f MiB)%s\n", __func__,
             extra / 1048576.0, n_off, freed / 1048576.0, freed < extra ? ", no flex layer left" : "");
         zones_log_state("static KV");
     }
@@ -1205,21 +1299,28 @@ void llama_context::zones_log_state(const char * what) {
     }
     const size_t w_all = std::max(model.size(), w_gpu);
 
-    // the flex layers that are off, as ranges
+    // the flex layers that are off, and the whole layers with only their experts off, as ranges
     const auto flex = model.flex_layers();
-    std::string off;
+    auto ranges = [&](auto pred) {
+        std::string res;
+        for (size_t i = 0; i < flex.size(); ++i) {
+            if (!pred(flex[i])) {
+                continue;
+            }
+            size_t j = i;
+            while (j + 1 < flex.size() && pred(flex[j + 1]) && flex[j + 1] == flex[j] + 1) {
+                j++;
+            }
+            res += (res.empty() ? "" : ",") + std::to_string(flex[i]) + (j > i ? "-" + std::to_string(flex[j]) : "");
+            i = j;
+        }
+        return res;
+    };
+    const std::string off  = ranges([&](int il) { return !model.flex_on_gpu(il); });
+    const std::string exps = ranges([&](int il) { return model.flex_on_gpu(il) && model.flex_exps_off(il); });
     int n_flex_on = 0;
-    for (size_t i = 0; i < flex.size(); ++i) {
-        if (model.flex_on_gpu(flex[i])) {
-            n_flex_on++;
-            continue;
-        }
-        size_t j = i;
-        while (j + 1 < flex.size() && !model.flex_on_gpu(flex[j + 1]) && flex[j + 1] == flex[j] + 1) {
-            j++;
-        }
-        off += (off.empty() ? "" : ",") + std::to_string(flex[i]) + (j > i ? "-" + std::to_string(flex[j]) : "");
-        i = j;
+    for (int il : flex) {
+        n_flex_on += model.flex_on_gpu(il) && !model.flex_exps_off(il);
     }
 
     size_t dev_free = 0, dev_total = 0;
@@ -1231,17 +1332,17 @@ void llama_context::zones_log_state(const char * what) {
     // no budget yet (static KV): booked and budget are not known
     const std::string booked = zones_headroom_set ? std::to_string((zones_headroom + (int64_t) zones_vram_margin) >> 20) : "-";
     const std::string budget = zones_headroom_set ? std::to_string(zones_headroom / 1048576) : "-";
-    LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s; "
+    LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s%s%s; "
         "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %.0f, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
         __func__, what,
         w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
-        off.empty() ? "" : ", off: ", off.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
+        off.empty() ? "" : ", off: ", off.c_str(), exps.empty() ? "" : ", experts off: ", exps.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
         kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, fixed.c_str(), booked.c_str(),
         dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
         zones_vram_margin / 1048576.0);
 }
 
-bool llama_context::flex_move_layer(int il, bool to_gpu) {
+bool llama_context::flex_move_layer(int il, bool to_gpu, int part) {
     // the previous batch must be done; not synchronize(), that would account the queued batch in the perf stats
     if (sched) {
         ggml_backend_sched_synchronize(sched.get());
@@ -1255,15 +1356,15 @@ bool llama_context::flex_move_layer(int il, bool to_gpu) {
             }
         }
     }
-    if (!model.flex_move(il, to_gpu, flex_test_file)) {
+    if (!model.flex_move(il, to_gpu, flex_test_file, part)) {
         return false;
     }
     if (sched) {
         flex_set_alts(il);
     }
     // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
-    // (the SWA K/V too; a recurrent state stays where it is, it is small and does not grow)
-    if (flex_test_kv && model.flex_whole(il)) {
+    // (the SWA K/V too; a recurrent state stays where it is, it is small and does not grow; not with the experts only)
+    if (flex_test_kv && model.flex_whole(il) && part != LLAMA_FLEX_EXPS) {
         const auto parts = zones_parts(memory.get());
         if (parts.kv) {
             parts.kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
@@ -1282,10 +1383,9 @@ bool llama_context::flex_move_layer(int il, bool to_gpu) {
 }
 
 void llama_context::flex_set_alts(int il) {
-    // a flex layer that is off uses its host copies for op offload, like a dual-buffer CPU layer
-    const bool off = !model.flex_on_gpu(il) && flex_use_host;
-    for (const auto & [w, host] : model.flex_host_copies(il)) {
-        ggml_backend_sched_set_weight_alt(sched.get(), w, off ? host : nullptr);
+    // a flex layer (or its experts) that is off uses its host copies for op offload, like a dual-buffer CPU layer
+    for (const auto & [w, host] : model.flex_host_alts(il)) {
+        ggml_backend_sched_set_weight_alt(sched.get(), w, flex_use_host ? host : nullptr);
     }
 }
 
@@ -1443,6 +1543,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    zones_compute_booked();
 }
 
 void llama_context::synchronize() {
@@ -2592,6 +2694,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // batch boundary: the zone rule and the debug moves run before this batch is queued (and accounted in the perf stats)
     zones_step(n_tokens_all);
+    zones_t_batch_us = ggml_time_us(); // the idle time before a shrink counts from here
 
     for (auto & s : flex_test) {
         if (!s.done && flex_test_tokens >= s.at) {
@@ -2607,6 +2710,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     flex_test_tokens += n_tokens_all;
 
     sched_reserve();
+
+    // the compute buffer got smaller (the KV shrank): measure again and put flex steps back
+    if (zones_retry_put_back) {
+        zones_retry_put_back = false;
+        if (!model.flex_layers().empty() && model.flex_next(true) >= 0) {
+            zones_clamp(true);
+            if (const int n_on = zones_put_back()) {
+                zones_log_state(format("compute buffer smaller, %d flex steps back", n_on).c_str());
+            }
+        }
+    }
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();

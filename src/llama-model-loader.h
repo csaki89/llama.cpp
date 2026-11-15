@@ -151,6 +151,7 @@ struct llama_model_loader {
         ggml_backend_buffer_type_t buft;
         bool lazy;
         int  flex; // flex layer number (own context and buffer), -1 = none
+        bool exps; // the expert tensors of a whole flex layer (own context and buffer, they move before the rest)
     };
 
     struct ctx_key_comparator {
@@ -160,6 +161,9 @@ struct llama_model_loader {
             }
             if (lhs.flex != rhs.flex) {
                 return lhs.flex < rhs.flex;
+            }
+            if (lhs.exps != rhs.exps) {
+                return lhs.exps < rhs.exps;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
@@ -184,6 +188,7 @@ struct llama_model_loader {
         ggml_backend_buffer_type_t buft; // GPU buffer type
         uint16_t      file_idx;
         size_t        offs;
+        bool          exps; // an expert tensor of a whole flex layer (own buffer, it moves without the rest of the layer)
     };
     int flex_lo = -1;
     int flex_hi = -1;

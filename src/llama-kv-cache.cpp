@@ -2358,6 +2358,10 @@ const slot_info_vec_t *   sinfos_in) {
 
         // dynamic KV: make room for the restored cells first
         if (is_dynamic()) {
+            // the restored sequence replaces its cells (state_read_meta removes them too): they do not count as used
+            if (seq_id != -1) {
+                seq_rm(seq_id, -1, -1);
+            }
             const uint32_t used = seq_id == -1 ? 0 : used_cells();
             const uint32_t need = used + cell_count;
             // the zone rule first, as before a batch: room from the flex layers, then the growth
@@ -3289,6 +3293,16 @@ uint32_t llama_kv_cache::dyn_round(uint32_t n) const {
         return dyn_base;
     }
     return std::min<uint32_t>(dyn_max, dyn_base + ((n - dyn_base + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
+}
+
+uint32_t llama_kv_cache::dyn_round_down(uint32_t n) const {
+    if (n <= dyn_base) {
+        return dyn_base;
+    }
+    if (dyn_chunk == 0) {
+        return std::min(n, dyn_max);
+    }
+    return std::min<uint32_t>(dyn_max, dyn_base + ((n - dyn_base)/dyn_chunk)*dyn_chunk);
 }
 
 uint32_t llama_kv_cache::used_cells() const {
