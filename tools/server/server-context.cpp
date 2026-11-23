@@ -1028,6 +1028,9 @@ public:
 
     mtmd_context * mctx = nullptr;
     mtmd_helper_cap mtmd_cap = {};
+    // dual-buffer fork, llama_park: the projector parameters, to load it again on the CPU (parked) or the device (unparked)
+    mtmd_context_params mparams_park = {};
+    bool                mparams_park_set = false;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
@@ -1401,6 +1404,11 @@ private:
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
+            mparams_park = mparams;
+            mparams_park.progress_callback           = nullptr; // its user data is a local of this function
+            mparams_park.progress_callback_user_data = nullptr;
+            mparams_park.warmup                      = false;
+            mparams_park_set = true;
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
             init_opt.video_params.fps_target = params_base.video_fps;
@@ -3202,8 +3210,36 @@ private:
                         res->success = true;
                         res->demoted = llama_park_drop_demoted(ctx_tgt);
                     } else {
-                        res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
+                        const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
+                        res->success = llama_park(ctx_tgt, to_park);
                         res->demoted = llama_park_demoted_bytes(ctx_tgt);
+                        // the projector on the device: loaded again on the CPU while parked, back on the device after
+                        if (res->success && mctx && mparams_park_set && mparams_park.use_gpu) {
+                            mtmd_context_params p = mparams_park;
+                            p.use_gpu = !to_park;
+                            const int64_t t_mm = ggml_time_us();
+                            mtmd_context * nctx = nullptr;
+                            if (to_park) {
+                                nctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
+                                if (nctx) {
+                                    mtmd_free(mctx);
+                                }
+                            } else {
+                                mtmd_free(mctx);
+                                mctx = nullptr;
+                                nctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
+                            }
+                            if (nctx) {
+                                mctx = nctx;
+                                for (auto & slot : slots) {
+                                    slot.mctx = mctx;
+                                }
+                                SRV_INF("park: the projector is on the %s now (%.1f ms)\n", to_park ? "CPU" : "device", (ggml_time_us() - t_mm) / 1000.0);
+                            } else {
+                                SRV_ERR("park: loading the projector on the %s failed%s\n", to_park ? "CPU" : "device", to_park ? ", it stays on the device" : "");
+                                res->success = to_park; // without a projector after an unpark the media requests fail
+                            }
+                        }
                     }
                     res->parked  = llama_is_parked(ctx_tgt);
                     res->t_ms    = (ggml_time_us() - t0) / 1000.0;
