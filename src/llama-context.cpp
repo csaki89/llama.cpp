@@ -1048,6 +1048,9 @@ void llama_context::zones_step(uint32_t n_tokens) {
 
     // zone rule (DESIGN-3zone.md 6.3): device memory budget, booked from the first step on
     const bool rule = !model.flex_layers().empty();
+    if (rule) {
+        zones_internal_booked(); // the backend's own buffers grew or shrank in the last graphs
+    }
     if (rule && !zones_headroom_set) {
         zones_headroom_set = true;
         size_t dev_free = 0, dev_total = 0;
@@ -1190,6 +1193,7 @@ void llama_context::zones_compute_booked() {
         zones_retry_put_back = delta < 0;
     }
     zones_compute_bytes = bytes;
+    zones_internal_booked();
 }
 
 // the free VRAM by the kernel driver (amdgpu sysfs: mem_info_vram_total - mem_info_vram_used) of the card whose total is closest
@@ -1324,7 +1328,33 @@ size_t llama_context::zones_booked_free(ggml_backend_dev_t dev) const {
             }
         }
     }
+    used += zones_internal_query(dev);
     return dev_total > used ? dev_total - used : 0;
+}
+
+// device memory the backend holds outside the ggml buffers' sizes (ggml_backend_dev_internal_memory: Vulkan's own graph
+// buffers and the sparse chunk rounding); 0 without the query (CUDA/HIP)
+size_t llama_context::zones_internal_query(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto fn = reg ? (size_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_internal_memory") : nullptr;
+    return fn ? fn(dev) : 0;
+}
+
+// the change of that memory is booked like the compute buffer (a smaller one is memory back: the flex steps are tried again)
+void llama_context::zones_internal_booked() {
+    const size_t bytes = zones_internal_query(zones_dev());
+    if (zones_headroom_set && bytes != zones_internal_bytes) {
+        const int64_t delta = (int64_t) bytes - (int64_t) zones_internal_bytes;
+        zones_headroom -= delta;
+        if (std::llabs(delta) >= ((int64_t) 16 << 20)) {
+            LLAMA_LOG_INFO("%s: zones: backend buffers outside the ggml buffers %.0f -> %.0f MiB, budget %.0f MiB\n", __func__,
+                zones_internal_bytes / 1048576.0, bytes / 1048576.0, zones_headroom / 1048576.0);
+        }
+        if (delta < 0) {
+            zones_retry_put_back = true;
+        }
+    }
+    zones_internal_bytes = bytes;
 }
 
 size_t llama_context::zones_layer_kv_bytes(int il) const {

@@ -13399,9 +13399,37 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
     return ctx->name.c_str();
 }
 
+// the live backend contexts (dual-buffer fork): their own device buffers are reported to the zones booking
+static std::mutex                           vk_ctx_live_mtx;
+static std::set<ggml_backend_vk_context *> vk_ctx_live;
+
+size_t ggml_vk_sparse_unbooked(size_t device_idx);
+
+// device memory the backend holds outside the ggml buffers' sizes: the buffers it allocates itself while a graph runs
+// (prealloc_x/y/split_k/add_rms_partials) and the whole-chunk rounding of the sparse K/V sections
+size_t ggml_vk_internal_device_bytes(size_t device_idx) {
+    size_t res = ggml_vk_sparse_unbooked(device_idx);
+    std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
+    for (const ggml_backend_vk_context * ctx : vk_ctx_live) {
+        if (ctx->device->idx != device_idx) {
+            continue;
+        }
+        for (const vk_buffer * b : { &ctx->prealloc_x, &ctx->prealloc_y, &ctx->prealloc_split_k, &ctx->prealloc_add_rms_partials }) {
+            if (*b && ((*b)->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                res += (*b)->size;
+            }
+        }
+    }
+    return res;
+}
+
 void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
+    {
+        std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
+        vk_ctx_live.erase(ctx);
+    }
 
     ggml_vk_cleanup(ctx);
 
@@ -15414,6 +15442,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
+    {
+        std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
+        vk_ctx_live.insert(ctx);
+    }
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),

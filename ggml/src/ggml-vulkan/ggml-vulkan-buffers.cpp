@@ -873,36 +873,45 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
 }
 
 
-// growable buffers on a sparse VkBuffer (dual-buffer fork, dynamic KV): the same interface as the ggml-cuda VMM arenas
-// (looked up with get_proc_address). An arena is one sparse buffer sized for the max context: address range only; device
-// memory is bound per chunk when a section grows (vkQueueBindSparse) and unbound and freed when it shrinks, so the memory
-// comes back without a copy. Needs sparseBinding, sparseResidencyBuffer and a compute queue with sparse binding; else no
-// arena (the KV grows by copy, with a log line naming the missing capability). GGML_VK_SPARSE=0 turns it off,
-// GGML_VK_SPARSE_CHUNK_KIB sets the chunk (default 2 MiB), GGML_VK_SPARSE_DEBUG=1 logs every bind.
+// growable buffers on sparse VkBuffers (dual-buffer fork, dynamic KV): the same interface as the ggml-cuda VMM arenas (looked
+// up with get_proc_address). The arena holds what a relayout's sections on one device share (the chunk, the memory type, the
+// pending binds); every section (one K or V) is a sparse VkBuffer of its own: an address range only, device memory is bound
+// per chunk when it grows (vkQueueBindSparse) and unbound and freed when it shrinks, so the memory comes back without a copy.
+// The address range: the section's max size if the device's sparse address space (sparseAddressSpaceSize, maxBufferSize)
+// allows it, else what it needs now; a section that outgrows its range gets a larger one and its memory chunks are bound
+// into it (no data copy), the old range goes (the HIP arena reserves its address space per chunk with the mapping: there the
+// address space follows the mapped memory). Needs sparseBinding, sparseResidencyBuffer and a compute queue with sparse binding;
+// else no arena (the KV grows by copy, with a log line naming the missing capability). GGML_VK_SPARSE=0 turns it off,
+// GGML_VK_SPARSE_CHUNK_KIB sets the chunk, GGML_VK_SPARSE_DEBUG=1 logs every bind, GGML_VK_SPARSE_VA_MIB caps the sparse
+// address space (test aid for the rebinding).
+
+struct vk_sparse_section;
 
 struct vk_sparse_arena {
     vk_device                       device;
     ggml_backend_buffer_type_t      buft;
-    vk_buffer                       buf;      // the sparse buffer, no memory of its own
     vk::Queue                       queue;    // the compute queue (sparse binding)
     vk_queue_handle *               qh = nullptr;
-    size_t                          reserved = 0;
+    vk::BufferCreateInfo            bci;      // a sparse buffer of this device (size set per range)
     size_t                          chunk    = 0;
     uint32_t                        mem_type = 0;
-    std::vector<vk::DeviceMemory>   mem;      // per chunk, null if unbound
-    std::vector<size_t>             pending;  // chunks allocated, not bound and zeroed yet
+    bool                            on_demand = false; // the sections at their max size do not fit the sparse address space
+    std::vector<vk_sparse_section *> pending; // sections with chunks allocated, not bound and zeroed yet
     int                             refs = 1;
     std::mutex                      mtx;
 };
 
 struct vk_sparse_section : ggml_backend_vk_buffer_context {
-    vk_sparse_arena * arena;
-    size_t            offset;  // in the arena
-    size_t            section; // max bytes
-    size_t            mapped = 0;
+    vk_sparse_arena *             arena;
+    size_t                        section;     // max bytes
+    size_t                        range = 0;   // bytes of the address range (dev_buffer)
+    size_t                        mapped = 0;  // bytes with memory
+    size_t                        logical = 0; // the ggml buffer size
+    std::vector<vk::DeviceMemory> mem;         // per chunk, null if none
+    std::vector<size_t>           pending;     // chunks allocated, not bound and zeroed yet
 
-    vk_sparse_section(vk_device_ref dev, vk_buffer buf, std::string & name, vk_sparse_arena * arena, size_t offset, size_t section) :
-        ggml_backend_vk_buffer_context(dev, std::move(buf), name), arena(arena), offset(offset), section(section) {}
+    vk_sparse_section(vk_device_ref dev, vk_buffer buf, std::string & name, vk_sparse_arena * arena, size_t section) :
+        ggml_backend_vk_buffer_context(dev, std::move(buf), name), arena(arena), section(section) {}
 };
 
 static bool vk_sparse_debug() {
@@ -911,6 +920,20 @@ static bool vk_sparse_debug() {
 }
 
 static std::atomic<int64_t> vk_sparse_stat_bound{0};
+
+// the live sections and the sparse address space they hold, per device
+static std::mutex                    vk_sparse_reg_mtx;
+static std::set<vk_sparse_section *> vk_sparse_live;
+static std::map<size_t, size_t>      vk_sparse_va; // device idx -> bytes of sparse address ranges
+
+// the sparse address space a device allows: sparseAddressSpaceSize (GGML_VK_SPARSE_VA_MIB lowers it, test aid)
+static size_t vk_sparse_va_limit(const vk_device & device) {
+    size_t lim = (size_t) device->properties.limits.sparseAddressSpaceSize;
+    if (const char * env = getenv("GGML_VK_SPARSE_VA_MIB"); env && atoll(env) > 0) {
+        lim = std::min(lim, (size_t) atoll(env) << 20);
+    }
+    return lim;
+}
 
 static void vk_sparse_arena_unref(vk_sparse_arena * a) {
     int left;
@@ -921,32 +944,24 @@ static void vk_sparse_arena_unref(vk_sparse_arena * a) {
     if (left > 0) {
         return;
     }
-    a->device->device.waitIdle();
-    for (auto & m : a->mem) {
-        if (m) {
-            a->device->device.freeMemory(m);
-            vk_sparse_stat_bound -= (int64_t) a->chunk;
-            m = nullptr;
-        }
-    }
     if (vk_sparse_debug()) {
-        GGML_LOG_INFO("%s: arena of %zu bytes freed\n", __func__, a->reserved);
+        GGML_LOG_INFO("%s: arena freed\n", __func__);
     }
-    a->buf.reset();
     delete a;
 }
 
-// bind (with their memory) or unbind the chunks idx of an arena, and wait for it
-static bool vk_sparse_bind(vk_sparse_arena * a, const std::vector<size_t> & idx, bool bind) {
+// bind (with their memory) or unbind the chunks idx of a section in its range buf, and wait for it
+static bool vk_sparse_bind(vk_sparse_section * s, const vk_buffer & buf, const std::vector<size_t> & idx, bool bind) {
     if (idx.empty()) {
         return true;
     }
+    vk_sparse_arena * a = s->arena;
     std::vector<vk::SparseMemoryBind> binds;
     binds.reserve(idx.size());
     for (size_t i : idx) {
-        binds.push_back(vk::SparseMemoryBind(i * a->chunk, a->chunk, bind ? a->mem[i] : vk::DeviceMemory(), 0));
+        binds.push_back(vk::SparseMemoryBind(i * a->chunk, a->chunk, bind ? s->mem[i] : vk::DeviceMemory(), 0));
     }
-    vk::SparseBufferMemoryBindInfo buf_bind(a->buf->buffer, (uint32_t) binds.size(), binds.data());
+    vk::SparseBufferMemoryBindInfo buf_bind(buf->buffer, (uint32_t) binds.size(), binds.data());
     vk::BindSparseInfo info;
     info.setBufferBinds(buf_bind);
     vk::Fence fence = a->device->device.createFence({});
@@ -971,6 +986,52 @@ static bool vk_sparse_bind(vk_sparse_arena * a, const std::vector<size_t> & idx,
     }
     a->device->device.destroyFence(fence);
     return ok;
+}
+
+// a sparse address range of bytes (no memory), booked in the device's sparse address space; nullptr if the device does not
+// allow it (the limit, maxBufferSize, or the creation fails). extra: bytes of a range that is about to be given back
+static vk_buffer vk_sparse_range_new(vk_sparse_arena * a, size_t bytes, std::string * why) {
+    const vk_device & device = a->device;
+    {
+        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+        const size_t used = vk_sparse_va[device->idx];
+        if (bytes > device->max_buffer_size || used + bytes > vk_sparse_va_limit(device)) {
+            if (why) {
+                *why = "sparse address space: " + std::to_string(used >> 20) + " MiB in use + " + std::to_string(bytes >> 20) + " MiB > " +
+                    std::to_string(vk_sparse_va_limit(device) >> 20) + " MiB (sparseAddressSpaceSize), max buffer " + std::to_string(device->max_buffer_size >> 20) + " MiB";
+            }
+            return nullptr;
+        }
+        vk_sparse_va[device->idx] = used + bytes;
+    }
+    vk::BufferCreateInfo bci = a->bci;
+    bci.size = bytes;
+    vk::Buffer vkbuf;
+    try {
+        vkbuf = device->device.createBuffer(bci);
+    } catch (const vk::SystemError & e) {
+        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+        vk_sparse_va[device->idx] -= bytes;
+        if (why) {
+            *why = std::string("creating a sparse buffer of ") + std::to_string(bytes) + " bytes failed: " + e.what();
+        }
+        return nullptr;
+    }
+    auto buf = std::make_shared<vk_buffer_struct>();
+    buf->buffer = vkbuf;
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    buf->ptr    = nullptr;
+    buf->size   = bytes;
+    buf->device = device;
+    if (device->buffer_device_address) {
+        buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(vkbuf));
+    }
+    return buf;
+}
+
+static void vk_sparse_range_release(const vk_device & device, size_t bytes) {
+    std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+    vk_sparse_va[device->idx] -= std::min(vk_sparse_va[device->idx], bytes);
 }
 
 // the heap usage of a memory type by the memory budget (VK_EXT_memory_budget); false without it
@@ -1136,16 +1197,19 @@ static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, siz
     if (probe_type < 0) {
         return no("no device local memory type for a sparse buffer");
     }
-    // the chunk, from the device like the ggml-cuda VMM: the sparse block (the alignment), the unit the driver books an allocation with
-    // (measured: the memory budget's heap usage before and after one block allocation, twice) and the allocation count limit (the
-    // chunks of one KV arena use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
+    // the chunk, by the rule of the ggml-cuda VMM: the sparse block (the granularity), the 2 MiB section alignment (as
+    // GGML_CUDA_VMM_MIN_ALIGN: whole large-page fragments for the K/V reads), the unit the driver books an allocation with
+    // (measured: the memory budget's heap usage before and after one allocation, twice; at most 32 alignments); then the
+    // Vulkan-only bounds: the release unit (a freed chunk must give its memory back) and the allocation count limit (the
+    // chunks of one KV use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
+    static constexpr size_t min_align = 2ull << 20;
+    const size_t align = block * ((std::max(block, min_align) + block - 1) / block);
     std::string unit_note;
     const size_t unit = vk_sparse_booking_unit(device, (uint32_t) probe_type, block, unit_note);
-    size_t chunk = block;
-    if (unit > 0 && std::lcm(block, unit) <= 32*block) {
-        chunk = std::lcm(block, unit);
+    size_t chunk = align;
+    if (unit > 0 && std::lcm(align, unit) <= 32*align) {
+        chunk = std::lcm(align, unit);
     }
-    // a chunk the driver gives back when it is freed (the shrink must return the memory)
     std::string release_note;
     const size_t release = vk_sparse_release_unit(device, (uint32_t) probe_type, chunk, release_note);
     chunk = std::max(chunk, release);
@@ -1162,33 +1226,10 @@ static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, siz
     {
         std::lock_guard<std::mutex> lock(log_mtx);
         if (logged.insert(device->name + "/chunk").second) {
-            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s\n",
-                device->name.c_str(), block, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk, env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "");
+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; section alignment %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s; sparse address space %zu MiB, max buffer %zu MiB\n",
+                device->name.c_str(), block, align, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk,
+                env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "", vk_sparse_va_limit(device) >> 20, (size_t) (device->max_buffer_size >> 20));
         }
-    }
-    const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
-    if (reserved > device->physical_device.getProperties().limits.sparseAddressSpaceSize) {
-        return no("the KV (" + std::to_string(reserved) + " bytes) is larger than sparseAddressSpaceSize");
-    }
-    bci.size = reserved;
-    vk::Buffer vkbuf;
-    try {
-        vkbuf = device->device.createBuffer(bci);
-    } catch (const vk::SystemError & e) {
-        return no(std::string("creating a sparse buffer of ") + std::to_string(reserved) + " bytes failed: " + e.what());
-    }
-    req = device->device.getBufferMemoryRequirements(vkbuf);
-    const vk::PhysicalDeviceMemoryProperties mp = device->physical_device.getMemoryProperties();
-    int mem_type = -1;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
-            mem_type = (int) i;
-            break;
-        }
-    }
-    if (mem_type < 0) {
-        device->device.destroyBuffer(vkbuf);
-        return no("no device local memory type for a sparse buffer");
     }
 
     auto * a = new vk_sparse_arena;
@@ -1196,28 +1237,32 @@ static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, siz
     a->buft     = buft;
     a->queue    = device->compute_queue->handle->queue;
     a->qh       = device->compute_queue->handle.get();
-    a->reserved = reserved;
+    a->bci      = bci;
     a->chunk    = chunk;
-    a->mem_type = (uint32_t) mem_type;
-    a->mem.assign(reserved / chunk, nullptr);
-    a->buf = std::make_shared<vk_buffer_struct>();
-    a->buf->buffer = vkbuf;
-    a->buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
-    a->buf->ptr    = nullptr;
-    a->buf->size   = reserved;
-    a->buf->device = device;
-    if (device->buffer_device_address) {
-        a->buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(vkbuf));
+    a->mem_type = (uint32_t) probe_type;
+    // size is the K/V of the arena's sections at the max context (with room for the alignment): if the sparse address space
+    // cannot hold it, every section gets the range it needs now and grows by rebinding (not the first ones all of it)
+    {
+        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+        a->on_demand = vk_sparse_va[device->idx] + size > vk_sparse_va_limit(device);
+    }
+    if (a->on_demand) {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        if (logged.insert(device->name + "/va").second) {
+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: the K/V sections at the max context (%zu MiB) do not fit the sparse address space (%zu MiB): "
+                "a section gets the range it needs and grows by binding its memory into a larger range (no copy)\n", device->name.c_str(), size >> 20,
+                vk_sparse_va_limit(device) >> 20);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(log_mtx);
         if (logged.insert(device->name + "/ok").second) {
-            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse KV buffers: block %zu, chunk %zu bytes, memory type %d\n", device->name.c_str(),
-                (size_t) req.alignment, chunk, mem_type);
+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse KV buffers: block %zu, chunk %zu bytes, memory type %d, a sparse range per section\n", device->name.c_str(),
+                block, chunk, probe_type);
         }
     }
     if (vk_sparse_debug()) {
-        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: arena of %zu bytes (%zu chunks)\n", reserved, reserved / chunk);
+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: arena for %zu bytes of sections\n", size);
     }
     return a;
 }
@@ -1255,13 +1300,52 @@ static vk_sparse_section * vk_sparse_ctx(ggml_backend_buffer_t buffer) {
     return buffer && buffer->iface.free_buffer == ggml_backend_vk_sparse_free_buffer ? (vk_sparse_section *) buffer->context : nullptr;
 }
 
-// allocate the memory of the chunks up to size (bound and zeroed by the next commit)
+// a larger address range for a section that outgrows its own: the bound chunks are bound into the new range (no data copy),
+// then the old range goes; the device is idle meanwhile (nothing may use the old range)
+static bool vk_sparse_rebind(vk_sparse_section * s, size_t want) {
+    vk_sparse_arena * a = s->arena;
+    std::string why;
+    // the max size if the address space holds every section at it (no more rebinding), else what it needs
+    size_t range = a->on_demand ? want : s->section;
+    vk_buffer nb = vk_sparse_range_new(a, range, nullptr);
+    if (!nb && want < s->section) {
+        range = want;
+        nb = vk_sparse_range_new(a, range, &why);
+    }
+    if (!nb) {
+        GGML_LOG_WARN("ggml_backend_vk_buffer_grow: a K/V section needs %zu MiB of address range: %s; it grows by copy\n", want >> 20, why.c_str());
+        return false;
+    }
+    std::vector<size_t> bound;
+    for (size_t i = 0; i < s->mem.size(); ++i) {
+        if (s->mem[i] && std::find(s->pending.begin(), s->pending.end(), i) == s->pending.end()) {
+            bound.push_back(i);
+        }
+    }
+    a->device->device.waitIdle();
+    if (!vk_sparse_bind(s, nb, bound, true)) {
+        vk_sparse_range_release(a->device, range);
+        return false;
+    }
+    if (vk_sparse_debug()) {
+        GGML_LOG_INFO("vk_sparse_rebind: section of %zu bytes: range %zu -> %zu bytes, %zu chunks bound into it\n", s->section, s->range, range, bound.size());
+    }
+    vk_sparse_range_release(a->device, s->range);
+    s->dev_buffer = nb; // the old range goes with its last reference (the descriptor caches see the destroy)
+    s->range = range;
+    return true;
+}
+
+// allocate the memory of the chunks up to size (bound and zeroed by the next commit); a larger range first if needed
 static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
     vk_sparse_arena * a = s->arena;
     const size_t want = std::min(s->section, a->chunk * ((size + a->chunk - 1) / a->chunk));
+    if (want > s->range && !vk_sparse_rebind(s, want)) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(a->mtx);
     while (s->mapped < want) {
-        const size_t i = (s->offset + s->mapped) / a->chunk;
+        const size_t i = s->mapped / a->chunk;
         try {
             vk::MemoryAllocateInfo mai(a->chunk, a->mem_type);
             vk::MemoryAllocateFlagsInfo flags_info;
@@ -1269,7 +1353,7 @@ static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
                 flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
                 mai.setPNext(&flags_info);
             }
-            a->mem[i] = a->device->device.allocateMemory(mai);
+            s->mem[i] = a->device->device.allocateMemory(mai);
         } catch (const vk::SystemError & e) {
             if (vk_sparse_debug()) {
                 GGML_LOG_INFO("vk_sparse_map_to: chunk %zu: allocation failed: %s\n", i, e.what());
@@ -1277,7 +1361,10 @@ static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
             return false;
         }
         vk_sparse_stat_bound += (int64_t) a->chunk;
-        a->pending.push_back(i);
+        if (s->pending.empty()) {
+            a->pending.push_back(s);
+        }
+        s->pending.push_back(i);
         s->mapped += a->chunk;
     }
     return true;
@@ -1286,45 +1373,75 @@ static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
 // bind the pending chunks and zero them; nothing may access them before
 static bool ggml_backend_vk_vmm_arena_commit(void * arena) {
     vk_sparse_arena * a = (vk_sparse_arena *) arena;
-    std::vector<size_t> idx;
+    std::vector<std::pair<vk_sparse_section *, std::vector<size_t>>> todo;
     {
         std::lock_guard<std::mutex> lock(a->mtx);
-        idx.swap(a->pending);
+        for (vk_sparse_section * s : a->pending) {
+            todo.emplace_back(s, std::move(s->pending));
+            s->pending.clear();
+        }
+        a->pending.clear();
     }
-    if (idx.empty()) {
+    if (todo.empty()) {
         return true;
     }
     const int64_t t0 = ggml_time_us();
-    if (!vk_sparse_bind(a, idx, true)) {
-        return false;
+    size_t n = 0;
+    for (auto & [s, idx] : todo) {
+        if (!vk_sparse_bind(s, s->dev_buffer, idx, true)) {
+            return false;
+        }
+        n += idx.size();
     }
     const int64_t t1 = ggml_time_us();
-    for (size_t i : idx) {
-        ggml_vk_buffer_memset(a->buf, i * a->chunk, 0, a->chunk);
+    for (auto & [s, idx] : todo) {
+        for (size_t i : idx) {
+            ggml_vk_buffer_memset(s->dev_buffer, i * a->chunk, 0, a->chunk);
+        }
     }
     if (vk_sparse_debug()) {
-        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_commit: %zu chunks bound (%.2f ms) and zeroed (%.2f ms)\n", idx.size(), (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_commit: %zu chunks of %zu sections bound (%.2f ms) and zeroed (%.2f ms)\n", n, todo.size(),
+            (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
     }
     return true;
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_vmm_arena_buffer(void * arena, size_t offset, size_t size, size_t max_size) {
+    GGML_UNUSED(offset); // a range of its own per section
     vk_sparse_arena * a = (vk_sparse_arena *) arena;
     const size_t section = a->chunk * ((std::max(size, max_size) + a->chunk - 1) / a->chunk);
-    if (offset % a->chunk != 0 || offset + section > a->reserved) {
-        return nullptr;
+    const size_t now     = a->chunk * ((std::max<size_t>(size, 1) + a->chunk - 1) / a->chunk);
+    // the range: the max size if the device's sparse address space allows it, else what the section needs now (it grows by
+    // binding its memory into a larger range)
+    size_t range = a->on_demand ? now : section;
+    vk_buffer buf = vk_sparse_range_new(a, range, nullptr);
+    if (!buf) {
+        std::string why;
+        range = now;
+        buf = vk_sparse_range_new(a, range, &why);
+        if (!buf) {
+            GGML_LOG_WARN("ggml_backend_vk_vmm_arena_buffer: %s: no address range for a K/V section of %zu MiB: %s\n", a->device->name.c_str(), now >> 20, why.c_str());
+            return nullptr;
+        }
     }
     auto * btctx = (ggml_backend_vk_buffer_type_context *) a->buft->context;
     {
         std::lock_guard<std::mutex> lock(a->mtx);
         a->refs++;
     }
-    auto * s = new vk_sparse_section(a->device, a->buf, btctx->name, a, offset, section);
+    auto * s = new vk_sparse_section(a->device, buf, btctx->name, a, section);
+    s->range = range;
+    s->mem.assign(section / a->chunk, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+        vk_sparse_live.insert(s);
+    }
     if (!vk_sparse_map_to(s, std::max<size_t>(size, 1))) {
         ggml_backend_buffer_t tmp = ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, 0);
         ggml_backend_buffer_free(tmp);
         return nullptr;
     }
+    s->logical = size;
     return ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, size);
 }
 
@@ -1340,6 +1457,7 @@ static bool ggml_backend_vk_buffer_grow(ggml_backend_buffer_t buffer, size_t siz
         return false;
     }
     buffer->size = size;
+    s->logical   = size;
     return true;
 }
 
@@ -1357,9 +1475,9 @@ static bool vk_sparse_unmap_from(vk_sparse_section * s, size_t keep_bytes) {
     {
         std::lock_guard<std::mutex> lock(a->mtx);
         for (size_t m = keep; m < s->mapped; m += a->chunk) {
-            const size_t i = (s->offset + m) / a->chunk;
+            const size_t i = m / a->chunk;
             all.push_back(i);
-            if (std::find(a->pending.begin(), a->pending.end(), i) == a->pending.end()) {
+            if (std::find(s->pending.begin(), s->pending.end(), i) == s->pending.end()) {
                 bound.push_back(i); // pending chunks were never bound
             }
         }
@@ -1369,16 +1487,19 @@ static bool vk_sparse_unmap_from(vk_sparse_section * s, size_t keep_bytes) {
     }
     if (!bound.empty()) {
         a->device->device.waitIdle(); // no queue may use a chunk when it is unbound
-        if (!vk_sparse_bind(a, bound, false)) {
+        if (!vk_sparse_bind(s, s->dev_buffer, bound, false)) {
             return false;
         }
     }
     std::lock_guard<std::mutex> lock(a->mtx);
     for (size_t i : all) {
-        a->pending.erase(std::remove(a->pending.begin(), a->pending.end(), i), a->pending.end());
-        a->device->device.freeMemory(a->mem[i]);
-        a->mem[i] = nullptr;
+        s->pending.erase(std::remove(s->pending.begin(), s->pending.end(), i), s->pending.end());
+        a->device->device.freeMemory(s->mem[i]);
+        s->mem[i] = nullptr;
         vk_sparse_stat_bound -= (int64_t) a->chunk;
+    }
+    if (s->pending.empty()) {
+        a->pending.erase(std::remove(a->pending.begin(), a->pending.end(), s), a->pending.end());
     }
     s->mapped = keep;
     return true;
@@ -1397,8 +1518,9 @@ static bool ggml_backend_vk_buffer_shrink(ggml_backend_buffer_t buffer, size_t s
         return false;
     }
     buffer->size = size;
+    s->logical   = size;
     if (vk_sparse_debug()) {
-        GGML_LOG_INFO("ggml_backend_vk_buffer_shrink: section at %zu: %zu -> %zu bytes bound\n", s->offset, old, s->mapped);
+        GGML_LOG_INFO("ggml_backend_vk_buffer_shrink: section of %zu bytes: %zu -> %zu bytes bound\n", s->section, old, s->mapped);
     }
     return true;
 }
@@ -1425,20 +1547,38 @@ static void ggml_backend_vk_vmm_stats(int64_t * stats) {
 static void ggml_backend_vk_sparse_free_buffer(ggml_backend_buffer_t buffer) {
     vk_sparse_section * s = (vk_sparse_section *) buffer->context;
     vk_sparse_unmap_from(s, 0);
+    {
+        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+        vk_sparse_live.erase(s);
+    }
+    vk_sparse_range_release(s->arena->device, s->range);
     vk_sparse_arena * a = s->arena;
     delete s;
     vk_sparse_arena_unref(a);
 }
 
 static void * ggml_backend_vk_sparse_get_base(ggml_backend_buffer_t buffer) {
-    return (uint8_t *) vk_ptr_base + ((vk_sparse_section *) buffer->context)->offset;
+    GGML_UNUSED(buffer);
+    return vk_ptr_base; // a range of its own: the tensors start at offset 0
 }
 
 static void ggml_backend_vk_sparse_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     vk_sparse_section * s = (vk_sparse_section *) buffer->context;
     if (buffer->size > 0) {
-        ggml_vk_buffer_memset(s->dev_buffer, s->offset, (uint32_t) value * 0x01010101, buffer->size);
+        ggml_vk_buffer_memset(s->dev_buffer, 0, (uint32_t) value * 0x01010101, buffer->size);
     }
+}
+
+// device memory of the sparse K/V sections above their ggml buffer size (whole chunks), per device
+size_t ggml_vk_sparse_unbooked(size_t device_idx) {
+    std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
+    size_t res = 0;
+    for (const vk_sparse_section * s : vk_sparse_live) {
+        if (s->arena->device->idx == device_idx && s->mapped > s->logical) {
+            res += s->mapped - s->logical;
+        }
+    }
+    return res;
 }
 
 // true if ggml_backend_dev_memory measures the free memory (VK_EXT_memory_budget); without it the free memory is the heap size
@@ -1466,7 +1606,17 @@ static bool ggml_backend_vk_dev_async_readback(ggml_backend_dev_t dev) {
     return on;
 }
 
+size_t ggml_vk_internal_device_bytes(size_t device_idx);
+
+// device memory the backend holds outside the ggml buffers' sizes (its own graph buffers, the sparse chunk rounding): the
+// zones booking adds it to the compute buffers, so the booked free memory follows the measured one
+static size_t ggml_backend_vk_dev_internal_memory(ggml_backend_dev_t dev) {
+    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
+    return ctx ? ggml_vk_internal_device_bytes((size_t) ctx->device) : 0;
+}
+
 void * ggml_vk_sparse_proc_address(const char * name) {
+    if (strcmp(name, "ggml_backend_dev_internal_memory") == 0)   { return (void *) ggml_backend_vk_dev_internal_memory; }
     if (strcmp(name, "ggml_backend_dev_async_readback") == 0)   { return (void *) ggml_backend_vk_dev_async_readback; }
     if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }
     if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }

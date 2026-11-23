@@ -435,6 +435,7 @@ private:
     int64_t  zones_t_batch_us  = 0;     // the start of the last batch
     int64_t  zones_t_shrink_us = 0;     // the last check whether a shrink lets flex steps back
     size_t   zones_compute_bytes = 0;   // the compute buffer on the device, booked in the budget
+    size_t   zones_internal_bytes = 0;  // the backend's own device buffers outside the ggml buffers, booked in the budget
     bool     zones_retry_put_back = false; // the compute buffer got smaller: try the flex steps that are off after the reservation
 
     // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
@@ -444,6 +445,8 @@ private:
     // whether the device's free memory is measured (else the booking: the device total minus what the model and context hold on it)
     bool     zones_mem_measured(ggml_backend_dev_t dev);
     size_t   zones_booked_free(ggml_backend_dev_t dev) const;
+    static size_t zones_internal_query(ggml_backend_dev_t dev);
+    void     zones_internal_booked();
     int      zones_measured = -1; // -1 = not asked yet
     // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
     void     zones_log_state(const char * what);
