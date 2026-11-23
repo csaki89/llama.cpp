@@ -2414,6 +2414,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_AUTO_ZONES"));
     add_opt(common_arg(
+        {"--zones-flex"}, {"--no-zones-flex"},
+        "with --auto-zones: make the flex band (default: enabled); --no-zones-flex keeps the dynamic KV without a flex band",
+        [](common_params & params, bool value) {
+            params.zones_flex = value;
+        }
+    ).set_env("LLAMA_ARG_ZONES_FLEX"));
+    add_opt(common_arg(
         {"--zones-ctx-init"}, "N",
         string_format("with --auto-zones: the small context for zone 1 + 2 and the initial KV size (default: %d)", params.zones_ctx_init),
         [](common_params & params, int value) {

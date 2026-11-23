@@ -1,6 +1,9 @@
 #include "ggml-vulkan-common.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <set>
 #include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
@@ -867,3 +870,444 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
     return buf;
 }
 
+
+// growable buffers on a sparse VkBuffer (dual-buffer fork, dynamic KV): the same interface as the ggml-cuda VMM arenas
+// (looked up with get_proc_address). An arena is one sparse buffer sized for the max context: address range only; device
+// memory is bound per chunk when a section grows (vkQueueBindSparse) and unbound and freed when it shrinks, so the memory
+// comes back without a copy. Needs sparseBinding, sparseResidencyBuffer and a compute queue with sparse binding; else no
+// arena (the KV grows by copy, with a log line naming the missing capability). GGML_VK_SPARSE=0 turns it off,
+// GGML_VK_SPARSE_CHUNK_KIB sets the chunk (default 2 MiB), GGML_VK_SPARSE_DEBUG=1 logs every bind.
+
+struct vk_sparse_arena {
+    vk_device                       device;
+    ggml_backend_buffer_type_t      buft;
+    vk_buffer                       buf;      // the sparse buffer, no memory of its own
+    vk::Queue                       queue;    // the compute queue (sparse binding)
+    vk_queue_handle *               qh = nullptr;
+    size_t                          reserved = 0;
+    size_t                          chunk    = 0;
+    uint32_t                        mem_type = 0;
+    std::vector<vk::DeviceMemory>   mem;      // per chunk, null if unbound
+    std::vector<size_t>             pending;  // chunks allocated, not bound and zeroed yet
+    int                             refs = 1;
+    std::mutex                      mtx;
+};
+
+struct vk_sparse_section : ggml_backend_vk_buffer_context {
+    vk_sparse_arena * arena;
+    size_t            offset;  // in the arena
+    size_t            section; // max bytes
+    size_t            mapped = 0;
+
+    vk_sparse_section(vk_device_ref dev, vk_buffer buf, std::string & name, vk_sparse_arena * arena, size_t offset, size_t section) :
+        ggml_backend_vk_buffer_context(dev, std::move(buf), name), arena(arena), offset(offset), section(section) {}
+};
+
+static bool vk_sparse_debug() {
+    static const bool on = getenv("GGML_VK_SPARSE_DEBUG") && atoi(getenv("GGML_VK_SPARSE_DEBUG")) != 0;
+    return on;
+}
+
+static std::atomic<int64_t> vk_sparse_stat_bound{0};
+
+static void vk_sparse_arena_unref(vk_sparse_arena * a) {
+    int left;
+    {
+        std::lock_guard<std::mutex> lock(a->mtx);
+        left = --a->refs;
+    }
+    if (left > 0) {
+        return;
+    }
+    a->device->device.waitIdle();
+    for (auto & m : a->mem) {
+        if (m) {
+            a->device->device.freeMemory(m);
+            vk_sparse_stat_bound -= (int64_t) a->chunk;
+            m = nullptr;
+        }
+    }
+    if (vk_sparse_debug()) {
+        GGML_LOG_INFO("%s: arena of %zu bytes freed\n", __func__, a->reserved);
+    }
+    a->buf.reset();
+    delete a;
+}
+
+// bind (with their memory) or unbind the chunks idx of an arena, and wait for it
+static bool vk_sparse_bind(vk_sparse_arena * a, const std::vector<size_t> & idx, bool bind) {
+    if (idx.empty()) {
+        return true;
+    }
+    std::vector<vk::SparseMemoryBind> binds;
+    binds.reserve(idx.size());
+    for (size_t i : idx) {
+        binds.push_back(vk::SparseMemoryBind(i * a->chunk, a->chunk, bind ? a->mem[i] : vk::DeviceMemory(), 0));
+    }
+    vk::SparseBufferMemoryBindInfo buf_bind(a->buf->buffer, (uint32_t) binds.size(), binds.data());
+    vk::BindSparseInfo info;
+    info.setBufferBinds(buf_bind);
+    vk::Fence fence = a->device->device.createFence({});
+    bool ok = true;
+    {
+        std::lock_guard<std::recursive_mutex> guard(a->device->mutex);
+        if (a->qh) {
+            a->qh->lock();
+        }
+        try {
+            a->queue.bindSparse(info, fence);
+        } catch (const vk::SystemError & e) {
+            GGML_LOG_ERROR("%s: %s of %zu chunks failed: %s\n", __func__, bind ? "binding" : "unbinding", idx.size(), e.what());
+            ok = false;
+        }
+        if (a->qh) {
+            a->qh->unlock();
+        }
+    }
+    if (ok) {
+        ok = a->device->device.waitForFences({ fence }, true, UINT64_MAX) == vk::Result::eSuccess;
+    }
+    a->device->device.destroyFence(fence);
+    return ok;
+}
+
+static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
+    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+        return nullptr;
+    }
+    vk_device & device = ((ggml_backend_vk_buffer_type_context *) buft->context)->device;
+    static std::mutex log_mtx;
+    static std::set<std::string> logged;
+    auto no = [&](const std::string & why) -> void * {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        if (logged.insert(device->name).second) {
+            GGML_LOG_WARN("ggml_backend_vk_vmm_arena_new: %s: no growable (sparse) KV buffers: %s; the KV grows by copy\n", device->name.c_str(), why.c_str());
+        }
+        return nullptr;
+    };
+    if (const char * env = getenv("GGML_VK_SPARSE"); env && atoi(env) == 0) {
+        return no("GGML_VK_SPARSE=0");
+    }
+    const vk::PhysicalDeviceFeatures feats = device->physical_device.getFeatures();
+    if (!feats.sparseBinding) {
+        return no("the device has no sparseBinding");
+    }
+    if (!feats.sparseResidencyBuffer) {
+        return no("the device has no sparseResidencyBuffer");
+    }
+    const auto qprops = device->physical_device.getQueueFamilyProperties();
+    const uint32_t qf = device->compute_queue->queue_family_index;
+    if (qf >= qprops.size() || !(qprops[qf].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
+        return no("the compute queue family " + std::to_string(qf) + " has no VK_QUEUE_SPARSE_BINDING_BIT");
+    }
+
+    size_t chunk = 2u << 20;
+    if (const char * env = getenv("GGML_VK_SPARSE_CHUNK_KIB"); env && atoll(env) > 0) {
+        chunk = (size_t) atoll(env) << 10;
+    }
+
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    // the sparse block is the memory requirement's alignment: probe it with a small buffer
+    vk::BufferCreateInfo bci(vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, chunk, usage, vk::SharingMode::eExclusive);
+    vk::MemoryRequirements req;
+    try {
+        vk::Buffer probe = device->device.createBuffer(bci);
+        req = device->device.getBufferMemoryRequirements(probe);
+        device->device.destroyBuffer(probe);
+    } catch (const vk::SystemError & e) {
+        return no(std::string("creating a sparse buffer failed: ") + e.what());
+    }
+    const size_t block = std::max<size_t>(req.alignment, 1);
+    chunk = block * ((chunk + block - 1) / block);
+    const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
+    if (reserved > device->physical_device.getProperties().limits.sparseAddressSpaceSize) {
+        return no("the KV (" + std::to_string(reserved) + " bytes) is larger than sparseAddressSpaceSize");
+    }
+    bci.size = reserved;
+    vk::Buffer vkbuf;
+    try {
+        vkbuf = device->device.createBuffer(bci);
+    } catch (const vk::SystemError & e) {
+        return no(std::string("creating a sparse buffer of ") + std::to_string(reserved) + " bytes failed: " + e.what());
+    }
+    req = device->device.getBufferMemoryRequirements(vkbuf);
+    const vk::PhysicalDeviceMemoryProperties mp = device->physical_device.getMemoryProperties();
+    int mem_type = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            mem_type = (int) i;
+            break;
+        }
+    }
+    if (mem_type < 0) {
+        device->device.destroyBuffer(vkbuf);
+        return no("no device local memory type for a sparse buffer");
+    }
+
+    auto * a = new vk_sparse_arena;
+    a->device   = device;
+    a->buft     = buft;
+    a->queue    = device->compute_queue->handle->queue;
+    a->qh       = device->compute_queue->handle.get();
+    a->reserved = reserved;
+    a->chunk    = chunk;
+    a->mem_type = (uint32_t) mem_type;
+    a->mem.assign(reserved / chunk, nullptr);
+    a->buf = std::make_shared<vk_buffer_struct>();
+    a->buf->buffer = vkbuf;
+    a->buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    a->buf->ptr    = nullptr;
+    a->buf->size   = reserved;
+    a->buf->device = device;
+    if (device->buffer_device_address) {
+        a->buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(vkbuf));
+    }
+    {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        if (logged.insert(device->name + "/ok").second) {
+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse KV buffers: block %zu, chunk %zu bytes, memory type %d\n", device->name.c_str(),
+                (size_t) req.alignment, chunk, mem_type);
+        }
+    }
+    if (vk_sparse_debug()) {
+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: arena of %zu bytes (%zu chunks)\n", reserved, reserved / chunk);
+    }
+    return a;
+}
+
+static size_t ggml_backend_vk_vmm_arena_alignment(void * arena) {
+    return ((vk_sparse_arena *) arena)->chunk;
+}
+
+static void ggml_backend_vk_vmm_arena_free(void * arena) {
+    vk_sparse_arena_unref((vk_sparse_arena *) arena);
+}
+
+static void ggml_backend_vk_sparse_free_buffer(ggml_backend_buffer_t buffer);
+static void * ggml_backend_vk_sparse_get_base(ggml_backend_buffer_t buffer);
+static void ggml_backend_vk_sparse_clear(ggml_backend_buffer_t buffer, uint8_t value);
+
+static ggml_backend_buffer_i ggml_backend_vk_sparse_interface = {
+    /* .free_buffer     = */ ggml_backend_vk_sparse_free_buffer,
+    /* .get_base        = */ ggml_backend_vk_sparse_get_base,
+    /* .init_tensor     = */ ggml_backend_vk_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_vk_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_vk_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_vk_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_vk_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_vk_buffer_get_tensor_2d,
+    /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_vk_sparse_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
+};
+
+static vk_sparse_section * vk_sparse_ctx(ggml_backend_buffer_t buffer) {
+    return buffer && buffer->iface.free_buffer == ggml_backend_vk_sparse_free_buffer ? (vk_sparse_section *) buffer->context : nullptr;
+}
+
+// allocate the memory of the chunks up to size (bound and zeroed by the next commit)
+static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
+    vk_sparse_arena * a = s->arena;
+    const size_t want = std::min(s->section, a->chunk * ((size + a->chunk - 1) / a->chunk));
+    std::lock_guard<std::mutex> lock(a->mtx);
+    while (s->mapped < want) {
+        const size_t i = (s->offset + s->mapped) / a->chunk;
+        try {
+            vk::MemoryAllocateInfo mai(a->chunk, a->mem_type);
+            vk::MemoryAllocateFlagsInfo flags_info;
+            if (a->device->buffer_device_address) {
+                flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+                mai.setPNext(&flags_info);
+            }
+            a->mem[i] = a->device->device.allocateMemory(mai);
+        } catch (const vk::SystemError & e) {
+            if (vk_sparse_debug()) {
+                GGML_LOG_INFO("vk_sparse_map_to: chunk %zu: allocation failed: %s\n", i, e.what());
+            }
+            return false;
+        }
+        vk_sparse_stat_bound += (int64_t) a->chunk;
+        a->pending.push_back(i);
+        s->mapped += a->chunk;
+    }
+    return true;
+}
+
+// bind the pending chunks and zero them; nothing may access them before
+static bool ggml_backend_vk_vmm_arena_commit(void * arena) {
+    vk_sparse_arena * a = (vk_sparse_arena *) arena;
+    std::vector<size_t> idx;
+    {
+        std::lock_guard<std::mutex> lock(a->mtx);
+        idx.swap(a->pending);
+    }
+    if (idx.empty()) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!vk_sparse_bind(a, idx, true)) {
+        return false;
+    }
+    const int64_t t1 = ggml_time_us();
+    for (size_t i : idx) {
+        ggml_vk_buffer_memset(a->buf, i * a->chunk, 0, a->chunk);
+    }
+    if (vk_sparse_debug()) {
+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_commit: %zu chunks bound (%.2f ms) and zeroed (%.2f ms)\n", idx.size(), (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
+    }
+    return true;
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_vmm_arena_buffer(void * arena, size_t offset, size_t size, size_t max_size) {
+    vk_sparse_arena * a = (vk_sparse_arena *) arena;
+    const size_t section = a->chunk * ((std::max(size, max_size) + a->chunk - 1) / a->chunk);
+    if (offset % a->chunk != 0 || offset + section > a->reserved) {
+        return nullptr;
+    }
+    auto * btctx = (ggml_backend_vk_buffer_type_context *) a->buft->context;
+    {
+        std::lock_guard<std::mutex> lock(a->mtx);
+        a->refs++;
+    }
+    auto * s = new vk_sparse_section(a->device, a->buf, btctx->name, a, offset, section);
+    if (!vk_sparse_map_to(s, std::max<size_t>(size, 1))) {
+        ggml_backend_buffer_t tmp = ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, 0);
+        ggml_backend_buffer_free(tmp);
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, size);
+}
+
+static bool ggml_backend_vk_buffer_grow(ggml_backend_buffer_t buffer, size_t size) {
+    vk_sparse_section * s = vk_sparse_ctx(buffer);
+    if (!s) {
+        return false;
+    }
+    if (size <= buffer->size) {
+        return true;
+    }
+    if (size > s->section || !vk_sparse_map_to(s, size)) {
+        return false;
+    }
+    buffer->size = size;
+    return true;
+}
+
+static bool ggml_backend_vk_buffer_grow_commit(ggml_backend_buffer_t buffer) {
+    vk_sparse_section * s = vk_sparse_ctx(buffer);
+    return s && ggml_backend_vk_vmm_arena_commit(s->arena);
+}
+
+// unbind and free the chunks of a section from byte keep on (keep is rounded up to whole chunks)
+static bool vk_sparse_unmap_from(vk_sparse_section * s, size_t keep_bytes) {
+    vk_sparse_arena * a = s->arena;
+    const size_t keep = a->chunk * ((keep_bytes + a->chunk - 1) / a->chunk);
+    std::vector<size_t> bound;
+    std::vector<size_t> all;
+    {
+        std::lock_guard<std::mutex> lock(a->mtx);
+        for (size_t m = keep; m < s->mapped; m += a->chunk) {
+            const size_t i = (s->offset + m) / a->chunk;
+            all.push_back(i);
+            if (std::find(a->pending.begin(), a->pending.end(), i) == a->pending.end()) {
+                bound.push_back(i); // pending chunks were never bound
+            }
+        }
+    }
+    if (all.empty()) {
+        return true;
+    }
+    if (!bound.empty()) {
+        a->device->device.waitIdle(); // no queue may use a chunk when it is unbound
+        if (!vk_sparse_bind(a, bound, false)) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(a->mtx);
+    for (size_t i : all) {
+        a->pending.erase(std::remove(a->pending.begin(), a->pending.end(), i), a->pending.end());
+        a->device->device.freeMemory(a->mem[i]);
+        a->mem[i] = nullptr;
+        vk_sparse_stat_bound -= (int64_t) a->chunk;
+    }
+    s->mapped = keep;
+    return true;
+}
+
+static bool ggml_backend_vk_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
+    vk_sparse_section * s = vk_sparse_ctx(buffer);
+    if (!s) {
+        return false;
+    }
+    if (size >= buffer->size) {
+        return true;
+    }
+    const size_t old = s->mapped;
+    if (!vk_sparse_unmap_from(s, std::max<size_t>(size, 1))) {
+        return false;
+    }
+    buffer->size = size;
+    if (vk_sparse_debug()) {
+        GGML_LOG_INFO("ggml_backend_vk_buffer_shrink: section at %zu: %zu -> %zu bytes bound\n", s->offset, old, s->mapped);
+    }
+    return true;
+}
+
+static size_t ggml_backend_vk_buffer_vmm_chunk(ggml_backend_buffer_t buffer) {
+    vk_sparse_section * s = vk_sparse_ctx(buffer);
+    return s ? s->arena->chunk : 0;
+}
+
+// vkFreeMemory gives the memory back at once: an in-place shrink frees it
+static bool ggml_backend_vk_vmm_unmap_keeps_memory(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    return false;
+}
+
+// stats[4]: live arenas (not tracked: 0), bound bytes, commit timings (0)
+static void ggml_backend_vk_vmm_stats(int64_t * stats) {
+    stats[0] = 0;
+    stats[1] = vk_sparse_stat_bound;
+    stats[2] = 0;
+    stats[3] = 0;
+}
+
+static void ggml_backend_vk_sparse_free_buffer(ggml_backend_buffer_t buffer) {
+    vk_sparse_section * s = (vk_sparse_section *) buffer->context;
+    vk_sparse_unmap_from(s, 0);
+    vk_sparse_arena * a = s->arena;
+    delete s;
+    vk_sparse_arena_unref(a);
+}
+
+static void * ggml_backend_vk_sparse_get_base(ggml_backend_buffer_t buffer) {
+    return (uint8_t *) vk_ptr_base + ((vk_sparse_section *) buffer->context)->offset;
+}
+
+static void ggml_backend_vk_sparse_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    vk_sparse_section * s = (vk_sparse_section *) buffer->context;
+    if (buffer->size > 0) {
+        ggml_vk_buffer_memset(s->dev_buffer, s->offset, (uint32_t) value * 0x01010101, buffer->size);
+    }
+}
+
+void * ggml_vk_sparse_proc_address(const char * name) {
+    if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }
+    if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0)    { return (void *) ggml_backend_vk_vmm_arena_alignment; }
+    if (strcmp(name, "ggml_backend_vmm_arena_buffer") == 0)       { return (void *) ggml_backend_vk_vmm_arena_buffer; }
+    if (strcmp(name, "ggml_backend_vmm_arena_commit") == 0)       { return (void *) ggml_backend_vk_vmm_arena_commit; }
+    if (strcmp(name, "ggml_backend_vmm_arena_free") == 0)         { return (void *) ggml_backend_vk_vmm_arena_free; }
+    if (strcmp(name, "ggml_backend_buffer_grow") == 0)            { return (void *) ggml_backend_vk_buffer_grow; }
+    if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0)     { return (void *) ggml_backend_vk_buffer_grow_commit; }
+    if (strcmp(name, "ggml_backend_buffer_shrink") == 0)          { return (void *) ggml_backend_vk_buffer_shrink; }
+    if (strcmp(name, "ggml_backend_buffer_vmm_chunk") == 0)       { return (void *) ggml_backend_vk_buffer_vmm_chunk; }
+    if (strcmp(name, "ggml_backend_vmm_unmap_keeps_memory") == 0) { return (void *) ggml_backend_vk_vmm_unmap_keeps_memory; }
+    if (strcmp(name, "ggml_backend_vmm_stats") == 0)              { return (void *) ggml_backend_vk_vmm_stats; }
+    return nullptr;
+}

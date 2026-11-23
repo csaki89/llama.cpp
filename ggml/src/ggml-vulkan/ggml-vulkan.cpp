@@ -16454,6 +16454,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
         return (void *) ggml_backend_vk_fusion_set_enabled;
     }
+    if (void * p = ggml_vk_sparse_proc_address(name)) {
+        return p;
+    }
     return nullptr;
 }
 

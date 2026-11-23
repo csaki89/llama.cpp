@@ -1309,6 +1309,10 @@ static void common_auto_zones(common_params & params, const llama_model_params &
         COM_INF("%s: auto zones: -ngl is set, no automatic flex band (dynamic KV only)\n", __func__);
         return;
     }
+    if (!params.zones_flex) {
+        COM_INF("%s: auto zones: --no-zones-flex, no flex band (dynamic KV only)\n", __func__);
+        return;
+    }
     const size_t n_ovr_user = count_overrides(ovr_user.data());
     const size_t n_ovr_full = count_overrides(mparams.tensor_buft_overrides);
     if (mparams.n_gpu_layers < 0 && n_ovr_full == n_ovr_user) {
