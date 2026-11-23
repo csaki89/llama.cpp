@@ -3565,10 +3565,56 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         t_alloc += ggml_time_us() - t1;
     }
 
+    const uint32_t n_rows = std::min(n_used, n);
+
+    // the copy fallback (no arena on the device) from a device buffer shared by several layers (the K/V as loaded): the used
+    // rows of its layers go to the host and the shared buffer is freed before the new buffers, so the device holds one layer's
+    // new K/V at a time on top of the rest instead of the whole old and the whole new K/V (the arena path is unchanged)
+    std::vector<uint8_t> staged_shared(layers.size(), 0);
+    size_t n_staged_bufs = 0;
+    if (n_stream == 1) {
+        for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
+            const ggml_backend_buffer_t b = ctxs_bufs.bufs[ib].second.get();
+            if (!b || n_owners[ib] <= 1 || ggml_backend_buffer_is_host(b)) {
+                continue;
+            }
+            std::vector<size_t> own;
+            bool all = true;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                if (layers[ikv].k->buffer != b && !(layers[ikv].v && layers[ikv].v->buffer == b)) {
+                    continue;
+                }
+                own.push_back(ikv);
+                if (grown[ikv] || !bufs_section[ikv].empty() || arenas.count(buft_of[ikv]) > 0 || via_host[ikv] || on_host[ikv]) {
+                    all = false;
+                }
+            }
+            if (!all || own.empty()) {
+                continue;
+            }
+            for (size_t ikv : own) {
+                int i = 0;
+                for (ggml_tensor * t : { layers[ikv].k, layers[ikv].v }) {
+                    auto & h = staged[2*ikv + i++];
+                    if (t && n_rows > 0) {
+                        h.resize(t->nb[1]*n_rows);
+                        ggml_backend_tensor_get(t, h.data(), 0, h.size());
+                    }
+                }
+                staged_shared[ikv] = 1;
+            }
+            ctxs_bufs.bufs[ib].second.reset();
+            n_staged_bufs++;
+        }
+        if (n_staged_bufs > 0) {
+            LLAMA_LOG_INFO("%s: copy fallback: %zu shared K/V buffers freed first (%u used rows of their layers through the host)\n", __func__,
+                n_staged_bufs, n_rows);
+        }
+    }
+
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
     bufs_new.reserve(2*layers.size());
     size_t n_copied = 0;
-    const uint32_t n_rows = std::min(n_used, n);
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         auto & layer = layers[ikv];
         ggml_backend_buffer_type_t buft = buft_of[ikv];
@@ -3672,10 +3718,11 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
         dyn_vmm[ikv] = !bufs_layer.empty();
         if (bufs_layer.empty()) {
             ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-            if (via_host[ikv]) {
-                // the old K/V is gone (its range was freed): an ordinary device buffer, else the CPU; stop only if both fail
+            if (via_host[ikv] || staged_shared[ikv]) {
+                // the old K/V is gone (its range or the shared buffer was freed): an ordinary device buffer, else the CPU; stop
+                // only if both fail
                 if (b) {
-                    n_lost_vmm++;
+                    n_lost_vmm += via_host[ikv];
                 } else {
                     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                     ggml_backend_buffer_type_t buft_cpu = cpu ? ggml_backend_dev_buffer_type(cpu) : nullptr;
@@ -3708,7 +3755,7 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
                 continue;
             }
             // the arena was freed above: the used rows come back from the host
-            if (via_host[ikv]) {
+            if (via_host[ikv] || staged_shared[ikv]) {
                 const auto & h = staged[2*ikv + i];
                 if (!h.empty()) {
                     ggml_backend_tensor_set(dst, h.data(), 0, h.size());
