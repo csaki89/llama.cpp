@@ -25,3 +25,16 @@ Felmérés a `multimodel` branchen (a45647ddb..6b19b5a28 után), módosítás el
 
 ## Eredmény
 Lásd a végén (a módosítások után kitöltve).
+
+## Eredmény (e795e5860 után; mérés: laptop, Iris Xe, `tools/dualbuf/vk-parity.sh`)
+| elem | állapot |
+|---|---|
+| dual-buffer, auto zónák, flex-mozgás a K/V-vel, naplósorok | egyezik (a módosítás előtt is) |
+| dinamikus KV helyben növelés és zsugorítás | egyezik |
+| a VMM-darab futásidőben | **egyezik**: `sparse block 65536; driver booking unit 65536 (measured); release unit 8388608 (measured: 8 allocations of it freed bring the heap usage back); allocation limit 2091911 (...); chunk 8388608`. A ROCm-os mintához (granularitás + mért foglalási egység) képest egy összetevővel több: a **visszaadási egység** (a legkisebb méret, amelynek felszabadítása a heap-használatot visszaállítja). Ok: ezen a meghajtón a 64 KiB-os darabokat a meghajtó belső blokkokból szolgálta ki, a zsugorításkor felszabadított 196 MiB-ból csak 72 MiB jött vissza; a mért 8 MiB-os darabbal 896-ból 811 MiB (90,5%), a másolásos úttal 490-ből 443 MiB (90,4%) – a kettő egyezik. ROCm-on ez a mérés nincs (a HIP-út változatlan). |
+| a zónakeret a mért szabad memóriából | **egyezik**: `VK_EXT_memory_budget` mellett mért; nélküle (`GGML_VK_DISABLE_MEMORY_BUDGET=1`) a backend jelzi (`no VK_EXT_memory_budget ... not a measurement`), a zónák a kernel sysfs-ét (amdgpu) vagy a könyvelést használják (`the budget follows the booking only`), a `zones_state`-ben `driver -` |
+| a felszabadított memória visszajön (mérve) | egyezik (fent) |
+| tartalékágak naplósorral | egyezik: `GGML_VK_SPARSE=0` → `the KV grows by copy`; költségvetés nélkül → könyvelés |
+| ROCm-út | változatlan: a `ggml_backend_dev_memory_measured` proc a CUDA/HIP-backendben nincs, a zónák a mért ágon maradnak; a `zones_state` formája (`driver %.0f`) ugyanaz |
+
+Nyitva (OPEN-QUESTIONS.md): a fit költségvetés nélkül a heap teljes méretét látja szabadnak (felső becslés); nagy visszaadási egységnél egy kis modell egy K/V-szakasza egyetlen darab, ilyenkor a zsugorítás nem ad vissza memóriát (a mechanizmus nagyobb szakaszokkal mérve működik).
