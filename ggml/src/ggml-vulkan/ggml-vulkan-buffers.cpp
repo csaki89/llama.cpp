@@ -1457,7 +1457,17 @@ static bool ggml_backend_vk_dev_memory_measured(ggml_backend_dev_t dev) {
     return measured;
 }
 
+// the scheduler reads a split's output into host memory through get_tensor_async + synchronize: a synchronous read is a
+// command buffer, a submission and a fence wait of its own after the wait for the graph (per split boundary in a GPU/CPU
+// split); off by default, GGML_VK_ASYNC_READBACK=1 turns it on (measured neutral on an iGPU; to be measured on a discrete card)
+static bool ggml_backend_vk_dev_async_readback(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    static const bool on = getenv("GGML_VK_ASYNC_READBACK") && atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0;
+    return on;
+}
+
 void * ggml_vk_sparse_proc_address(const char * name) {
+    if (strcmp(name, "ggml_backend_dev_async_readback") == 0)   { return (void *) ggml_backend_vk_dev_async_readback; }
     if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }
     if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }
     if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0)    { return (void *) ggml_backend_vk_vmm_arena_alignment; }
