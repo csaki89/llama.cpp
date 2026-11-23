@@ -992,6 +992,12 @@ struct llama_model {
     // next step to take (to_gpu = false) or put back, -1 if none; exps: the step is the experts of a whole layer
     int  flex_next(bool to_gpu, bool * exps = nullptr) const;
     ggml_backend_dev_t flex_gpu_dev(int il) const; // the GPU device of a flex layer (dev_layer() is the CPU while it is taken off)
+
+    // llama_park: the model has park copies (llama_model_params.park); move every weight group off the device (to_gpu = false,
+    // the placement before is kept) or back to it; bytes: the weights moved
+    bool park_available() const;
+    bool park_move(bool to_gpu, size_t * bytes = nullptr) const;
+    bool park_was_on_gpu(int il) const; // a flex layer was on the device before the park
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 

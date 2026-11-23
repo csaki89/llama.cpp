@@ -591,6 +591,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool dual_buffer       = false; // keep repacked CPU weights also in the host buffer (original format) for op offload
+    bool park              = false; // pinned host copies of the GPU weights, for llama_park (llama-server: POST /park, /unpark)
     std::string dual_buffer_pattern;      // regex on tensor names to duplicate with --dual-buffer (empty = all)
     int32_t     dual_buffer_limit_mib = 0; // max extra host memory for --dual-buffer in MiB (0 = no limit)
     int32_t     flex_layers           = 0; // first N GPU layers can move to the CPU at runtime (0 = off, or automatic with auto_zones)

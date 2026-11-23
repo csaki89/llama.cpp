@@ -3376,6 +3376,11 @@ bool llama_kv_cache::relayout(uint32_t n, bool force) {
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         buft_of[ikv] = ggml_backend_buffer_get_type(layers[ikv].k->buffer);
         on_host[ikv] = ggml_backend_buffer_is_host(layers[ikv].k->buffer);
+        // llama_park: another buffer type for the layer (the device host buffer, or back to the device)
+        if (ikv < relayout_target.size() && relayout_target[ikv]) {
+            buft_of[ikv] = relayout_target[ikv];
+            on_host[ikv] = ggml_backend_buft_is_host(relayout_target[ikv]);
+        }
     }
 
     // growable K/V: map more memory at the end first, for all the layers, then one commit (the mappings are not valid before it)
@@ -3924,4 +3929,59 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+bool llama_kv_cache::park_kv(bool to_host) {
+    if (layers.empty()) {
+        return true;
+    }
+    relayout_target.assign(layers.size(), nullptr);
+    if (to_host) {
+        park_bufts.assign(layers.size(), nullptr);
+    }
+    size_t n_moved = 0;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        ggml_backend_buffer_t buf = layers[ikv].k->buffer;
+        if (to_host) {
+            if (!buf || ggml_backend_buffer_is_host(buf)) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_buffer_type_t host = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (!host) {
+                ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                host = cpu ? ggml_backend_dev_buffer_type(cpu) : nullptr;
+            }
+            if (!host) {
+                relayout_target.clear();
+                return false;
+            }
+            park_bufts[ikv]      = buft;
+            relayout_target[ikv] = host;
+            n_moved++;
+        } else if (ikv < park_bufts.size() && park_bufts[ikv]) {
+            relayout_target[ikv] = park_bufts[ikv];
+            n_moved++;
+        }
+    }
+    bool ok = true;
+    if (n_moved > 0) {
+        ok = relayout(get_size(), true);
+    }
+    relayout_target.clear();
+    if (!ok) {
+        return false;
+    }
+    // the flex layers' K/V follows the weights in their own moves: record where it is now
+    for (auto & [il, fk] : flex_kv_layers) {
+        const auto it = map_layer_ids.find(il);
+        if (it != map_layer_ids.end()) {
+            fk.on_gpu = !ggml_backend_buffer_is_host(layers[it->second].k->buffer);
+        }
+    }
+    if (!to_host) {
+        park_bufts.clear();
+    }
+    return true;
 }

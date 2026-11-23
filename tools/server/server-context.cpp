@@ -3182,6 +3182,26 @@ private:
                 {
                     // do nothing
                 } break;
+            case SERVER_TASK_TYPE_PARK:
+            case SERVER_TASK_TYPE_UNPARK:
+                {
+                    // only between requests: a park moves every weight and the K/V
+                    bool busy = false;
+                    for (server_slot & slot : slots) {
+                        busy = busy || slot.is_processing();
+                    }
+                    if (busy) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    const int64_t t0 = ggml_time_us();
+                    auto res = std::make_unique<server_task_result_park>();
+                    res->id      = task.id;
+                    res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
+                    res->parked  = llama_is_parked(ctx_tgt);
+                    res->t_ms    = (ggml_time_us() - t0) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
@@ -5868,6 +5888,32 @@ void server_routes::init_routes() {
         res->ok(res_task->to_json());
         return res;
     };
+
+    // dual-buffer fork: free the device (park) or load it back (unpark), see llama_park
+    auto park_handler = [this](bool park) {
+        return [this, park](const server_http_req & req) {
+            auto res = create_response();
+            auto & rd = res->rd;
+            {
+                server_task task(park ? SERVER_TASK_TYPE_PARK : SERVER_TASK_TYPE_UNPARK);
+                task.id = rd.get_new_id();
+                rd.post_task(std::move(task));
+            }
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
+        };
+    };
+    this->post_park   = park_handler(true);
+    this->post_unpark = park_handler(false);
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();

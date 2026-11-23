@@ -2414,6 +2414,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_AUTO_ZONES"));
     add_opt(common_arg(
+        {"--park"},
+        "keep a GPU-format copy of every GPU weight in the pinned host buffer, so the model can be parked (llama-server: POST /park frees the device, POST /unpark loads it back; needs --load-mode none, uses RAM as large as the GPU weights)",
+        [](common_params & params) {
+            params.park = true;
+        }
+    ).set_env("LLAMA_ARG_PARK"));
+    add_opt(common_arg(
         {"--zones-flex"}, {"--no-zones-flex"},
         "with --auto-zones: make the flex band (default: enabled); --no-zones-flex keeps the dynamic KV without a flex band",
         [](common_params & params, bool value) {

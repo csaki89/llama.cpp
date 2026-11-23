@@ -948,6 +948,9 @@ int64_t llama_context::zones_step_cost(int il, bool exps) const {
 }
 
 bool llama_context::zones_take() {
+    if (parked) {
+        return false; // parked: nothing is on the device, the zone rule waits for the unpark
+    }
     bool exps = false;
     const int il = model.flex_next(false, &exps);
     if (il < 0) {
@@ -962,6 +965,9 @@ bool llama_context::zones_take() {
 }
 
 int llama_context::zones_put_back() {
+    if (parked) {
+        return 0;
+    }
     int n = 0;
     bool exps = false;
     for (int il = model.flex_next(true, &exps); il >= 0; il = model.flex_next(true, &exps)) {
@@ -5393,6 +5399,111 @@ bool llama_memory_can_shift(llama_memory_t mem) {
 
 bool llama_memory_reserve(llama_context * ctx, uint32_t n_tokens) {
     return ctx ? ctx->zones_reserve(n_tokens) : false;
+}
+
+bool llama_park(llama_context * ctx, bool park) {
+    return ctx ? ctx->park(park) : false;
+}
+
+bool llama_is_parked(const llama_context * ctx) {
+    return ctx ? ctx->is_parked() : false;
+}
+
+bool llama_context::park(bool to_park) {
+    if (to_park == parked) {
+        return true;
+    }
+    if (!model.park_available()) {
+        LLAMA_LOG_WARN("%s: the model has no park copies (load it with --park / llama_model_params.park), not %s\n", __func__, to_park ? "parked" : "unparked");
+        return false;
+    }
+    // the device: the measured free memory before and after (driver, and the kernel's sysfs figure where there is one)
+    ggml_backend_dev_t dev = zones_dev();
+    auto measure = [&](size_t & drv, size_t & sys) {
+        drv = 0;
+        sys = 0;
+        if (dev) {
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &drv, &total);
+            if (!zones_sysfs_free(total, sys)) {
+                sys = 0;
+            }
+        }
+    };
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    const auto parts = zones_parts(memory.get());
+    std::vector<llama_kv_cache *> kvs;
+    if (parts.kv) {
+        kvs.push_back(parts.kv);
+    }
+    for (const auto & [name, part] : parts.fixed) {
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(part)) {
+            kvs.push_back(kv);
+        } else {
+            LLAMA_LOG_WARN("%s: the %s stays where it is\n", __func__, name);
+        }
+    }
+    size_t kv_bytes = 0;
+    for (auto * kv : kvs) {
+        kv_bytes += (size_t) kv->get_size() * kv->cell_bytes(true);
+    }
+
+    size_t drv0 = 0, sys0 = 0;
+    measure(drv0, sys0);
+    const int64_t t0 = ggml_time_us();
+    size_t w_bytes = 0;
+    bool ok = true;
+    int64_t t1 = 0, t2 = 0;
+    if (to_park) {
+        // weights: every group switches to its host storage (park copy, or the CPU twin of a flex layer) and its device buffer is freed
+        ok = model.park_move(false, &w_bytes);
+        t1 = ggml_time_us();
+        // K/V: the used rows to the device host buffer (the VMM sections and their ranges are freed with the old buffers)
+        for (auto * kv : kvs) {
+            ok = kv->park_kv(true) && ok;
+        }
+        t2 = ggml_time_us();
+        // no op offload while parked: the device is not used at all
+        park_op_offload    = cparams.op_offload;
+        cparams.op_offload = false;
+        parked = true;
+    } else {
+        // weights back from the pinned copies (DMA), the flex layers to their placement before the park
+        ok = model.park_move(true, &w_bytes);
+        t1 = ggml_time_us();
+        for (auto * kv : kvs) {
+            ok = kv->park_kv(false) && ok;
+        }
+        t2 = ggml_time_us();
+        kv_bytes = 0;
+        for (auto * kv : kvs) {
+            kv_bytes += (size_t) kv->get_size() * kv->cell_bytes(true);
+        }
+        cparams.op_offload = park_op_offload;
+        parked = false;
+    }
+    // the scheduler is built again: the device compute buffer of the old one is freed; parked, the new one plans nothing on the device
+    sched_need_reserve = true;
+    sched_reserve();
+    gf_res_prev_active = nullptr;
+    zones_kv_gen = 0;
+    const int64_t t3 = ggml_time_us();
+    if (!to_park && zones_kv_init > 0) {
+        // the zones are measured again: the budget follows the free device memory now
+        zones_clamp(true, true);
+        zones_put_back();
+    }
+    size_t drv1 = 0, sys1 = 0;
+    measure(drv1, sys1);
+    LLAMA_LOG_INFO("%s: %s%s: weights %.2f MiB in %.1f ms (%.2f GB/s), K/V %.2f MiB in %.1f ms, scheduler %.1f ms; device free: driver %.0f -> %.0f MiB, sysfs %s -> %s MiB\n",
+        __func__, to_park ? "parked" : "unparked", ok ? "" : " (with errors)",
+        w_bytes / 1048576.0, (t1 - t0) / 1000.0, t1 > t0 ? w_bytes / 1e3 / (double) (t1 - t0) : 0.0,
+        kv_bytes / 1048576.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, drv0 / 1048576.0, drv1 / 1048576.0,
+        sys0 ? std::to_string(sys0 >> 20).c_str() : "-", sys1 ? std::to_string(sys1 >> 20).c_str() : "-");
+    zones_log_state(to_park ? "parked" : "unparked");
+    return ok;
 }
 
 // llama state API

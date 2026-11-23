@@ -1446,9 +1446,12 @@ struct llama_model::impl {
         // a whole layer's experts in their own buffer: they go to the CPU first, the layer stays a GPU layer (on_gpu is the rest)
         size_t buf_idx_exps  = SIZE_MAX;
         bool   exps_on_gpu   = true;
+        bool   park_only     = false; // park copies (zone 1, the output layer): only llama_park moves them, not the zone rule
         std::vector<llama_model_loader::flex_pair> pairs;
     };
     std::map<int, flex_layer> flex;
+    std::map<int, std::pair<bool, bool>> park_prev; // the (rest, experts) placement of every group before llama_park
+    bool park_quiet = false; // in park_move: no log line per group
     llama_files flex_files; // kept open to reload the GPU copies
 
     struct layer_dev {
@@ -1835,10 +1838,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // RAM guard (DECISIONS.md 12-14, 17): free RAM, the RAM-resident part of the model, and the zone 2 copies of the flex layers
-    size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0;
+    size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0, ram_park = 0;
     const char * ram_src = "system";
     bool flex_off = (n_flex == 0 && flex_ovr.empty()) || ml.use_mmap;
-    if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off) {
+    if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off || params.park) {
         size_t cg_free = 0, cg_limit = 0;
         ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (ram_dev) {
@@ -1891,6 +1894,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ram_cpu_part += ggml_nbytes(it.second.tensor);
             } else if (is_layer && ((il >= i_gpu_start_est && il < flex_end_est) || flex_ovr_match(name))) {
                 ram_flex += 2*ggml_nbytes(it.second.tensor); // zone 2: repacked copy + host copy
+            } else if (params.park) {
+                ram_park += ggml_nbytes(it.second.tensor); // a GPU weight outside the flex band: its pinned park copy
             }
         }
 
@@ -1911,6 +1916,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ram_free / 1024.0 / 1024.0, ram_src, ram_cpu_part / 1024.0 / 1024.0, ram_flex / 1024.0 / 1024.0, ram_reserve / 1024.0 / 1024.0);
         }
     }
+
+    // park copies: a pinned GPU-format copy of every GPU weight outside the flex band; without room for them no in-process park
+    // (the caller then swaps by restarting the process)
+    if (params.park) {
+        if (ml.use_mmap) {
+            LLAMA_LOG_WARN("%s: park: --park requires --load-mode none, no park copies\n", __func__);
+        } else if (ram_total > 0 && ram_free < ram_cpu_part + ram_flex + ram_park + ram_reserve) {
+            LLAMA_LOG_WARN("%s: park: the pinned copies of the GPU weights (%.0f MiB) do not fit the free RAM (%.0f MiB, %s; CPU part ~%.0f MiB, flex copies %.0f MiB, reserve %.0f MiB), no in-process park\n",
+                __func__, ram_park / 1024.0 / 1024.0, ram_free / 1024.0 / 1024.0, ram_src, ram_cpu_part / 1024.0 / 1024.0, ram_flex / 1024.0 / 1024.0, ram_reserve / 1024.0 / 1024.0);
+            ram_park = 0;
+        } else {
+            ml.park_copies = true;
+            LLAMA_LOG_INFO("%s: park: pinned copies of the GPU weights ~%.0f MiB (free RAM %.0f MiB, %s)\n", __func__,
+                ram_park / 1024.0 / 1024.0, ram_free / 1024.0 / 1024.0, ram_src);
+        }
+    }
+    ram_flex += ram_park; // the dual-buffer budget below leaves room for them
 
     // dual-buffer: find the host buffer type that holds the original-format copies (same choice as make_cpu_buft_list)
     if (params.dual_buffer) {
@@ -2249,6 +2271,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         pimpl->flex[p.layer].pairs.push_back(p);
         pimpl->flex[p.layer].whole = p.layer >= ml.flex_lo && p.layer <= ml.flex_hi;
+        pimpl->flex[p.layer].park_only = p.park;
     }
     dual_weights = ml.dual_pairs;
     if (ml.dual_host_buft) {
@@ -2433,8 +2456,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!pimpl->flex.empty()) {
         // the loader is not used after load_tensors, keep its files to reload the GPU copies
         pimpl->flex_files = std::move(ml.files);
-        size_t n_pairs = 0, n_bytes_flex = 0, n_host = 0, n_bytes_host = 0, n_exps = 0;
+        size_t n_pairs = 0, n_bytes_flex = 0, n_host = 0, n_bytes_host = 0, n_exps = 0, n_park = 0, n_bytes_park = 0, n_park_groups = 0;
         for (auto & [il, fl] : pimpl->flex) {
+            if (fl.park_only) {
+                n_park_groups++;
+                for (const auto & p : fl.pairs) {
+                    n_park++;
+                    n_bytes_park += ggml_nbytes(p.cpu);
+                }
+                continue;
+            }
             // a layer with only experts in the band has a single buffer
             if (fl.buf_idx == SIZE_MAX && fl.buf_idx_exps != SIZE_MAX) {
                 std::swap(fl.buf_idx, fl.buf_idx_exps);
@@ -2452,8 +2483,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             }
         }
-        LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB), %zu with a host copy (%.2f MiB); %zu whole layers move their experts first\n", __func__,
-            pimpl->flex.begin()->first, pimpl->flex.rbegin()->first, n_pairs, n_bytes_flex / 1024.0 / 1024.0, n_host, n_bytes_host / 1024.0 / 1024.0, n_exps);
+        const auto fl_layers = flex_layers();
+        if (!fl_layers.empty()) {
+            LLAMA_LOG_INFO("%s: flex layers %d-%d: %zu weights with a CPU copy (%.2f MiB), %zu with a host copy (%.2f MiB); %zu whole layers move their experts first\n", __func__,
+                fl_layers.front(), fl_layers.back(), n_pairs, n_bytes_flex / 1024.0 / 1024.0, n_host, n_bytes_host / 1024.0 / 1024.0, n_exps);
+        }
+        if (n_park > 0) {
+            LLAMA_LOG_INFO("%s: park: %zu GPU weights in %zu groups have a pinned GPU-format copy (%.2f MiB)\n", __func__,
+                n_park, n_park_groups, n_bytes_park / 1024.0 / 1024.0);
+        }
     }
 
     return true;
@@ -2471,7 +2509,7 @@ std::vector<std::pair<int, bool>> llama_model::flex_order() const {
     // Put back: the reverse. (layer, experts of a whole layer)
     std::vector<std::pair<int, bool>> order;
     for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
-        if (!it->second.whole && it->second.buf_idx != SIZE_MAX) {
+        if (!it->second.whole && !it->second.park_only && it->second.buf_idx != SIZE_MAX) {
             order.emplace_back(it->first, false);
         }
     }
@@ -2567,11 +2605,70 @@ size_t llama_model::flex_layer_bytes(int il, int part) const {
 std::vector<int> llama_model::flex_layers() const {
     std::vector<int> res;
     for (const auto & [il, fl] : pimpl->flex) {
-        if (fl.buf_idx != SIZE_MAX) {
+        if (fl.buf_idx != SIZE_MAX && !fl.park_only) {
             res.push_back(il);
         }
     }
     return res;
+}
+
+bool llama_model::park_available() const {
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.park_only && fl.buf_idx != SIZE_MAX) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_model::park_move(bool to_gpu, size_t * bytes) const {
+    // park: every group (flex layers and park copies) off the device, the placement before it is kept; unpark: back to it
+    // (the park copies are host buffers: the upload is a DMA from pinned memory)
+    size_t moved = 0;
+    bool ok = true;
+    if (!to_gpu) {
+        pimpl->park_prev.clear();
+    }
+    pimpl->park_quiet = true;
+    for (auto & [il, fl] : pimpl->flex) {
+        if (fl.buf_idx == SIZE_MAX) {
+            continue;
+        }
+        const bool has_exps = fl.buf_idx_exps != SIZE_MAX;
+        if (!to_gpu) {
+            pimpl->park_prev[il] = { fl.on_gpu, fl.exps_on_gpu };
+            if (has_exps && fl.exps_on_gpu) {
+                moved += flex_layer_bytes(il, LLAMA_FLEX_EXPS);
+                ok = flex_move_part(il, true, false, false) && ok;
+            }
+            if (fl.on_gpu) {
+                moved += flex_layer_bytes(il, has_exps ? LLAMA_FLEX_REST : LLAMA_FLEX_ALL);
+                ok = flex_move_part(il, false, false, false) && ok;
+            }
+        } else {
+            const auto it = pimpl->park_prev.find(il);
+            const bool rest = it == pimpl->park_prev.end() || it->second.first;
+            const bool exps = it == pimpl->park_prev.end() || it->second.second;
+            if (rest && !fl.on_gpu) {
+                moved += flex_layer_bytes(il, has_exps ? LLAMA_FLEX_REST : LLAMA_FLEX_ALL);
+                ok = flex_move_part(il, false, true, false) && ok;
+            }
+            if (has_exps && exps && !fl.exps_on_gpu) {
+                moved += flex_layer_bytes(il, LLAMA_FLEX_EXPS);
+                ok = flex_move_part(il, true, true, false) && ok;
+            }
+        }
+    }
+    pimpl->park_quiet = false;
+    if (bytes) {
+        *bytes = moved;
+    }
+    return ok;
+}
+
+bool llama_model::park_was_on_gpu(int il) const {
+    const auto it = pimpl->park_prev.find(il);
+    return it == pimpl->park_prev.end() || it->second.first;
 }
 
 bool llama_model::flex_move(int il, bool to_gpu, bool from_file, int part) const {
@@ -2686,6 +2783,10 @@ bool llama_model::flex_move_part(int il, bool exps, bool to_gpu, bool from_file)
     on_gpu = to_gpu;
     const double t_ms = (ggml_time_us() - t0) / 1000.0;
 
+    if (fl.park_only || pimpl->park_quiet) {
+        // llama_park moves every group at once and logs one summary
+        return true;
+    }
     size_t dev_free = 0, dev_total = 0;
     if (auto * dev = ggml_backend_buft_get_device(buft)) {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
@@ -4093,6 +4194,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.dual_buffer                 =*/ false,
+        /*.park                        =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
     };

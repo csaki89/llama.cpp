@@ -369,6 +369,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool dual_buffer;     // also keep repacked CPU weights in the original format in the host buffer, so that op offload can use them
+        bool park;            // every GPU weight also gets a GPU-format copy in the pinned host buffer, so llama_park can free the device (needs no mmap)
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
     };
@@ -846,6 +847,13 @@ extern "C" {
     // to the growth steps, with the zone rule's layer moves), e.g. for a whole prompt before its first batch; the shrink does not go
     // below it while the prompt fills it. Without a dynamic KV it does nothing and returns true; false if the KV could not grow enough.
     LLAMA_API bool llama_memory_reserve(struct llama_context * ctx, uint32_t n_tokens);
+
+    // Park (park = true): free every device allocation of the context and the model (weights, K/V, compute buffers); the weights
+    // switch to their pinned host copies (llama_model_params.park) and the K/V moves to the host, so the model still runs on the CPU.
+    // Unpark (park = false): the weights and the K/V go back to the device (DMA from the pinned copies), the zones are measured again.
+    // Returns false if the model has no park copies or a step failed (an unpark that failed leaves the model parked).
+    LLAMA_API bool llama_park(struct llama_context * ctx, bool park);
+    LLAMA_API bool llama_is_parked(const struct llama_context * ctx);
 
     //
     // State / sessions

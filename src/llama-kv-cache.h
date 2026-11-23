@@ -265,6 +265,10 @@ public:
     // legacy (test): CPU buffer and a full synchronous copy, the first implementation
     bool flex_move(int32_t il, bool to_gpu, ggml_backend_t backend = nullptr, bool legacy = false);
 
+    // llama_park: the K/V of every layer on a device to the device host buffer (to_host), or back to the buffer type it had there
+    // (growable sections again where possible); a full relayout at the current size, the used rows are copied
+    bool park_kv(bool to_host);
+
     // dynamic KV (DESIGN-3zone.md 6.2): the cache grows in chunks up to max_size; false if this cache cannot (shared layers, transposed V, ...)
     bool set_dynamic(uint32_t max_size, size_t chunk_bytes);
     bool     is_dynamic()   const { return dyn_max > 0; }
@@ -308,6 +312,10 @@ private:
         ggml_backend_buffer_ptr spare = nullptr; // host buffer kept after the layer went back, reused when it goes off again
     };
     std::map<int32_t, flex_kv> flex_kv_layers;
+
+    // relayout: the buffer type of each layer instead of its current one (null = keep), set by park_kv
+    std::vector<ggml_backend_buffer_type_t> relayout_target;
+    std::vector<ggml_backend_buffer_type_t> park_bufts; // the device buffer type of each layer before the park (null = was on the host)
 
     const llama_model & model;
     const llama_hparams & hparams;

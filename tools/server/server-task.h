@@ -32,6 +32,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_PARK,   // dual-buffer fork: llama_park (POST /park), when no slot is processing
+    SERVER_TASK_TYPE_UNPARK, // POST /unpark
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -647,6 +649,17 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+// used by POST /park and /unpark
+struct server_task_result_park : server_task_result {
+    bool   success = false;
+    bool   parked  = false;
+    double t_ms    = 0.0;
+
+    virtual json to_json() override {
+        return json { { "success", success }, { "parked", parked }, { "timings", { { "ms", t_ms } } } };
+    }
 };
 
 struct server_task_result_slot_erase : server_task_result {

@@ -403,6 +403,15 @@ private:
     bool flex_move_layer(int il, bool to_gpu, int part = 0);
 
 public:
+    // llama_park: free every device allocation (weights to their pinned copies, K/V to the host, compute buffers), or load it back
+    bool park(bool to_park);
+    bool is_parked() const { return parked; }
+
+private:
+    bool parked          = false;
+    bool park_op_offload = true; // cparams.op_offload before the park
+
+public:
     // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)
     bool     zones_reserve(uint32_t n_tokens);
 

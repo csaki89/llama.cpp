@@ -1170,6 +1170,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set by buft_for_tensor() for a GPU weight in the flex layer range: buffer type of its CPU twin
     ggml_backend_buffer_type_t flex_cpu_buft = nullptr;
     ggml_backend_buffer_type_t flex_host_buft = nullptr; // set if the twin is repacked: original-format copy in the host buffer
+    bool park_tensor = false; // the twin is a park copy (pinned GPU-format copy of a weight outside the flex band)
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1352,6 +1353,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // park copies: the other GPU weights (zone 1, the output layer) get a GPU-format copy in the pinned host buffer; parked, the
+        // CPU computes from it, unparked it is the DMA source of the upload
+        if (!flex_cpu_buft && park_copies && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
+            auto * dev_w = ggml_backend_buft_get_device(buft);
+            if (dev_w && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_ACCEL &&
+                    !ggml_backend_buft_is_host(buft) && strstr(ggml_backend_buft_name(buft), "Split") == nullptr) {
+                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev_w);
+                ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (host_buft && cpu_dev && weight_buft_supported(hparams, t_meta, op, host_buft, cpu_dev)) {
+                    flex_cpu_buft = host_buft;
+                    park_tensor   = true;
+                }
+            }
+        }
+
         return buft;
     };
 
@@ -1433,7 +1449,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // the experts of a whole flex layer get their own buffer: they go to the CPU before the rest of the layer (attention, K/V)
     const bool flex_exps = flex_cpu_buft && flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi && tn.str().find("_exps") != std::string::npos;
-    ggml_context * ctx = ctx_for_buft(buft, flex_cpu_buft ? tn.bid : -1, flex_exps);
+    // a park group: its own key range, so it never shares a buffer with a flex layer (e.g. the partial MoE flex layers)
+    const int flex_key = park_tensor ? FLEX_PARK_BASE + (tn.bid >= 0 ? tn.bid : FLEX_PARK_NOLAYER) : tn.bid;
+    ggml_context * ctx = ctx_for_buft(buft, flex_cpu_buft ? flex_key : -1, flex_exps);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1473,7 +1491,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const auto it_w = weights_map.find(tn.str());
         GGML_ASSERT(it_w != weights_map.end());
-        flex_pairs.push_back({ tensor, twin, host, tn.bid, buft, it_w->second.idx, it_w->second.offs, flex_exps });
+        flex_pairs.push_back({ tensor, twin, host, flex_key, buft, it_w->second.idx, it_w->second.offs, flex_exps, park_tensor });
     }
 
     return tensor;
