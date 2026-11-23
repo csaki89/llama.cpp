@@ -1447,6 +1447,12 @@ struct llama_model::impl {
         size_t buf_idx_exps  = SIZE_MAX;
         bool   exps_on_gpu   = true;
         bool   park_only     = false; // park copies (zone 1, the output layer): only llama_park moves them, not the zone rule
+        // a park group demoted while parked: its weights repacked for the CPU (kept until dropped); the pinned copies are then
+        // held by the pairs' host tensors (in demote_ctxs), the repacked ones by the model tensors (parked) or the twins (unparked)
+        bool   demoted       = false;
+        size_t demote_bytes  = 0;
+        std::vector<ggml_context_ptr>        demote_ctxs;
+        std::vector<ggml_backend_buffer_ptr> demote_bufs;
         std::vector<llama_model_loader::flex_pair> pairs;
     };
     std::map<int, flex_layer> flex;
@@ -2664,6 +2670,121 @@ bool llama_model::park_move(bool to_gpu, size_t * bytes) const {
         *bytes = moved;
     }
     return ok;
+}
+
+size_t llama_model::park_demoted_bytes() const {
+    size_t res = 0;
+    for (const auto & [il, fl] : pimpl->flex) {
+        res += fl.demoted ? fl.demote_bytes : 0;
+    }
+    return res;
+}
+
+size_t llama_model::park_demote() const {
+    // what the demote needs: the repackable weights of the parked groups not demoted yet
+    size_t need = 0;
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.park_only && !fl.on_gpu && !fl.demoted) {
+            for (const auto & p : fl.pairs) {
+                need += p.demote_buft ? ggml_nbytes(p.gpu) : 0;
+            }
+        }
+    }
+    if (need == 0) {
+        return 0;
+    }
+    // the RAM guard: the free RAM (cgroup limit if any) minus a reserve
+    size_t ram_free = 0, ram_total = 0, cg_free = 0, cg_limit = 0;
+    const char * src = "system";
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
+    }
+    if (get_cgroup_free(cg_free, cg_limit)) {
+        ram_free  = cg_free;
+        ram_total = cg_limit;
+        src       = "cgroup limit";
+    }
+    if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
+        ram_free  = (size_t) atoll(env) * 1024 * 1024;
+        ram_total = std::max(ram_total, ram_free);
+        src       = "env override";
+    }
+    const size_t reserve = std::max((size_t) 1 << 30, ram_total / 20);
+    if (ram_total > 0 && ram_free < need + reserve) {
+        LLAMA_LOG_WARN("%s: park: no demote, the repacked copies (%.0f MiB) do not fit the free RAM (%.0f MiB, %s, reserve %.0f MiB); the CPU computes from the pinned copies\n",
+            __func__, need / 1048576.0, ram_free / 1048576.0, src, reserve / 1048576.0);
+        return 0;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t done = 0;
+    for (auto & [il, fl] : pimpl->flex) {
+        if (!fl.park_only || fl.on_gpu || fl.demoted) {
+            continue;
+        }
+        std::map<ggml_backend_buffer_type_t, std::vector<llama_model_loader::flex_pair *>> by_buft;
+        for (auto & p : fl.pairs) {
+            if (p.demote_buft && !p.host) {
+                by_buft[p.demote_buft].push_back(&p);
+            }
+        }
+        for (auto & [buft, ps] : by_buft) {
+            ggml_init_params ip = { ggml_tensor_overhead()*(ps.size() + 1), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(ip));
+            std::vector<ggml_tensor *> reps;
+            for (auto * p : ps) {
+                ggml_tensor * r = ggml_dup_tensor(ctx.get(), p->gpu);
+                ggml_set_name(r, ggml_get_name(p->gpu));
+                reps.push_back(r);
+            }
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: park: allocating %s for the demote failed, the CPU computes from the pinned copies\n", __func__, ggml_backend_buft_name(buft));
+                continue;
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (size_t i = 0; i < ps.size(); ++i) {
+                auto * p = ps[i];
+                // the model tensor holds the pinned copy while parked: the repack buffer converts it on the set
+                ggml_backend_tensor_set(reps[i], p->gpu->data, 0, ggml_nbytes(p->gpu));
+                flex_swap_storage(p->gpu, reps[i]); // the model computes from the repacked copy
+                p->host = reps[i];                  // the pinned copy: the source of the upload on the unpark
+                fl.demote_bytes += ggml_nbytes(p->gpu);
+                done += ggml_nbytes(p->gpu);
+            }
+            fl.demote_ctxs.push_back(std::move(ctx));
+            fl.demote_bufs.push_back(std::move(buf));
+        }
+        fl.demoted = !fl.demote_bufs.empty();
+    }
+    LLAMA_LOG_INFO("%s: park: demoted %.2f MiB (repacked for the CPU from the pinned copies) in %.1f ms; kept until dropped\n",
+        __func__, done / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+    return done;
+}
+
+size_t llama_model::park_drop_demoted() const {
+    size_t freed = 0;
+    for (auto & [il, fl] : pimpl->flex) {
+        if (!fl.demoted) {
+            continue;
+        }
+        for (auto & p : fl.pairs) {
+            if (!p.host || !p.park) {
+                continue;
+            }
+            // the pinned copy goes back where it was: the model tensor (parked) or the twin (unparked)
+            flex_swap_storage(fl.on_gpu ? p.cpu : p.gpu, p.host);
+            p.host = nullptr;
+        }
+        freed += fl.demote_bytes;
+        fl.demote_bytes = 0;
+        fl.demote_bufs.clear();
+        fl.demote_ctxs.clear();
+        fl.demoted = false;
+    }
+    if (freed > 0) {
+        LLAMA_LOG_INFO("%s: park: the demoted (repacked) copies were dropped (%.2f MiB)\n", __func__, freed / 1048576.0);
+    }
+    return freed;
 }
 
 bool llama_model::park_was_on_gpu(int il) const {

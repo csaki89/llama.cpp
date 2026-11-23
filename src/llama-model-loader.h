@@ -190,6 +190,7 @@ struct llama_model_loader {
         size_t        offs;
         bool          exps; // an expert tensor of a whole flex layer (own buffer, it moves without the rest of the layer)
         bool          park = false; // a park copy (cpu = GPU-format copy in the pinned host buffer), only llama_park moves it
+        ggml_backend_buffer_type_t demote_buft = nullptr; // park copy: the CPU (repack) buffer type of a demote, null = not repackable
     };
     // park copies (llama_model_params.park): every GPU weight outside the flex band gets a pinned GPU-format copy; their groups
     // are keyed from FLEX_PARK_BASE (+ layer), the tensors of no layer (output) at FLEX_PARK_BASE + FLEX_PARK_NOLAYER

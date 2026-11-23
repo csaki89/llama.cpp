@@ -998,6 +998,11 @@ struct llama_model {
     bool park_available() const;
     bool park_move(bool to_gpu, size_t * bytes = nullptr) const;
     bool park_was_on_gpu(int il) const; // a flex layer was on the device before the park
+    // parked and running on the CPU: the park copies repacked for the CPU (a demote, if the RAM allows), kept until dropped;
+    // returns the bytes repacked now (0: nothing to do, or no room: the CPU computes from the pinned copies)
+    size_t park_demote() const;
+    size_t park_drop_demoted() const; // frees the repacked copies, returns their bytes
+    size_t park_demoted_bytes() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 

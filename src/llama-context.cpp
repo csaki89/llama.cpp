@@ -2612,6 +2612,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    // parked and running on the CPU: once per park, the park copies are repacked for the CPU (a demote, if the RAM allows)
+    if (parked && !park_demote_tried) {
+        park_demote_tried = true;
+        if (model.park_demote() > 0) {
+            sched_need_reserve = true;
+            gf_res_prev_active = nullptr;
+        }
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -5409,6 +5418,26 @@ bool llama_is_parked(const llama_context * ctx) {
     return ctx ? ctx->is_parked() : false;
 }
 
+size_t llama_park_drop_demoted(llama_context * ctx) {
+    return ctx ? ctx->park_drop_demoted() : 0;
+}
+
+size_t llama_park_demoted_bytes(const llama_context * ctx) {
+    return ctx ? ctx->get_model().park_demoted_bytes() : 0;
+}
+
+size_t llama_context::park_drop_demoted() {
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    const size_t freed = model.park_drop_demoted();
+    if (freed > 0) {
+        sched_need_reserve = true;
+        gf_res_prev_active = nullptr;
+    }
+    return freed;
+}
+
 bool llama_context::park(bool to_park) {
     if (to_park == parked) {
         return true;
@@ -5469,6 +5498,7 @@ bool llama_context::park(bool to_park) {
         park_op_offload    = cparams.op_offload;
         cparams.op_offload = false;
         parked = true;
+        park_demote_tried = false;
     } else {
         // weights back from the pinned copies (DMA), the flex layers to their placement before the park
         ok = model.park_move(true, &w_bytes);

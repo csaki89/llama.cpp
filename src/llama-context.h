@@ -406,10 +406,12 @@ public:
     // llama_park: free every device allocation (weights to their pinned copies, K/V to the host, compute buffers), or load it back
     bool park(bool to_park);
     bool is_parked() const { return parked; }
+    size_t park_drop_demoted();
 
 private:
     bool parked          = false;
     bool park_op_offload = true; // cparams.op_offload before the park
+    bool park_demote_tried = false; // the demote of this park was tried (once, at the first decode while parked)
 
 public:
     // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)

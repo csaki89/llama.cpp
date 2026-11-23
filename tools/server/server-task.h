@@ -34,6 +34,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_PARK,   // dual-buffer fork: llama_park (POST /park), when no slot is processing
     SERVER_TASK_TYPE_UNPARK, // POST /unpark
+    SERVER_TASK_TYPE_PARK_DROP, // POST /park/drop: free the demoted (repacked) copies
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -656,9 +657,10 @@ struct server_task_result_park : server_task_result {
     bool   success = false;
     bool   parked  = false;
     double t_ms    = 0.0;
+    size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
 
     virtual json to_json() override {
-        return json { { "success", success }, { "parked", parked }, { "timings", { { "ms", t_ms } } } };
+        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "timings", { { "ms", t_ms } } } };
     }
 };
 

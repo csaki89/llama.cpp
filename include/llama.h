@@ -854,6 +854,10 @@ extern "C" {
     // Returns false if the model has no park copies or a step failed (an unpark that failed leaves the model parked).
     LLAMA_API bool llama_park(struct llama_context * ctx, bool park);
     LLAMA_API bool llama_is_parked(const struct llama_context * ctx);
+    // Parked, the first decode repacks the park copies for the CPU (a demote, if the RAM allows); the repacked copies stay
+    // (parked and unparked) until dropped here. Returns the bytes freed / held.
+    LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
+    LLAMA_API size_t llama_park_demoted_bytes(const struct llama_context * ctx);
 
     //
     // State / sessions

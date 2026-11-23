@@ -1171,6 +1171,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t flex_cpu_buft = nullptr;
     ggml_backend_buffer_type_t flex_host_buft = nullptr; // set if the twin is repacked: original-format copy in the host buffer
     bool park_tensor = false; // the twin is a park copy (pinned GPU-format copy of a weight outside the flex band)
+    ggml_backend_buffer_type_t park_demote_buft = nullptr; // its repacked CPU buffer type (a demote while parked), if any
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1364,6 +1365,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (host_buft && cpu_dev && weight_buft_supported(hparams, t_meta, op, host_buft, cpu_dev)) {
                     flex_cpu_buft = host_buft;
                     park_tensor   = true;
+                    // the CPU buffer type a flex twin would get: a repack buffer is the demote target (allocated only then)
+                    buft_list_t cpu_only;
+                    for (const auto & e : *buft_list_cpu) {
+                        if (ggml_backend_dev_type(e.first) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            cpu_only.push_back(e);
+                        }
+                    }
+                    ggml_backend_buffer_type_t rb = select_weight_buft(hparams, t_meta, op, &cpu_only);
+                    if (rb && !ggml_backend_buft_is_host(rb)) {
+                        park_demote_buft = rb;
+                    }
                 }
             }
         }
@@ -1491,7 +1503,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const auto it_w = weights_map.find(tn.str());
         GGML_ASSERT(it_w != weights_map.end());
-        flex_pairs.push_back({ tensor, twin, host, flex_key, buft, it_w->second.idx, it_w->second.offs, flex_exps, park_tensor });
+        flex_pairs.push_back({ tensor, twin, host, flex_key, buft, it_w->second.idx, it_w->second.offs, flex_exps, park_tensor, park_demote_buft });
     }
 
     return tensor;

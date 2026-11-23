@@ -3184,6 +3184,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_PARK:
             case SERVER_TASK_TYPE_UNPARK:
+            case SERVER_TASK_TYPE_PARK_DROP:
                 {
                     // only between requests: a park moves every weight and the K/V
                     bool busy = false;
@@ -3197,7 +3198,13 @@ private:
                     const int64_t t0 = ggml_time_us();
                     auto res = std::make_unique<server_task_result_park>();
                     res->id      = task.id;
-                    res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
+                    if (task.type == SERVER_TASK_TYPE_PARK_DROP) {
+                        res->success = true;
+                        res->demoted = llama_park_drop_demoted(ctx_tgt);
+                    } else {
+                        res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
+                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
+                    }
                     res->parked  = llama_is_parked(ctx_tgt);
                     res->t_ms    = (ggml_time_us() - t0) / 1000.0;
                     queue_results.send(std::move(res));
@@ -5890,12 +5897,12 @@ void server_routes::init_routes() {
     };
 
     // dual-buffer fork: free the device (park) or load it back (unpark), see llama_park
-    auto park_handler = [this](bool park) {
-        return [this, park](const server_http_req & req) {
+    auto park_handler = [this](server_task_type type) {
+        return [this, type](const server_http_req & req) {
             auto res = create_response();
             auto & rd = res->rd;
             {
-                server_task task(park ? SERVER_TASK_TYPE_PARK : SERVER_TASK_TYPE_UNPARK);
+                server_task task(type);
                 task.id = rd.get_new_id();
                 rd.post_task(std::move(task));
             }
@@ -5912,8 +5919,9 @@ void server_routes::init_routes() {
             return res;
         };
     };
-    this->post_park   = park_handler(true);
-    this->post_unpark = park_handler(false);
+    this->post_park      = park_handler(SERVER_TASK_TYPE_PARK);
+    this->post_unpark    = park_handler(SERVER_TASK_TYPE_UNPARK);
+    this->post_park_drop = park_handler(SERVER_TASK_TYPE_PARK_DROP);
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
