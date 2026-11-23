@@ -441,6 +441,10 @@ private:
     // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
     // rest: the KV is empty at its initial size, the budget is measured again (no check against the booking)
     size_t   zones_clamp(bool up = false, bool rest = false);
+    // whether the device's free memory is measured (else the booking: the device total minus what the model and context hold on it)
+    bool     zones_mem_measured(ggml_backend_dev_t dev);
+    size_t   zones_booked_free(ggml_backend_dev_t dev) const;
+    int      zones_measured = -1; // -1 = not asked yet
     // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
     void     zones_log_state(const char * what);
     ggml_backend_dev_t zones_dev() const; // the device the budget is for

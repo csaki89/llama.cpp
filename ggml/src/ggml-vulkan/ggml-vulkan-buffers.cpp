@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <map>
+#include <numeric>
 #include <set>
 #include <cstdlib>
 #include <mutex>
@@ -971,6 +973,111 @@ static bool vk_sparse_bind(vk_sparse_arena * a, const std::vector<size_t> & idx,
     return ok;
 }
 
+// the heap usage of a memory type by the memory budget (VK_EXT_memory_budget); false without it
+static bool vk_heap_usage(vk_device & device, uint32_t mem_type, size_t & usage) {
+    if (device->idx >= vk_instance.device_supports_membudget.size() || !vk_instance.device_supports_membudget[device->idx]) {
+        return false;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget;
+    vk::PhysicalDeviceMemoryProperties2 mp;
+    mp.pNext = &budget;
+    device->physical_device.getMemoryProperties2(&mp);
+    const uint32_t heap = mp.memoryProperties.memoryTypes[mem_type].heapIndex;
+    usage = (size_t) budget.heapUsage[heap];
+    return true;
+}
+
+// the unit the driver books one allocation of `size` bytes with: the heap usage change of one allocation, the same twice and a
+// multiple of the size; 0 if it cannot be measured (note says why). Once per device.
+static size_t vk_sparse_booking_unit(vk_device & device, uint32_t mem_type, size_t size, std::string & note) {
+    static std::mutex mtx;
+    static std::map<size_t, std::pair<size_t, std::string>> done;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = done.find(device->idx);
+    if (it != done.end()) {
+        note = it->second.second;
+        return it->second.first;
+    }
+    size_t unit = 0;
+    size_t d[2] = { 0, 1 };
+    bool measured = true;
+    for (int i = 0; i < 2 && measured; ++i) {
+        size_t u0 = 0, u1 = 0;
+        if (!vk_heap_usage(device, mem_type, u0)) {
+            measured = false;
+            break;
+        }
+        vk::DeviceMemory m;
+        try {
+            m = device->device.allocateMemory(vk::MemoryAllocateInfo(size, mem_type));
+        } catch (const vk::SystemError &) {
+            measured = false;
+            break;
+        }
+        vk_heap_usage(device, mem_type, u1);
+        device->device.freeMemory(m);
+        d[i] = u1 > u0 ? u1 - u0 : 0;
+    }
+    if (!measured) {
+        note = " (unclear: no VK_EXT_memory_budget to measure it)";
+    } else if (d[0] > 0 && d[0] == d[1] && d[0] % size == 0) {
+        unit = d[0];
+        note = " (measured)";
+    } else {
+        note = " (unclear: the heap usage changed by " + std::to_string(d[0]) + " / " + std::to_string(d[1]) + " bytes)";
+    }
+    done[device->idx] = { unit, note };
+    return unit;
+}
+
+// the smallest allocation size (from `base`, doubled, a multiple of it) whose memory the driver gives back when freed: a few
+// allocations of it, then freed, must bring the heap usage back to where it was (a driver can serve small allocations from
+// larger blocks it keeps); 0 if it cannot be measured (no memory budget) or no size up to the limit does. Once per device.
+static size_t vk_sparse_release_unit(vk_device & device, uint32_t mem_type, size_t base, std::string & note) {
+    static std::mutex mtx;
+    static std::map<size_t, std::pair<size_t, std::string>> done;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = done.find(device->idx);
+    if (it != done.end()) {
+        note = it->second.second;
+        return it->second.first;
+    }
+    const size_t limit = (size_t) 64 << 20;
+    const int    n     = 8;
+    size_t res = 0;
+    note = " (unclear: no VK_EXT_memory_budget to measure it)";
+    size_t u_probe = 0;
+    if (vk_heap_usage(device, mem_type, u_probe)) {
+        note = " (unclear: no size up to " + std::to_string(limit >> 20) + " MiB was given back in full)";
+        for (size_t s = base; s <= limit && res == 0; s *= 2) {
+            size_t u0 = 0, u1 = 0, u2 = 0;
+            vk_heap_usage(device, mem_type, u0);
+            std::vector<vk::DeviceMemory> ms;
+            try {
+                for (int i = 0; i < n; ++i) {
+                    ms.push_back(device->device.allocateMemory(vk::MemoryAllocateInfo(s, mem_type)));
+                }
+            } catch (const vk::SystemError &) {
+                for (auto & m : ms) {
+                    device->device.freeMemory(m);
+                }
+                break;
+            }
+            vk_heap_usage(device, mem_type, u1);
+            for (auto & m : ms) {
+                device->device.freeMemory(m);
+            }
+            vk_heap_usage(device, mem_type, u2);
+            if (u1 >= u0 + n*s && u2 <= u0) {
+                res  = s;
+                note = " (measured: " + std::to_string(n) + " allocations of it freed bring the heap usage back)";
+            }
+        }
+    }
+    done[device->idx] = { res, note };
+    return res;
+}
+
 static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return nullptr;
@@ -1001,17 +1108,12 @@ static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, siz
         return no("the compute queue family " + std::to_string(qf) + " has no VK_QUEUE_SPARSE_BINDING_BIT");
     }
 
-    size_t chunk = 2u << 20;
-    if (const char * env = getenv("GGML_VK_SPARSE_CHUNK_KIB"); env && atoll(env) > 0) {
-        chunk = (size_t) atoll(env) << 10;
-    }
-
     vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
     if (device->buffer_device_address) {
         usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
     // the sparse block is the memory requirement's alignment: probe it with a small buffer
-    vk::BufferCreateInfo bci(vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, chunk, usage, vk::SharingMode::eExclusive);
+    vk::BufferCreateInfo bci(vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, 1u << 20, usage, vk::SharingMode::eExclusive);
     vk::MemoryRequirements req;
     try {
         vk::Buffer probe = device->device.createBuffer(bci);
@@ -1021,7 +1123,49 @@ static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, siz
         return no(std::string("creating a sparse buffer failed: ") + e.what());
     }
     const size_t block = std::max<size_t>(req.alignment, 1);
-    chunk = block * ((chunk + block - 1) / block);
+    int probe_type = -1;
+    {
+        const vk::PhysicalDeviceMemoryProperties mp0 = device->physical_device.getMemoryProperties();
+        for (uint32_t i = 0; i < mp0.memoryTypeCount; ++i) {
+            if ((req.memoryTypeBits & (1u << i)) && (mp0.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                probe_type = (int) i;
+                break;
+            }
+        }
+    }
+    if (probe_type < 0) {
+        return no("no device local memory type for a sparse buffer");
+    }
+    // the chunk, from the device like the ggml-cuda VMM: the sparse block (the alignment), the unit the driver books an allocation with
+    // (measured: the memory budget's heap usage before and after one block allocation, twice) and the allocation count limit (the
+    // chunks of one KV arena use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
+    std::string unit_note;
+    const size_t unit = vk_sparse_booking_unit(device, (uint32_t) probe_type, block, unit_note);
+    size_t chunk = block;
+    if (unit > 0 && std::lcm(block, unit) <= 32*block) {
+        chunk = std::lcm(block, unit);
+    }
+    // a chunk the driver gives back when it is freed (the shrink must return the memory)
+    std::string release_note;
+    const size_t release = vk_sparse_release_unit(device, (uint32_t) probe_type, chunk, release_note);
+    chunk = std::max(chunk, release);
+    const uint32_t alloc_limit = device->properties.limits.maxMemoryAllocationCount;
+    const size_t   max_chunks  = std::max<size_t>(1, alloc_limit / 4);
+    const size_t   count_min   = (std::max<size_t>(size, 1) + max_chunks - 1) / max_chunks;
+    if (chunk < count_min) {
+        chunk = chunk * ((count_min + chunk - 1) / chunk);
+    }
+    const char * env_chunk = getenv("GGML_VK_SPARSE_CHUNK_KIB");
+    if (env_chunk && atoll(env_chunk) > 0) {
+        chunk = block * std::max<size_t>(1, (((size_t) atoll(env_chunk) << 10) + block - 1) / block);
+    }
+    {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        if (logged.insert(device->name + "/chunk").second) {
+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s\n",
+                device->name.c_str(), block, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk, env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "");
+        }
+    }
     const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
     if (reserved > device->physical_device.getProperties().limits.sparseAddressSpaceSize) {
         return no("the KV (" + std::to_string(reserved) + " bytes) is larger than sparseAddressSpaceSize");
@@ -1297,7 +1441,24 @@ static void ggml_backend_vk_sparse_clear(ggml_backend_buffer_t buffer, uint8_t v
     }
 }
 
+// true if ggml_backend_dev_memory measures the free memory (VK_EXT_memory_budget); without it the free memory is the heap size
+static bool ggml_backend_vk_dev_memory_measured(ggml_backend_dev_t dev) {
+    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
+    const bool measured = ctx && ctx->device < vk_instance.device_supports_membudget.size() && vk_instance.device_supports_membudget[ctx->device];
+    if (!measured && ctx) {
+        static std::mutex mtx;
+        static std::set<size_t> logged;
+        std::lock_guard<std::mutex> lock(mtx);
+        if (logged.insert(ctx->device).second) {
+            GGML_LOG_WARN("ggml_backend_vk_dev_memory_measured: %s: no VK_EXT_memory_budget%s: the free memory it reports is the heap size, not a measurement\n",
+                ctx->name.c_str(), getenv("GGML_VK_DISABLE_MEMORY_BUDGET") ? " (GGML_VK_DISABLE_MEMORY_BUDGET)" : "");
+        }
+    }
+    return measured;
+}
+
 void * ggml_vk_sparse_proc_address(const char * name) {
+    if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }
     if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }
     if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0)    { return (void *) ggml_backend_vk_vmm_arena_alignment; }
     if (strcmp(name, "ggml_backend_vmm_arena_buffer") == 0)       { return (void *) ggml_backend_vk_vmm_arena_buffer; }

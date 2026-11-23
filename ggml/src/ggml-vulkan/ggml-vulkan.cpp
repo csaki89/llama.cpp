@@ -5491,7 +5491,8 @@ void ggml_vk_instance_init() {
             }
         }
 
-        vk_instance.device_supports_membudget.push_back(membudget_supported);
+        // GGML_VK_DISABLE_MEMORY_BUDGET (test aid): as if the device had no VK_EXT_memory_budget (the free memory is not measured)
+        vk_instance.device_supports_membudget.push_back(membudget_supported && getenv("GGML_VK_DISABLE_MEMORY_BUDGET") == nullptr);
 
         bool host_buffer_import = false;
         if (external_memory_host_supported) {

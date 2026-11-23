@@ -193,6 +193,9 @@ struct zones_mem_parts {
     std::vector<std::pair<const char *, llama_memory_i *>> fixed;
 };
 
+// the kernel's free VRAM of the card (amdgpu sysfs), below
+static bool zones_sysfs_free(size_t total, size_t & free_out);
+
 static zones_mem_parts zones_parts(llama_memory_i * mem) {
     zones_mem_parts res;
     if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
@@ -1048,7 +1051,13 @@ void llama_context::zones_step(uint32_t n_tokens) {
     if (rule && !zones_headroom_set) {
         zones_headroom_set = true;
         size_t dev_free = 0, dev_total = 0;
-        ggml_backend_dev_memory(model.flex_gpu_dev(model.flex_layers().front()), &dev_free, &dev_total);
+        ggml_backend_dev_t zdev = model.flex_gpu_dev(model.flex_layers().front());
+        ggml_backend_dev_memory(zdev, &dev_free, &dev_total);
+        if (!zones_mem_measured(zdev)) {
+            // not measured by the backend: the kernel's figure if there is one, else the booking
+            size_t sys_free = 0;
+            dev_free = zones_sysfs_free(dev_total, sys_free) ? sys_free : zones_booked_free(zdev);
+        }
         zones_headroom = (int64_t) dev_free - (int64_t) zones_vram_margin;
         if (const char * env = getenv("LLAMA_ZONES_HEADROOM_MIB")) { // test aid
             zones_headroom = (int64_t) atoll(env) * 1024 * 1024;
@@ -1234,12 +1243,18 @@ size_t llama_context::zones_clamp(bool up, bool rest) {
     // the kernel's own figure where there is one: the booked free memory is checked against it, the lower one counts
     size_t sys_free = 0;
     const bool sys = zones_sysfs_free(dev_total, sys_free);
+    // a backend that does not measure (the free memory it reports is the total): the driver figure does not count
+    const bool drv = zones_mem_measured(dev);
+    if (!drv && !sys) {
+        // nothing measures the device: the budget follows the booking only
+        return zones_booked_free(dev);
+    }
     const int64_t booked = zones_headroom + (int64_t) zones_vram_margin;
     if (!rest && sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
         LLAMA_LOG_WARN("%s: zones: the booked free memory (%.0f MiB) is off from the device: driver %.0f MiB, sysfs %.0f MiB\n", __func__,
             booked / 1048576.0, dev_free / 1048576.0, sys_free / 1048576.0);
     }
-    const size_t free_real = sys ? std::min(dev_free, sys_free) : dev_free;
+    const size_t free_real = sys ? (drv ? std::min(dev_free, sys_free) : sys_free) : dev_free;
     const int64_t real = (int64_t) free_real - (int64_t) zones_vram_margin;
     if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
         // at rest only a change of 64 MiB or more is logged
@@ -1255,6 +1270,61 @@ size_t llama_context::zones_clamp(bool up, bool rest) {
 
 llama_kv_cache * llama_context::zones_kv() const {
     return zones_parts(memory.get()).kv;
+}
+
+bool llama_context::zones_mem_measured(ggml_backend_dev_t dev) {
+    if (zones_measured >= 0) {
+        return zones_measured != 0;
+    }
+    // a backend tells whether ggml_backend_dev_memory measures (Vulkan without VK_EXT_memory_budget reports the heap size);
+    // without the query it is a measurement (CUDA/HIP)
+    bool measured = true;
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto fn = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_memory_measured") : nullptr;
+    if (fn) {
+        measured = fn(dev);
+    }
+    zones_measured = measured ? 1 : 0;
+    if (!measured) {
+        size_t sys_free = 0, dev_free = 0, dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        const bool sys = zones_sysfs_free(dev_total, sys_free);
+        LLAMA_LOG_WARN("%s: zones: %s does not measure its free memory (no memory budget): the budget follows %s\n", __func__,
+            ggml_backend_dev_name(dev), sys ? "the kernel's sysfs figure" : "the booking only (the device total minus the model weights, the K/V and the compute buffers on it)");
+    }
+    return measured;
+}
+
+size_t llama_context::zones_booked_free(ggml_backend_dev_t dev) const {
+    size_t dev_free = 0, dev_total = 0;
+    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    size_t used = 0;
+    for (const auto & [buft, size] : model.memory_breakdown()) {
+        if (ggml_backend_buft_get_device(buft) == dev && !ggml_backend_buft_is_host(buft)) {
+            used += size;
+        }
+    }
+    const auto parts = zones_parts(memory.get());
+    std::vector<const llama_kv_cache *> kvs;
+    if (parts.kv) {
+        kvs.push_back(parts.kv);
+    }
+    for (const auto & [name, part] : parts.fixed) {
+        if (const auto * kv = dynamic_cast<const llama_kv_cache *>(part)) {
+            kvs.push_back(kv);
+        }
+    }
+    for (const auto * kv : kvs) {
+        used += (size_t) kv->get_size() * kv->cell_bytes(true);
+    }
+    if (sched) {
+        for (const auto & b : backends) {
+            if (ggml_backend_get_device(b.get()) == dev) {
+                used += ggml_backend_sched_get_buffer_size(sched.get(), b.get());
+            }
+        }
+    }
+    return dev_total > used ? dev_total - used : 0;
 }
 
 size_t llama_context::zones_layer_kv_bytes(int il) const {
@@ -1330,21 +1400,24 @@ void llama_context::zones_log_state(const char * what) {
     }
 
     size_t dev_free = 0, dev_total = 0;
+    bool drv = true;
     if (ggml_backend_dev_t dev = zones_dev()) {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        drv = zones_mem_measured(dev);
     }
     size_t sys_free = 0;
     const bool sys = zones_sysfs_free(dev_total, sys_free);
-    // no budget yet (static KV): booked and budget are not known
+    // no budget yet (static KV): booked and budget are not known; a driver that does not measure: "-"
     const std::string booked = zones_headroom_set ? std::to_string((zones_headroom + (int64_t) zones_vram_margin) >> 20) : "-";
     const std::string budget = zones_headroom_set ? std::to_string(zones_headroom / 1048576) : "-";
+    const std::string drv_free = drv ? format("%.0f", dev_free / 1048576.0) : "-";
     LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s%s%s; "
-        "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %.0f, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
+        "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %s, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
         __func__, what,
         w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
         off.empty() ? "" : ", off: ", off.c_str(), exps.empty() ? "" : ", experts off: ", exps.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
         kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, fixed.c_str(), booked.c_str(),
-        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
+        drv_free.c_str(), sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
         zones_vram_margin / 1048576.0);
 }
 
