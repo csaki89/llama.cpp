@@ -859,6 +859,13 @@ extern "C" {
     LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
     LLAMA_API size_t llama_park_demoted_bytes(const struct llama_context * ctx);
 
+    // Host memory the backends allocated through their drivers (ggml_backend_dev_host_memory, e.g. the Vulkan host buffers) that
+    // the process' memory cgroup does not see (measured once: a host buffer allocated and cleared, the cgroup usage before and
+    // after). The RAM guards add it to the cgroup's usage; 0 without a cgroup or without the query (CUDA/HIP).
+    LLAMA_API size_t llama_backend_host_uncharged(void);
+    // all host memory those backends allocated through their drivers (seen by the cgroup or not)
+    LLAMA_API size_t llama_backend_host_allocated(void);
+
     //
     // State / sessions
     //

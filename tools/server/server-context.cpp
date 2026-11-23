@@ -3213,6 +3213,7 @@ private:
                         const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
                         res->success = llama_park(ctx_tgt, to_park);
                         res->demoted = llama_park_demoted_bytes(ctx_tgt);
+                        res->host_uncharged = llama_backend_host_uncharged();
                         // the projector on the device: loaded again on the CPU while parked, back on the device after
                         if (res->success && mctx && mparams_park_set && mparams_park.use_gpu) {
                             mtmd_context_params p = mparams_park;

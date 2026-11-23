@@ -683,6 +683,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
     ctx_http.is_ready.store(true);
 
     SRV_INF("%s", "model loaded\n");
+    // the driver host memory the memory cgroup does not see (Vulkan host buffers): the caller adds it to its RAM accounting
+    SRV_INF("host memory: %.0f MiB in backend host buffers, %.0f MiB not charged to the cgroup\n", llama_backend_host_allocated() / 1048576.0, llama_backend_host_uncharged() / 1048576.0);
 
     shutdown_handler = [&](int) {
         mcp_mgr.shutdown();

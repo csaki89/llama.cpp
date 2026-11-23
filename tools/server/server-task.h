@@ -658,9 +658,10 @@ struct server_task_result_park : server_task_result {
     bool   parked  = false;
     double t_ms    = 0.0;
     size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
+    size_t host_uncharged = 0; // driver host memory the memory cgroup does not see (llama_backend_host_uncharged)
 
     virtual json to_json() override {
-        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "timings", { { "ms", t_ms } } } };
+        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
     }
 };
 

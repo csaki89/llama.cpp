@@ -202,6 +202,12 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     buf->device = device;
     buf->size = size;
 
+    // driver-allocated host memory (an imported host pointer is the caller's own memory)
+    if (!import_ptr && !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+        buf->host_counted = mem_req.size;
+        ggml_vk_host_alloc_bytes += (int64_t) mem_req.size;
+    }
+
     if (device->buffer_device_address) {
         const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
         buf->bda_addr = device->device.getBufferAddress(addressInfo);
@@ -1615,7 +1621,17 @@ static size_t ggml_backend_vk_dev_internal_memory(ggml_backend_dev_t dev) {
     return ctx ? ggml_vk_internal_device_bytes((size_t) ctx->device) : 0;
 }
 
+std::atomic<int64_t> ggml_vk_host_alloc_bytes{0};
+
+// host memory the backend allocated through the driver (the Vulkan_Host buffers, staging, pinned copies); the caller measures
+// whether the process' cgroup sees it (a driver allocation, e.g. the GTT of a discrete card, need not be charged there)
+static size_t ggml_backend_vk_dev_host_memory(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return (size_t) std::max<int64_t>(0, ggml_vk_host_alloc_bytes.load());
+}
+
 void * ggml_vk_sparse_proc_address(const char * name) {
+    if (strcmp(name, "ggml_backend_dev_host_memory") == 0)       { return (void *) ggml_backend_vk_dev_host_memory; }
     if (strcmp(name, "ggml_backend_dev_internal_memory") == 0)   { return (void *) ggml_backend_vk_dev_internal_memory; }
     if (strcmp(name, "ggml_backend_dev_async_readback") == 0)   { return (void *) ggml_backend_vk_dev_async_readback; }
     if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }

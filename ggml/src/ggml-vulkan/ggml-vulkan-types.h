@@ -1049,17 +1049,25 @@ inline void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+// bytes of host memory (not device-local) the backend allocated through the driver (dual-buffer fork: the RAM accounting adds
+// what the process' cgroup does not see of it)
+extern std::atomic<int64_t> ggml_vk_host_alloc_bytes;
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
     vk::MemoryPropertyFlags memory_property_flags;
     void * ptr;
     size_t size = 0;
+    size_t host_counted = 0; // in ggml_vk_host_alloc_bytes
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
 
     ~vk_buffer_struct() {
+        if (host_counted > 0) {
+            ggml_vk_host_alloc_bytes -= (int64_t) host_counted;
+        }
         if (size == 0) {
             return;
         }

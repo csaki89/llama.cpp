@@ -34,6 +34,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1291,6 +1292,102 @@ static bool get_cgroup_free(size_t & free_bytes, size_t & limit_bytes, const std
     return found;
 }
 
+// the memory usage of the process' own (leaf) memory cgroup: v2 memory.current, v1 memory.usage_in_bytes
+static bool get_cgroup_self_usage(uint64_t & use, const std::string & root = "/sys/fs/cgroup", const std::string & self = "/proc/self/cgroup") {
+    std::ifstream f(self);
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t p1 = line.find(':');
+        const size_t p2 = p1 == std::string::npos ? p1 : line.find(':', p1 + 1);
+        if (p2 == std::string::npos) {
+            continue;
+        }
+        const std::string ctrl = line.substr(p1 + 1, p2 - p1 - 1);
+        const bool v2 = ctrl.empty();
+        if (!v2 && (',' + ctrl + ',').find(",memory,") == std::string::npos) {
+            continue;
+        }
+        const std::string dir = root + (v2 ? "" : "/memory") + line.substr(p2 + 1);
+        if (read_cgroup_u64(dir + (v2 ? "/memory.current" : "/memory.usage_in_bytes"), use)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the backends' driver-allocated host memory (ggml_backend_dev_host_memory), and a device that has the query
+static size_t backend_host_allocated(ggml_backend_dev_t * probe) {
+    size_t total = 0;
+    std::vector<ggml_backend_reg_t> seen;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg || std::find(seen.begin(), seen.end(), reg) != seen.end()) {
+            continue;
+        }
+        seen.push_back(reg);
+        auto fn = (size_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_host_memory");
+        if (fn) {
+            total += fn(dev);
+            if (probe && !*probe) {
+                *probe = dev;
+            }
+        }
+    }
+    return total;
+}
+
+size_t llama_backend_host_allocated(void) {
+    return backend_host_allocated(nullptr);
+}
+
+size_t llama_backend_host_uncharged(void) {
+    static std::mutex mtx;
+    static int charged = -1; // measured once per process: 1 the cgroup sees the driver's host allocations, 0 it does not
+    std::lock_guard<std::mutex> lock(mtx);
+    ggml_backend_dev_t probe = nullptr;
+    const size_t total = backend_host_allocated(&probe);
+    uint64_t u0 = 0, u1 = 0;
+    if (!probe || !get_cgroup_self_usage(u0)) {
+        return 0; // no backend with the query, or no cgroup: the system's free memory sees the driver's allocations
+    }
+    if (charged < 0) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(probe);
+        const size_t bytes = (size_t) 64 << 20;
+        const size_t h0 = backend_host_allocated(nullptr);
+        ggml_backend_buffer_t buf = buft ? ggml_backend_buft_alloc_buffer(buft, bytes) : nullptr;
+        const size_t h1 = backend_host_allocated(nullptr);
+        if (!buf || h1 < h0 + bytes/2) {
+            // no host buffer of the device, or it is not a driver allocation (an imported malloc): nothing to measure
+            if (buf) {
+                ggml_backend_buffer_free(buf);
+            }
+            charged = 1;
+            LLAMA_LOG_INFO("%s: RAM: the host buffers of %s are not driver allocations here: the cgroup sees them\n", __func__, ggml_backend_dev_name(probe));
+        } else {
+            get_cgroup_self_usage(u0);
+            ggml_backend_buffer_clear(buf, 1); // the pages are allocated on the first touch
+            get_cgroup_self_usage(u1);
+            ggml_backend_buffer_free(buf);
+            charged = u1 >= u0 + bytes/2 ? 1 : 0;
+            LLAMA_LOG_INFO("%s: RAM: the host buffers %s allocates through its driver are %s by the memory cgroup (measured: %+.0f MiB of usage for a %zu MiB buffer)%s\n",
+                __func__, ggml_backend_dev_name(probe), charged ? "seen" : "not seen", ((double) u1 - (double) u0) / 1048576.0, bytes >> 20,
+                charged ? "" : ": the RAM guards add them to the cgroup's usage");
+        }
+    }
+    return charged ? 0 : total;
+}
+
+// the RAM the guards subtract from the cgroup's free memory besides its own usage: this process' uncharged driver host memory and
+// the other processes' (LLAMA_ARG_RAM_UNCHARGED_MIB, from the caller that runs several, e.g. ollama-dualbuf)
+static size_t ram_uncharged_all() {
+    size_t res = llama_backend_host_uncharged();
+    if (const char * env = getenv("LLAMA_ARG_RAM_UNCHARGED_MIB")) {
+        res += (size_t) std::max(0LL, atoll(env)) << 20;
+    }
+    return res;
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, bool host_after_extra = false) {
     buft_list_t buft_list;
@@ -1855,9 +1952,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         // a cgroup memory limit applies instead of the system memory
         if (get_cgroup_free(cg_free, cg_limit)) {
-            ram_free  = cg_free;
+            // the driver host memory the cgroup does not see (Vulkan host buffers) is used all the same
+            const size_t unch = ram_uncharged_all();
+            ram_free  = cg_free > unch ? cg_free - unch : 0;
             ram_total = cg_limit;
-            ram_src   = "cgroup limit";
+            ram_src   = unch > 0 ? "cgroup limit + uncharged driver host memory" : "cgroup limit";
         }
         if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
             ram_free  = (size_t) atoll(env) * 1024 * 1024;
@@ -2700,9 +2799,10 @@ size_t llama_model::park_demote() const {
         ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
     }
     if (get_cgroup_free(cg_free, cg_limit)) {
-        ram_free  = cg_free;
+        const size_t unch = ram_uncharged_all();
+        ram_free  = cg_free > unch ? cg_free - unch : 0;
         ram_total = cg_limit;
-        src       = "cgroup limit";
+        src       = unch > 0 ? "cgroup limit + uncharged driver host memory" : "cgroup limit";
     }
     if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
         ram_free  = (size_t) atoll(env) * 1024 * 1024;
