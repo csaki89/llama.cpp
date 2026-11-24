@@ -59,3 +59,14 @@ Nyitva (OPEN-QUESTIONS.md): a fit költségvetés nélkül a heap teljes méret�
 | `ggml_backend_dev_host_memory` proc: a backend host-foglalásainak összege; a llama-server megméri, hogy a cgroup látja-e őket (egy host-puffer foglalása előtt és után a `memory.current`), és ami nem látszik, azt a RAM-számításhoz adja, naplóban és az Ollamának | a host-látható Vulkan-memória a meghajtó foglalása (GTT), nem felhasználói lap; hogy a cgroup számolja-e, a meghajtótól függ, ezért mérve |
 | a másolásos tartalék közös régi pufferből rétegenként halad: a használt sorok a hostra mennek, a közös puffer az új pufferek előtt felszabadul | nem API-kényszer: a tartalék csak ott fut, ahol nincs aréna (Vulkan hiányzó képességgel); a ROCm-on az arénás eszközök útja nem változik |
 | `ggml_backend_dev_async_readback` proc (alapból ki, `GGML_VK_ASYNC_READBACK=1`) és `GGML_SCHED_TIMING` mérősor a schedulerben | a Vulkan szinkron olvasása külön parancspuffer + beküldés + várakozás; a NAS-mérés dönt róla |
+
+## Eredmény (2. lépés; f8133efac, c639f4f84, bbd033c19)
+| hiba | állapot | eltérés a ROCm-tól (az API miatt) |
+|---|---|---|
+| 1. másolásos növelés | javítva: szakaszonkénti sparse tartomány, kevés címtérnél átkötéses növelés (laptopon `GGML_VK_SPARSE_VA_MIB`-bel ellenőrizve) | a tartomány pufferenként rögzül, ezért átkötés (HIP: darabonkénti címfoglalás) |
+| 2. tartalék csúcsa | javítva: a közös régi puffer az új pufferek előtt szabadul (használt sorok a hoston át) | nincs (csak a tartalékon fut) |
+| 3. RAM | javítva: driver host-foglalás mérve, ami a cgroupnak nem látszik, hozzáadódik (llama RAM-őr, Ollama `PlanRAM`, park-válasz) | proc + mérés (a HIP pinned memóriáját a cgroup látja) |
+| 4. split-generálás | **nyitva**: mérőeszköz (`GGML_SCHED_TIMING`) és kísérleti kapcsoló (`GGML_VK_ASYNC_READBACK`), NAS-mérés kell | – |
+| 5. hosszú kontextus | javítva ok-feltevés alapján (2 MiB-os darabigazítás, mint a HIP-en), NAS-mérés igazolja | nincs (azonos szabály) |
+| 6. betöltési margó | dokumentálva (OPEN-QUESTIONS 13) | – |
+| 7. könyvelés | javítva: a backend saját eszközpufferei és a darabkerekítés könyvelve (`ggml_backend_dev_internal_memory`) | proc (a Vulkan-backend a köztes puffereit maga foglalja) |
