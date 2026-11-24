@@ -1605,10 +1605,14 @@ static bool ggml_backend_vk_dev_memory_measured(ggml_backend_dev_t dev) {
 
 // the scheduler reads a split's output into host memory through get_tensor_async + synchronize: a synchronous read is a
 // command buffer, a submission and a fence wait of its own after the wait for the graph (per split boundary in a GPU/CPU
-// split); off by default, GGML_VK_ASYNC_READBACK=1 turns it on (measured neutral on an iGPU; to be measured on a discrete card)
+// split); with it the read is recorded behind the graph and goes with its fence: one wait per boundary, as the HIP path
+// (async copy + stream synchronize). On by default; GGML_VK_ASYNC_READBACK=0 turns it off (test aid). A device without async
+// support has no get_tensor_async, the scheduler then keeps the synchronous read.
+bool ggml_vk_low_latency_sync();
+
 static bool ggml_backend_vk_dev_async_readback(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    static const bool on = getenv("GGML_VK_ASYNC_READBACK") && atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0;
+    static const bool on = (!getenv("GGML_VK_ASYNC_READBACK") || atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0) && ggml_vk_low_latency_sync();
     return on;
 }
 

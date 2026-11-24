@@ -1258,6 +1258,9 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // dual-buffer fork: the last command buffer of a small graph stays open (submitted with its fence by the next synchronize,
+    // together with a readback recorded behind it)
+    bool defer_last_submit {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
