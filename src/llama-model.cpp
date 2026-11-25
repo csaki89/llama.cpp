@@ -2566,7 +2566,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         uint64_t cg_use = 0;
         const bool cg = get_cgroup_self_usage(cg_use);
         if (unch > 0) {
-            LLAMA_LOG_INFO("%s: RAM: driver host memory %.0f MiB (backend host buffers), not seen by the memory cgroup: the RAM guards and the RAM plan add +%.0f MiB to the cgroup's usage\n",
+            LLAMA_LOG_INFO("%s: RAM: driver host memory %.0f MiB (backend host buffers), not seen by the memory cgroup: where a cgroup limit bounds the RAM, the RAM guards and the RAM plan add +%.0f MiB to the cgroup's usage\n",
                 __func__, host / 1048576.0, unch / 1048576.0);
         } else {
             LLAMA_LOG_INFO("%s: RAM: driver host memory %.0f MiB (backend host buffers), %s: +0 MiB\n", __func__, host / 1048576.0,
