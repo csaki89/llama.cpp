@@ -587,9 +587,11 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
 
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
+    ggml_vk_timing_scope timing(GGML_VK_T_WRITE);
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        dst->device->submit_epoch++; // dual-buffer fork: a host write invalidates the read-ahead (vk_readahead)
 
         if (width == spitch && width == dpitch) {
             memcpy((uint8_t *)dst->ptr + offset, src, width * height);
@@ -601,7 +603,8 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
-        vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
+        // dual-buffer fork: a small write on the compute queue with a spinning wait (ggml_vk_sync_copy_wait)
+        vk_context subctx = ggml_vk_create_temporary_context(ggml_vk_sync_copy_queue(dst->device, width * height).cmd_pool);
         ggml_vk_ctx_begin(dst->device, subctx);
         bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
@@ -616,8 +619,7 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
         }
 
         ggml_vk_submit(subctx, dst->device->fence);
-        VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences", dst->device);
-        dst->device->device.resetFences({ dst->device->fence });
+        ggml_vk_sync_copy_wait(dst->device, width * height, "vk_buffer_write_2d waitForFences");
         ggml_vk_queue_command_pools_cleanup(dst->device);
     }
 }
@@ -708,6 +710,12 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 
 void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
+    ggml_vk_timing_scope timing(GGML_VK_T_READ);
+
+    // dual-buffer fork: a range copied by the read-ahead of the last synchronize (vk_readahead)
+    if (ggml_vk_readahead_read(src, offset, dst, spitch, dpitch, width, height)) {
+        return;
+    }
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
@@ -730,9 +738,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
             {}, {});
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
-                 "vk_buffer_read_2d uma waitForFences", src->device);
-        src->device->device.resetFences({ src->device->fence });
+        ggml_vk_sync_copy_wait(src->device, width * height, "vk_buffer_read_2d uma waitForFences");
         ggml_vk_queue_command_pools_cleanup(src->device);
 
         if (width == spitch && width == dpitch) {
@@ -745,21 +751,55 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
-        vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
+        // dual-buffer fork: a small read (a split-boundary input) on the compute queue with a spinning wait
+        // (ggml_vk_sync_copy_wait)
+        vk_context subctx = ggml_vk_create_temporary_context(ggml_vk_sync_copy_queue(src->device, width * height).cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         bool ret = ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
         ggml_vk_ctx_end(subctx);
 
         ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences", src->device);
-        src->device->device.resetFences({ src->device->fence });
+        ggml_vk_sync_copy_wait(src->device, width * height, "vk_buffer_read_2d waitForFences");
         ggml_vk_queue_command_pools_cleanup(src->device);
 
         for (auto& cpy : subctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
     }
+}
+
+// dual-buffer fork: vk_readahead. Every synchronous read after the synchronize of a small graph is observed (learned for
+// that graph by the next graph_compute); a read inside a range of the read-ahead is served from it while no submission
+// and no host write to the device's memory has happened since the read-ahead's own submission.
+bool ggml_vk_readahead_read(vk_buffer & src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
+    if (!ggml_vk_low_latency_sync()) {
+        return false;
+    }
+    const size_t len = spitch * (height - 1) + width;
+    vk_readahead & ra = src->device->readahead;
+    std::lock_guard<std::mutex> lock(ra.mutex);
+    if (ra.observe_key != 0 && ggml_vk_sync_copy_small(len) && ra.observed.size() < 16) {
+        ra.observed.push_back({ src, src->buffer, offset, len, 0 });
+    }
+    if (ra.ready_epoch != src->device->submit_epoch.load()) {
+        return false;
+    }
+    for (const auto & r : ra.ready) {
+        if (r.handle == src->buffer && offset >= r.offset && offset + len <= r.offset + r.size && r.buf.lock() == src) {
+            ggml_vk_timing_scope timing(GGML_VK_T_RA_HIT);
+            const uint8_t * s = (const uint8_t *) ra.staging->ptr + r.staging_offset + (offset - r.offset);
+            if (width == spitch && width == dpitch) {
+                memcpy(dst, s, width * height);
+            } else {
+                for (size_t i = 0; i < height; i++) {
+                    memcpy((uint8_t *) dst + i * dpitch, s + i * spitch, width);
+                }
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
@@ -820,6 +860,7 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
 
     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
         dst->device->uma) {
+        dst->device->submit_epoch++; // dual-buffer fork: a host write invalidates the read-ahead (vk_readahead)
         memset((uint8_t*)dst->ptr + offset, c, size);
         return;
     }

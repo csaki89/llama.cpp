@@ -369,7 +369,11 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             GGML_LOG_ERROR("ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
             throw vk::SystemError(vk::make_error_code(result), "ggml_vulkan: getFenceStatus");
         }
-        for (uint32_t i = 0; i < 100; ++i) {
+        // dual-buffer fork: after a small graph (split boundary, generation) the GPU is done within microseconds: poll every
+        // 10 pauses, as a HIP stream synchronize spins on a memory word (1000 pauses are tens of microseconds on current x86
+        // cores, of which a split boundary pays half on average)
+        const uint32_t n = ggml_vk_low_latency_sync() && ctx->defer_last_submit ? 1 : 100;
+        for (uint32_t i = 0; i < n; ++i) {
             YIELD();
             YIELD();
             YIELD();
@@ -383,6 +387,179 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+}
+
+// dual-buffer fork: small synchronous copies (buffer get/set of a split-boundary input and of the per-graph user inputs:
+// the scheduler reads a view input and writes an input tensor with these) go on the compute queue and the CPU spins on the
+// device fence, as a HIP device-host copy on the compute stream with a spinning synchronize. Upstream sends them to the
+// transfer queue (a DMA engine with its own start-up latency) and sleeps in vkWaitForFences (a kernel wake-up per copy).
+// Larger copies keep the upstream path. GGML_VK_LOW_LATENCY_SYNC=0 restores it for all (test aid).
+static constexpr size_t ggml_vk_sync_copy_small_max = 1u << 20;
+
+// GGML_SCHED_TIMING=N (test aid) also times the Vulkan side of the split boundaries: a line every 2 s with the calls per
+// second and the mean time per call of the graph recording (graph_compute, CPU time), the backend synchronize (submission
+// and the wait for the GPU) and the synchronous buffer reads and writes (one submission and wait each)
+static bool ggml_vk_timing_on() {
+    static const bool on = getenv("GGML_SCHED_TIMING") && atoi(getenv("GGML_SCHED_TIMING")) > 0;
+    return on;
+}
+
+ggml_vk_timing_scope::ggml_vk_timing_scope(int c) : cat(c), t0(ggml_vk_timing_on() ? ggml_time_us() : 0) {}
+
+ggml_vk_timing_scope::~ggml_vk_timing_scope() {
+    if (!ggml_vk_timing_on()) {
+        return;
+    }
+    static std::mutex mutex;
+    static int64_t n[GGML_VK_T_COUNT] = {}, t[GGML_VK_T_COUNT] = {}, t_print = 0;
+    const int64_t now = ggml_time_us();
+    std::lock_guard<std::mutex> lock(mutex);
+    n[cat]++;
+    t[cat] += now - t0;
+    if (t_print == 0) {
+        t_print = now;
+    } else if (now - t_print >= 2000000) {
+        const double s = (now - t_print) / 1e6;
+        auto mean = [&](int c) { return n[c] ? (double) t[c] / n[c] : 0.0; };
+        GGML_LOG_INFO("ggml_vulkan: sched timing: per second: %.0f graph recordings %.1f us, %.0f synchronizes %.1f us, %.0f sync reads %.1f us (%.0f from the read-ahead), %.0f sync writes %.1f us\n",
+            n[GGML_VK_T_GRAPH] / s, mean(GGML_VK_T_GRAPH), n[GGML_VK_T_SYNC] / s, mean(GGML_VK_T_SYNC),
+            n[GGML_VK_T_READ] / s, mean(GGML_VK_T_READ), n[GGML_VK_T_RA_HIT] / s, n[GGML_VK_T_WRITE] / s, mean(GGML_VK_T_WRITE));
+        for (int c = 0; c < GGML_VK_T_COUNT; c++) {
+            n[c] = t[c] = 0;
+        }
+        t_print = now;
+    }
+}
+
+thread_local uint64_t ggml_vk_tl_submit_epoch = 0;
+
+// vk_readahead: the reads that followed the synchronize of the last graph become that graph's read-ahead set (a graph that
+// was not followed by reads loses its set)
+static void ggml_vk_readahead_learn(ggml_backend_vk_context * ctx) {
+    vk_readahead & ra = ctx->device->readahead;
+    std::lock_guard<std::mutex> lock(ra.mutex);
+    if (ra.observe_key != 0) {
+        if (ra.observed.empty()) {
+            ra.learned.erase(ra.observe_key);
+        } else {
+            if (ra.learned.size() >= 1024) {
+                ra.learned.clear();
+            }
+            ra.learned[ra.observe_key] = ra.observed;
+        }
+    }
+    ra.observe_key = 0;
+    ra.observed.clear();
+    ra.ready.clear();
+    ra.ready_epoch = UINT64_MAX;
+}
+
+static uint64_t ggml_vk_readahead_graph_key(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    mix((uint64_t) (uintptr_t) ctx);
+    mix((uint64_t) (uintptr_t) cgraph);
+    mix((uint64_t) cgraph->n_nodes);
+    if (cgraph->n_nodes > 0) {
+        const ggml_tensor * first = cgraph->nodes[0];
+        const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
+        mix((uint64_t) (uintptr_t) first);
+        mix((uint64_t) (uintptr_t) first->data);
+        mix((uint64_t) (uintptr_t) last);
+        mix((uint64_t) (uintptr_t) last->data);
+        mix((uint64_t) ggml_nbytes(last));
+    }
+    return h != 0 ? h : 1;
+}
+
+// record the copies of the learned ranges of the graph just finished into its open command buffer, before the fence
+static bool ggml_vk_readahead_record(ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
+    vk_readahead & ra = ctx->device->readahead;
+    std::lock_guard<std::mutex> lock(ra.mutex);
+    ra.ready.clear();
+    ra.ready_epoch = UINT64_MAX;
+    auto it = ra.learned.find(ctx->readahead_key);
+    if (it == ra.learned.end()) {
+        return false;
+    }
+    size_t total = 0;
+    for (const auto & r : it->second) {
+        total += GGML_PAD(r.size, 256);
+    }
+    if (ra.staging == nullptr || ra.staging->size < total) {
+        ggml_vk_destroy_buffer(ra.staging);
+        ra.staging = ggml_vk_create_buffer_check(ctx->device, std::max<size_t>(total, 1u << 16),
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    size_t off = 0;
+    for (const auto & r : it->second) {
+        vk_buffer buf = r.buf.lock();
+        if (!buf || buf->buffer != r.handle || r.offset + r.size > buf->size) {
+            continue;
+        }
+        vk::BufferCopy bc{ r.offset, off, r.size };
+        compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ra.staging->buffer, { bc });
+        vk_readahead_range e = r;
+        e.staging_offset = off;
+        ra.ready.push_back(e);
+        off += GGML_PAD(r.size, 256);
+    }
+    compute_ctx->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+        { { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+    return !ra.ready.empty();
+}
+
+// after the wait for the synchronize of a small graph: the read-ahead copies (if any) are valid until the next submission;
+// the reads that follow are observed for the graph
+static void ggml_vk_readahead_commit(ggml_backend_vk_context * ctx, bool recorded, uint64_t epoch) {
+    vk_readahead & ra = ctx->device->readahead;
+    std::lock_guard<std::mutex> lock(ra.mutex);
+    ra.ready_epoch = recorded ? epoch : UINT64_MAX;
+    if (!recorded) {
+        ra.ready.clear();
+    }
+    ra.observe_key = ctx->readahead_key;
+    ra.observed.clear();
+}
+
+bool ggml_vk_sync_copy_small(size_t size) {
+    return ggml_vk_low_latency_sync() && size <= ggml_vk_sync_copy_small_max;
+}
+
+vk_queue & ggml_vk_sync_copy_queue(vk_device & device, size_t size) {
+    return ggml_vk_sync_copy_small(size) ? *device->compute_queue : *device->transfer_queue;
+}
+
+void ggml_vk_sync_copy_wait(vk_device & device, size_t size, const char * what) {
+    if (!ggml_vk_sync_copy_small(size)) {
+        VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk sync copy waitForFences", device);
+        GGML_UNUSED(what);
+        device->device.resetFences({ device->fence });
+        return;
+    }
+    for (;;) {
+        vk::Result result;
+        try {
+            result = device->device.getFenceStatus(device->fence);
+        } catch (vk::DeviceLostError &) {
+            ggml_vk_print_device_lost_info(device);
+            GGML_LOG_ERROR("ggml_vulkan: getFenceStatus (%s)\n", what);
+            throw;
+        }
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        if (result != vk::Result::eNotReady) {
+            GGML_LOG_ERROR("ggml_vulkan: error %s in %s\n", to_string(result).c_str(), what);
+            throw vk::SystemError(vk::make_error_code(result), what);
+        }
+        for (uint32_t i = 0; i < 10; ++i) {
+            YIELD();
+        }
+    }
+    device->device.resetFences({ device->fence });
 }
 
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
@@ -1056,6 +1233,7 @@ std::unique_ptr<vk_queue> ggml_vk_create_queue(vk_device& device, uint32_t queue
 
     h->queue = device->device.getQueue2(queue_info2);
     h->device = device;
+    h->submit_epoch = &device->submit_epoch;
     // Avoid concurrent submissions on NVIDIA due to driver bug.
     if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
         h->device_submit_mutex = &device->queue_submit_mutex;
@@ -13783,6 +13961,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
     bool do_transfer = !ctx->compute_ctx.expired();
     bool fence_submitted = false;
+    bool readahead_eligible = false;
+    bool readahead_recorded = false;
+    uint64_t readahead_epoch = 0;
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
@@ -13794,6 +13975,14 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         compute_ctx = ctx->compute_ctx.lock();
         if (compute_ctx->s) {
             cmd_buf = compute_ctx->s->buffer;
+        }
+
+        // dual-buffer fork: the synchronize of a small graph (one submission with its fence, below) carries the read-ahead
+        // copies of the ranges read after it last time (vk_readahead)
+        readahead_eligible = ggml_vk_low_latency_sync() && ctx->defer_last_submit && compute_ctx->s && !ctx->device->serialize_submissions &&
+                             !(ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value);
+        if (readahead_eligible) {
+            readahead_recorded = ggml_vk_readahead_record(ctx, compute_ctx);
         }
 
         ggml_vk_ctx_end(compute_ctx);
@@ -13810,6 +13999,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             // dual-buffer fork: the pending commands carry the fence themselves (no empty submission for it): one submission
             // and one wait, as a HIP stream synchronize after its async copies
             ggml_vk_submit(compute_ctx, ctx->fence);
+            readahead_epoch = ggml_vk_tl_submit_epoch;
             fence_submitted = true;
         } else {
             ggml_vk_submit(compute_ctx, {});
@@ -13842,6 +14032,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         if (!ctx->device->serialize_submissions) {
             ggml_vk_wait_for_fence(ctx);
         }
+        if (readahead_eligible && fence_submitted) {
+            ggml_vk_readahead_commit(ctx, readahead_recorded, readahead_epoch);
+        }
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
@@ -13860,6 +14053,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_timing_scope timing(GGML_VK_T_SYNC);
 
     // dual-buffer fork: nothing recorded or submitted since the last synchronize (the scheduler syncs the split backend before
     // every input copy): return at once, as a HIP stream synchronize on an idle stream (no command pool cleanup)
@@ -14618,6 +14812,13 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_timing_scope timing(GGML_VK_T_GRAPH);
+
+    // dual-buffer fork: vk_readahead
+    if (ggml_vk_low_latency_sync()) {
+        ggml_vk_readahead_learn(ctx);
+        ctx->readahead_key = ggml_vk_readahead_graph_key(ctx, cgraph);
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -16919,6 +17120,9 @@ void vk_queue_handle_synchronized::submit(vk::ArrayProxy<const vk::SubmitInfo> s
     std::lock_guard<std::mutex> guard(mutex);
     try {
         queue.submit(submits, fence);
+        if (submit_epoch) {
+            ggml_vk_tl_submit_epoch = ++*submit_epoch;
+        }
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {
             ggml_vk_print_device_lost_info(dev);
@@ -16935,6 +17139,9 @@ void vk_queue_handle_unsynchronized::submit(vk::ArrayProxy<const vk::SubmitInfo>
     }
     try {
         queue.submit(submits, fence);
+        if (submit_epoch) {
+            ggml_vk_tl_submit_epoch = ++*submit_epoch;
+        }
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {
             ggml_vk_print_device_lost_info(dev);
@@ -16954,6 +17161,7 @@ vk_device_struct::~vk_device_struct() {
     device.destroyFence(fence);
 
     ggml_vk_destroy_buffer(sync_staging);
+    ggml_vk_destroy_buffer(readahead.staging);
 
     if (compute_queue) compute_queue->cmd_pool.destroy(device);
     if (transfer_queue) transfer_queue->cmd_pool.destroy(device);

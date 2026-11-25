@@ -64,6 +64,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
+#include <atomic>
 #include <future>
 #include <condition_variable>
 #include <thread>
@@ -332,6 +333,8 @@ struct vk_queue_handle {
     vk::Queue queue;
     vk_device_ref device;
     std::mutex * device_submit_mutex = nullptr;
+    // dual-buffer fork: the device's submission count (vk_device_struct::submit_epoch)
+    std::atomic<uint64_t> * submit_epoch = nullptr;
     virtual void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) = 0;
     virtual void lock()   {}   // no-op by default (internally synchronized case)
     virtual void unlock() {}
@@ -673,9 +676,37 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// dual-buffer fork: split-boundary read-ahead (ggml_vk_readahead_*). The scheduler reads a split's outputs for the next
+// (CPU) split with synchronous buffer reads right after synchronizing the backend (an input that is a view takes this path);
+// each would be a submission and a wait of its own. The ranges read after the synchronize of a graph are learned; the next
+// time that graph is synchronized, they are copied into a host buffer in the same submission, behind the graph, and a read
+// of such a range is a memcpy, as long as no submission (and no host write to device memory) has happened since.
+struct vk_readahead_range {
+    std::weak_ptr<vk_buffer_struct> buf;
+    vk::Buffer handle;
+    size_t offset;
+    size_t size;
+    size_t staging_offset;
+};
+
+struct vk_readahead {
+    std::mutex mutex;
+    vk_buffer staging;
+    std::vector<vk_readahead_range> ready;   // in the staging buffer, valid while submit_epoch == ready_epoch
+    uint64_t ready_epoch = UINT64_MAX;
+    uint64_t observe_key = 0;                // the graph whose synchronize the current reads follow (0: none)
+    std::vector<vk_readahead_range> observed;
+    std::unordered_map<uint64_t, std::vector<vk_readahead_range>> learned;
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
+
+    // dual-buffer fork: every queue submission on the device counts here (and every host write to its memory), see
+    // vk_readahead
+    std::atomic<uint64_t> submit_epoch {0};
+    vk_readahead readahead;
 
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile
@@ -1270,6 +1301,8 @@ struct ggml_backend_vk_context {
     // dual-buffer fork: the last command buffer of a small graph stays open (submitted with its fence by the next synchronize,
     // together with a readback recorded behind it)
     bool defer_last_submit {};
+    // dual-buffer fork: the identity of the last graph (vk_readahead)
+    uint64_t readahead_key {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;

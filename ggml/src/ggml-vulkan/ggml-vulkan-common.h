@@ -67,6 +67,21 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
 uint64_t vk_tensor_offset(const ggml_tensor * tensor);
 uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx);
+bool ggml_vk_low_latency_sync();
+bool ggml_vk_sync_copy_small(size_t size);
+vk_queue & ggml_vk_sync_copy_queue(vk_device & device, size_t size);
+void ggml_vk_sync_copy_wait(vk_device & device, size_t size, const char * what);
+// dual-buffer fork: split-boundary read-ahead (vk_readahead)
+extern thread_local uint64_t ggml_vk_tl_submit_epoch;
+bool ggml_vk_readahead_read(vk_buffer & src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height);
+// dual-buffer fork: GGML_SCHED_TIMING (test aid): the Vulkan side of the split boundaries, see ggml_vk_timing_scope
+enum ggml_vk_timing_cat { GGML_VK_T_GRAPH, GGML_VK_T_SYNC, GGML_VK_T_READ, GGML_VK_T_WRITE, GGML_VK_T_RA_HIT, GGML_VK_T_COUNT };
+struct ggml_vk_timing_scope {
+    int cat;
+    int64_t t0;
+    explicit ggml_vk_timing_scope(int c);
+    ~ggml_vk_timing_scope();
+};
 void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n);
 void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence);
