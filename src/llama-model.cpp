@@ -2558,6 +2558,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    // RAM accounting: the backends' driver host memory (the Vulkan host buffers: on a discrete card GTT memory the driver
+    // allocates) is RAM all the same. If the memory cgroup does not see it, the RAM guards add it to the cgroup's usage and the
+    // caller gets it from the "host memory:" line of the server (ollama-dualbuf adds it to its RAM plan)
+    if (const size_t host = llama_backend_host_allocated(); host > 0) {
+        const size_t unch = llama_backend_host_uncharged();
+        uint64_t cg_use = 0;
+        const bool cg = get_cgroup_self_usage(cg_use);
+        if (unch > 0) {
+            LLAMA_LOG_INFO("%s: RAM: driver host memory %.0f MiB (backend host buffers), not seen by the memory cgroup: the RAM guards and the RAM plan add +%.0f MiB to the cgroup's usage\n",
+                __func__, host / 1048576.0, unch / 1048576.0);
+        } else {
+            LLAMA_LOG_INFO("%s: RAM: driver host memory %.0f MiB (backend host buffers), %s: +0 MiB\n", __func__, host / 1048576.0,
+                cg ? "in the memory cgroup's usage already" : "no memory cgroup: in the system's used memory already");
+        }
+    }
+
     if (!pimpl->flex.empty()) {
         // the loader is not used after load_tensors, keep its files to reload the GPU copies
         pimpl->flex_files = std::move(ml.files);
