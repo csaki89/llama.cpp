@@ -8467,6 +8467,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
     fa_pipeline_state.kvc = fa_kvc;
+    GGML_ASSERT(!fa_kvc || tuning_params.path != FA_COOPMAT2); // the coopmat2 shader has no KV_CHUNKED build
 
     vk_pipeline pipeline = nullptr;
 
@@ -16003,7 +16004,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[5] != nullptr) {
                     return false;
                 }
-                bool coopmat2 = device->coopmat2;
+                // a chunked K/V (dual-buffer fork) never takes the coopmat2 path (no KV_CHUNKED build, get_fa_tuning_params):
+                // it needs what the scalar/coopmat1 shaders need
+                bool coopmat2 = device->coopmat2 && !ggml_vk_tensor_chunked(op->src[1]) && !ggml_vk_tensor_chunked(op->src[2]);
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
