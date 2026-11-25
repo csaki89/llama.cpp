@@ -96,3 +96,6 @@ Ok (forrásból): a `hipMemSetAccess` a ROCr-en át a DRM `GEM_VA` ioctl-t hívj
 - **Költségalapú op-offload döntés.** Csak akkor küldje át a súlyt, ha a másolás ideje kisebb, mint a CPU-n megspórolt számítás. MoE-nél egy 512 tokenes adagban szakértőnként átlagosan kb. 16 token jut, ami kevés az átvitel megtérüléséhez.
 - **Az op offload VRAM-igénye.** Az átküldött súlyoknak helyet kell foglalni a VRAM-ban (gpt-oss:120b: számítási puffer 607 MiB, repack módban 91 MiB). Lehetőség: a GPU közvetlenül olvassa a rögzített host-memóriát, másolás nélkül.
 - **gpt-oss:120b, azonos rétegelosztással:** dual a promptban +22%, a generálásban -3% (szóráson belül), +43 GB rögzített RAM áron. Nagy modelleknél a `--dual-buffer-limit` javasolt.
+
+## 4. Később
+- **ROCm: a split-határ visszaolvasásainak összevonása** a Vulkanon bevezetett előreolvasás (`vk_readahead`, ollama-dualbuf DECISIONS 85) mintájára: a kis gráf szinkronja után szinkron olvasott (nézet-)bemenetek másolása ugyanabba a streambe, a szinkron elé. Csak ha a NAS-mérés szerint gyorsít (ROCm-on egy `hipMemcpy` D2H váltásonként ~10–20 µs; a coder ~56 splitjénél tokenenként legfeljebb ~1 ms várható).
