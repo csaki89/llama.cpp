@@ -250,6 +250,10 @@ struct vk_pipeline_struct {
     // linked list of pipelines for multiple compilation variants.
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
+    // chunked K/V (dual-buffer fork, dynamic KV): the same pipeline built with KV_CHUNKED, reading a chunked source
+    // (kvc_src, also its destination if that is chunked) or writing a chunked destination (kvc_dst); null if none
+    vk_pipeline kvc_src;
+    vk_pipeline kvc_dst;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -426,10 +430,12 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    // chunked K and V (dual-buffer fork): the KV_CHUNKED build
+    bool kvc = false;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, kvc) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.kvc);
     }
 };
 
@@ -720,6 +726,9 @@ struct vk_device_struct {
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;
+    // chunked K/V (dual-buffer fork): the shaders reach the K/V chunks by their device addresses (bufferDeviceAddress,
+    // shaderInt64); without it the dynamic KV grows by copy
+    bool kv_chunked;
 
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;

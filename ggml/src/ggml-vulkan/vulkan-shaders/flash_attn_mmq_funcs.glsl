@@ -5,39 +5,39 @@
 int32_t get_k_qs(uint ib, uint iqs, uint a_offset) {
     switch (FaTypeK) {
         case GGML_TYPE_Q4_0: {
-            uint vui = pack32(u16vec2(k_packed_q4_0.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0],
-                                      k_packed_q4_0.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]));
+            uint vui = pack32(u16vec2(FA_BLK(k_packed_q4_0, a_offset + ib).qs[(iqs & 0xF) / 2 + 0],
+                                      FA_BLK(k_packed_q4_0, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]));
             uint shift = (iqs & 0x10) >> 2;
             vui >>= shift;
             return int32_t(vui & 0x0F0F0F0F);
         }
         case GGML_TYPE_Q4_1: { // uses packed32 alias
-            uint vui = k_packed_q4_1_p32.data[a_offset + ib].qs[(iqs & 0xF) / 4];
+            uint vui = FA_BLK(k_packed_q4_1_p32, a_offset + ib).qs[(iqs & 0xF) / 4];
             uint shift = (iqs & 0x10) >> 2;
             vui >>= shift;
             return int32_t(vui & 0x0F0F0F0F);
         }
         case GGML_TYPE_Q5_0: {
-            uint vui = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0],
-                                      k_packed_q5_0.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]));
-            uint qh = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qh[0],
-                                     k_packed_q5_0.data[a_offset + ib].qh[1]));
+            uint vui = pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + ib).qs[(iqs & 0xF) / 2 + 0],
+                                      FA_BLK(k_packed_q5_0, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]));
+            uint qh = pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + ib).qh[0],
+                                     FA_BLK(k_packed_q5_0, a_offset + ib).qh[1]));
             uint shift = (iqs & 0x10) >> 2;
             vui >>= shift;
             uint qh_bits = (qh >> iqs) & 0xF;
             return int32_t(vui & 0x0F0F0F0F) | int32_t((qh_bits * 0x02040810u) & 0x10101010u);
         }
         case GGML_TYPE_Q5_1: { // qs via packed32, qh via packed16
-            uint vui = k_packed_q5_1_p32.data[a_offset + ib].qs[(iqs & 0xF) / 4];
-            uint qh  = k_packed_q5_1.data[a_offset + ib].qh;
+            uint vui = FA_BLK(k_packed_q5_1_p32, a_offset + ib).qs[(iqs & 0xF) / 4];
+            uint qh  = FA_BLK(k_packed_q5_1, a_offset + ib).qh;
             uint shift = (iqs & 0x10) >> 2;
             vui >>= shift;
             uint qh_bits = (qh >> iqs) & 0xF;
             return int32_t(vui & 0x0F0F0F0F) | int32_t((qh_bits * 0x02040810u) & 0x10101010u);
         }
         case GGML_TYPE_Q8_0: {
-            return pack32(i16vec2(k_packed_q8_0.data[a_offset + ib].qs[iqs / 2],
-                                  k_packed_q8_0.data[a_offset + ib].qs[iqs / 2 + 1]));
+            return pack32(i16vec2(FA_BLK(k_packed_q8_0, a_offset + ib).qs[iqs / 2],
+                                  FA_BLK(k_packed_q8_0, a_offset + ib).qs[iqs / 2 + 1]));
         }
         default: return 0;
     }
@@ -47,11 +47,11 @@ int32_t get_k_qs(uint ib, uint iqs, uint a_offset) {
 // return (d, 0) so call sites always see the same shape.
 FLOAT_TYPEV2 get_k_scale(uint ib, uint a_offset) {
     switch (FaTypeK) {
-        case GGML_TYPE_Q4_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q4_0.data[a_offset + ib].d), 0.0);
-        case GGML_TYPE_Q4_1: return FLOAT_TYPEV2(k_packed_q4_1_p32.data[a_offset + ib].dm);
-        case GGML_TYPE_Q5_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q5_0.data[a_offset + ib].d), 0.0);
-        case GGML_TYPE_Q5_1: return FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + ib].dm);
-        case GGML_TYPE_Q8_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + ib].d), 0.0);
+        case GGML_TYPE_Q4_0: return FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q4_0, a_offset + ib).d), 0.0);
+        case GGML_TYPE_Q4_1: return FLOAT_TYPEV2(FA_BLK(k_packed_q4_1_p32, a_offset + ib).dm);
+        case GGML_TYPE_Q5_0: return FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q5_0, a_offset + ib).d), 0.0);
+        case GGML_TYPE_Q5_1: return FLOAT_TYPEV2(FA_BLK(k_packed_q5_1_p32, a_offset + ib).dm);
+        case GGML_TYPE_Q8_0: return FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q8_0, a_offset + ib).d), 0.0);
         default: return FLOAT_TYPEV2(0);
     }
 }
@@ -62,33 +62,33 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
     // signed/unsigned interpretation happens downstream in the dot product.
     switch (FaTypeK) {
         case GGML_TYPE_Q4_0: {
-            kblocksh[buf_ib].qs[iqs] = int32_t(pack32(u16vec2(k_packed_q4_0.data[a_offset + global_ib].qs[iqs * 2],
-                                                              k_packed_q4_0.data[a_offset + global_ib].qs[iqs * 2 + 1])));
+            kblocksh[buf_ib].qs[iqs] = int32_t(pack32(u16vec2(FA_BLK(k_packed_q4_0, a_offset + global_ib).qs[iqs * 2],
+                                                              FA_BLK(k_packed_q4_0, a_offset + global_ib).qs[iqs * 2 + 1])));
             break;
         }
         case GGML_TYPE_Q4_1: {
-            kblocksh[buf_ib].qs[iqs] = int32_t(k_packed_q4_1_p32.data[a_offset + global_ib].qs[iqs]);
+            kblocksh[buf_ib].qs[iqs] = int32_t(FA_BLK(k_packed_q4_1_p32, a_offset + global_ib).qs[iqs]);
             break;
         }
         case GGML_TYPE_Q5_0: {
-            kblocksh[buf_ib].qs[iqs] = int32_t(pack32(u16vec2(k_packed_q5_0.data[a_offset + global_ib].qs[iqs * 2],
-                                                              k_packed_q5_0.data[a_offset + global_ib].qs[iqs * 2 + 1])));
+            kblocksh[buf_ib].qs[iqs] = int32_t(pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + global_ib).qs[iqs * 2],
+                                                              FA_BLK(k_packed_q5_0, a_offset + global_ib).qs[iqs * 2 + 1])));
             if (iqs == 0) {
-                kblocksh[buf_ib].qh = pack32(u16vec2(k_packed_q5_0.data[a_offset + global_ib].qh[0],
-                                                     k_packed_q5_0.data[a_offset + global_ib].qh[1]));
+                kblocksh[buf_ib].qh = pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + global_ib).qh[0],
+                                                     FA_BLK(k_packed_q5_0, a_offset + global_ib).qh[1]));
             }
             break;
         }
         case GGML_TYPE_Q5_1: {
-            kblocksh[buf_ib].qs[iqs] = int32_t(k_packed_q5_1_p32.data[a_offset + global_ib].qs[iqs]);
+            kblocksh[buf_ib].qs[iqs] = int32_t(FA_BLK(k_packed_q5_1_p32, a_offset + global_ib).qs[iqs]);
             if (iqs == 0) {
-                kblocksh[buf_ib].qh = k_packed_q5_1.data[a_offset + global_ib].qh;
+                kblocksh[buf_ib].qh = FA_BLK(k_packed_q5_1, a_offset + global_ib).qh;
             }
             break;
         }
         case GGML_TYPE_Q8_0: {
-            kblocksh[buf_ib].qs[iqs] = pack32(i16vec2(k_packed_q8_0.data[a_offset + global_ib].qs[iqs * 2],
-                                                      k_packed_q8_0.data[a_offset + global_ib].qs[iqs * 2 + 1]));
+            kblocksh[buf_ib].qs[iqs] = pack32(i16vec2(FA_BLK(k_packed_q8_0, a_offset + global_ib).qs[iqs * 2],
+                                                      FA_BLK(k_packed_q8_0, a_offset + global_ib).qs[iqs * 2 + 1]));
             break;
         }
     }
@@ -96,11 +96,11 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
     if (iqs == 0) {
         // Q4_0/Q5_0/Q8_0 store dm.x = d; Q4_1/Q5_1 store dm = (d, m) pair.
         switch (FaTypeK) {
-            case GGML_TYPE_Q4_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q4_0.data[a_offset + global_ib].d), 0.0); break;
-            case GGML_TYPE_Q4_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(k_packed_q4_1_p32.data[a_offset + global_ib].dm); break;
-            case GGML_TYPE_Q5_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q5_0.data[a_offset + global_ib].d), 0.0); break;
-            case GGML_TYPE_Q5_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + global_ib].dm); break;
-            case GGML_TYPE_Q8_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + global_ib].d), 0.0); break;
+            case GGML_TYPE_Q4_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q4_0, a_offset + global_ib).d), 0.0); break;
+            case GGML_TYPE_Q4_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FA_BLK(k_packed_q4_1_p32, a_offset + global_ib).dm); break;
+            case GGML_TYPE_Q5_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q5_0, a_offset + global_ib).d), 0.0); break;
+            case GGML_TYPE_Q5_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FA_BLK(k_packed_q5_1_p32, a_offset + global_ib).dm); break;
+            case GGML_TYPE_Q8_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(FA_BLK(k_packed_q8_0, a_offset + global_ib).d), 0.0); break;
         }
     }
 }
@@ -122,31 +122,31 @@ fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset) {
     fa_k_qs_block8 r;
     uint qh = 0;
     if (FaTypeK == GGML_TYPE_Q5_0) {
-        qh = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qh[0],
-                            k_packed_q5_0.data[a_offset + ib].qh[1]));
+        qh = pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + ib).qh[0],
+                            FA_BLK(k_packed_q5_0, a_offset + ib).qh[1]));
     } else if (FaTypeK == GGML_TYPE_Q5_1) {
-        qh = k_packed_q5_1.data[a_offset + ib].qh;
+        qh = FA_BLK(k_packed_q5_1, a_offset + ib).qh;
     }
     const bool has_qh = (FaTypeK == GGML_TYPE_Q5_0) || (FaTypeK == GGML_TYPE_Q5_1);
     [[unroll]] for (uint32_t d = 0; d < 4; d++) {
         uint vui = 0;
         switch (FaTypeK) {
             case GGML_TYPE_Q4_0: { // packed16
-                vui = pack32(u16vec2(k_packed_q4_0.data[a_offset + ib].qs[d * 2 + 0],
-                                     k_packed_q4_0.data[a_offset + ib].qs[d * 2 + 1]));
+                vui = pack32(u16vec2(FA_BLK(k_packed_q4_0, a_offset + ib).qs[d * 2 + 0],
+                                     FA_BLK(k_packed_q4_0, a_offset + ib).qs[d * 2 + 1]));
                 break;
             }
             case GGML_TYPE_Q4_1: { // packed32 alias
-                vui = k_packed_q4_1_p32.data[a_offset + ib].qs[d];
+                vui = FA_BLK(k_packed_q4_1_p32, a_offset + ib).qs[d];
                 break;
             }
             case GGML_TYPE_Q5_0: { // packed16
-                vui = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qs[d * 2 + 0],
-                                     k_packed_q5_0.data[a_offset + ib].qs[d * 2 + 1]));
+                vui = pack32(u16vec2(FA_BLK(k_packed_q5_0, a_offset + ib).qs[d * 2 + 0],
+                                     FA_BLK(k_packed_q5_0, a_offset + ib).qs[d * 2 + 1]));
                 break;
             }
             case GGML_TYPE_Q5_1: { // packed32 alias
-                vui = k_packed_q5_1_p32.data[a_offset + ib].qs[d];
+                vui = FA_BLK(k_packed_q5_1_p32, a_offset + ib).qs[d];
                 break;
             }
         }

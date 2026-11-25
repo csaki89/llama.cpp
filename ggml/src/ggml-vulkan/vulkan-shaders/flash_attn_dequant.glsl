@@ -38,85 +38,124 @@ layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_
 layout (binding = 1) readonly buffer K_PACKED_Q4_1_P32 { block_q4_1_packed32 data[]; } k_packed_q4_1_p32;
 layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 data[]; } k_packed_q5_1_p32;
 
+// FA_BLK(BUF, i): block i of the K or V view BUF. Chunked K/V (KV_CHUNKED, dual-buffer fork): bindings 1 and 2 are the
+// chunk tables of K and V and block i is read through its device address (kv_chunk.glsl).
+#if defined(KV_CHUNKED)
+#include "kv_chunk.glsl"
+KVC_TABLE(1, kvc_k)
+KVC_TABLE(2, kvc_v)
+KVC_REF(kvc_vec4,    vec4,                  16)
+KVC_REF(kvc_u16vec4, u16vec4,               8)
+KVC_REF(kvc_q4_0,    block_q4_0_packed16,   2)
+KVC_REF(kvc_q4_1,    block_q4_1_packed16,   2)
+KVC_REF(kvc_q4_1_32, block_q4_1_packed32,   4)
+KVC_REF(kvc_q5_0,    block_q5_0_packed16,   2)
+KVC_REF(kvc_q5_1,    block_q5_1_packed16,   4)
+KVC_REF(kvc_q5_1_32, block_q5_1_packed32,   4)
+KVC_REF(kvc_q8_0,    block_q8_0_packed16,   2)
+KVC_REF(kvc_iq4_nl,  block_iq4_nl_packed16, 2)
+#define k_packed_f32_at(i)      KVC_AT(kvc_vec4,    kvc_k, i, 16)
+#define v_packed_f32_at(i)      KVC_AT(kvc_vec4,    kvc_v, i, 16)
+#define k_packed_bf16_at(i)     KVC_AT(kvc_u16vec4, kvc_k, i, 8)
+#define v_packed_bf16_at(i)     KVC_AT(kvc_u16vec4, kvc_v, i, 8)
+#define k_packed_q4_0_at(i)     KVC_AT(kvc_q4_0,    kvc_k, i, 18)
+#define v_packed_q4_0_at(i)     KVC_AT(kvc_q4_0,    kvc_v, i, 18)
+#define k_packed_q4_1_at(i)     KVC_AT(kvc_q4_1,    kvc_k, i, 20)
+#define v_packed_q4_1_at(i)     KVC_AT(kvc_q4_1,    kvc_v, i, 20)
+#define k_packed_q4_1_p32_at(i) KVC_AT(kvc_q4_1_32, kvc_k, i, 20)
+#define k_packed_q5_0_at(i)     KVC_AT(kvc_q5_0,    kvc_k, i, 22)
+#define v_packed_q5_0_at(i)     KVC_AT(kvc_q5_0,    kvc_v, i, 22)
+#define k_packed_q5_1_at(i)     KVC_AT(kvc_q5_1,    kvc_k, i, 24)
+#define v_packed_q5_1_at(i)     KVC_AT(kvc_q5_1,    kvc_v, i, 24)
+#define k_packed_q5_1_p32_at(i) KVC_AT(kvc_q5_1_32, kvc_k, i, 24)
+#define k_packed_q8_0_at(i)     KVC_AT(kvc_q8_0,    kvc_k, i, 34)
+#define v_packed_q8_0_at(i)     KVC_AT(kvc_q8_0,    kvc_v, i, 34)
+#define k_packed_iq4_nl_at(i)   KVC_AT(kvc_iq4_nl,  kvc_k, i, 18)
+#define v_packed_iq4_nl_at(i)   KVC_AT(kvc_iq4_nl,  kvc_v, i, 18)
+#define FA_BLK(BUF, I) BUF##_at(I)
+#else
+#define FA_BLK(BUF, I) BUF.data[I]
+#endif
+
 // Per-quant decode bodies are expanded once for the K view set and once for
 // the V view set. The macros take the buffer name as a parameter.
 #define FA_DEQUANT4_F32(BUF) \
-    return FLOAT_TYPEV4(BUF.data[a_offset + ib]);
+    return FLOAT_TYPEV4(FA_BLK(BUF, a_offset + ib));
 
 #define FA_DEQUANT4_Q4_0(BUF) {                                                                   \
-    uint vui_lo = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);                          \
-    uint vui_hi = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);                          \
+    uint vui_lo = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 0]);                          \
+    uint vui_hi = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]);                          \
     uint shift = (iqs & 0x10) >> 2;                                                               \
     vui_lo >>= shift;                                                                             \
     vui_hi >>= shift;                                                                             \
     FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF,                        \
                                         vui_hi & 0xF, (vui_hi >> 8) & 0xF);                       \
-    return FLOAT_TYPE(BUF.data[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));                  \
+    return FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d) * (nibbles - FLOAT_TYPE(8.0f));                  \
 }
 
 #define FA_DEQUANT4_Q4_1(BUF) {                                                                   \
-    uint vui_lo = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);                          \
-    uint vui_hi = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);                          \
+    uint vui_lo = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 0]);                          \
+    uint vui_hi = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]);                          \
     uint shift = (iqs & 0x10) >> 2;                                                               \
     vui_lo >>= shift;                                                                             \
     vui_hi >>= shift;                                                                             \
     FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF,                        \
                                         vui_hi & 0xF, (vui_hi >> 8) & 0xF);                       \
-    return FLOAT_TYPE(BUF.data[a_offset + ib].d) * nibbles                                        \
-         + FLOAT_TYPE(BUF.data[a_offset + ib].m);                                                 \
+    return FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d) * nibbles                                        \
+         + FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).m);                                                 \
 }
 
 #define FA_DEQUANT4_Q5_0(BUF) {                                                                   \
-    uint vui_lo = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);                          \
-    uint vui_hi = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);                          \
+    uint vui_lo = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 0]);                          \
+    uint vui_hi = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]);                          \
     uint shift = (iqs & 0x10) >> 2;                                                               \
     vui_lo >>= shift;                                                                             \
     vui_hi >>= shift;                                                                             \
-    uint qh = uint(BUF.data[a_offset + ib].qh[0])                                                 \
-            | (uint(BUF.data[a_offset + ib].qh[1]) << 16);                                        \
+    uint qh = uint(FA_BLK(BUF, a_offset + ib).qh[0])                                                 \
+            | (uint(FA_BLK(BUF, a_offset + ib).qh[1]) << 16);                                        \
     FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs)       & 1, (qh >> (iqs + 1)) & 1,                  \
                                    (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1)                  \
                       * FLOAT_TYPE(16.0f);                                                        \
     FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF,                        \
                                         vui_hi & 0xF, (vui_hi >> 8) & 0xF);                       \
-    return FLOAT_TYPE(BUF.data[a_offset + ib].d) * (nibbles + hb - FLOAT_TYPE(16.0f));            \
+    return FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d) * (nibbles + hb - FLOAT_TYPE(16.0f));            \
 }
 
 #define FA_DEQUANT4_Q5_1(BUF) {                                                                   \
-    uint vui_lo = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);                          \
-    uint vui_hi = uint(BUF.data[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);                          \
+    uint vui_lo = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 0]);                          \
+    uint vui_hi = uint(FA_BLK(BUF, a_offset + ib).qs[(iqs & 0xF) / 2 + 1]);                          \
     uint shift = (iqs & 0x10) >> 2;                                                               \
     vui_lo >>= shift;                                                                             \
     vui_hi >>= shift;                                                                             \
-    uint qh = BUF.data[a_offset + ib].qh;                                                         \
+    uint qh = FA_BLK(BUF, a_offset + ib).qh;                                                         \
     FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs)       & 1, (qh >> (iqs + 1)) & 1,                  \
                                    (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1)                  \
                       * FLOAT_TYPE(16.0f);                                                        \
     FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF,                        \
                                         vui_hi & 0xF, (vui_hi >> 8) & 0xF);                       \
-    return FLOAT_TYPE(BUF.data[a_offset + ib].d) * (nibbles + hb)                                 \
-         + FLOAT_TYPE(BUF.data[a_offset + ib].m);                                                 \
+    return FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d) * (nibbles + hb)                                 \
+         + FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).m);                                                 \
 }
 
 #define FA_DEQUANT4_Q8_0(BUF) {                                                                   \
-    const i8vec2 v0 = unpack8(int32_t(BUF.data[a_offset + ib].qs[iqs / 2    ])).xy;               \
-    const i8vec2 v1 = unpack8(int32_t(BUF.data[a_offset + ib].qs[iqs / 2 + 1])).xy;               \
-    return FLOAT_TYPE(BUF.data[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);          \
+    const i8vec2 v0 = unpack8(int32_t(FA_BLK(BUF, a_offset + ib).qs[iqs / 2    ])).xy;               \
+    const i8vec2 v1 = unpack8(int32_t(FA_BLK(BUF, a_offset + ib).qs[iqs / 2 + 1])).xy;               \
+    return FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);          \
 }
 
 #define FA_DEQUANT4_IQ4_NL(BUF) {                                                                 \
     const uint shift = (iqs & 0x10) >> 2;                                                         \
     const uint qs_i = (iqs & 0xC) >> 1;                                                           \
-    const uint qsw = uint(BUF.data[a_offset + ib].qs[qs_i])                                       \
-                   | (uint(BUF.data[a_offset + ib].qs[qs_i + 1u]) << 16);                         \
-    const FLOAT_TYPE d = FLOAT_TYPE(BUF.data[a_offset + ib].d);                                   \
+    const uint qsw = uint(FA_BLK(BUF, a_offset + ib).qs[qs_i])                                       \
+                   | (uint(FA_BLK(BUF, a_offset + ib).qs[qs_i + 1u]) << 16);                         \
+    const FLOAT_TYPE d = FLOAT_TYPE(FA_BLK(BUF, a_offset + ib).d);                                   \
     const u8vec4 q = unpack8((qsw >> shift) & 0x0F0F0F0Fu);                                       \
     return d * FLOAT_TYPEV4(kvalues_iq4nl[q.x], kvalues_iq4nl[q.y],                               \
                             kvalues_iq4nl[q.z], kvalues_iq4nl[q.w]);                              \
 }
 
 #define FA_DEQUANT4_BF16(BUF) \
-    return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
+    return FLOAT_TYPEV4(bf16_to_fp32(uvec4(FA_BLK(BUF, (a_offset + ib) / 4))));
 
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {

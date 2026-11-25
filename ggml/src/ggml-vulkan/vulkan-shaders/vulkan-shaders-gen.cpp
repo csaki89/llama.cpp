@@ -1244,6 +1244,108 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
+    // Chunked K/V (dual-buffer fork, dynamic KV): the shaders that read or write the K/V, built once more with KV_CHUNKED
+    // ("_kvc"): the K/V binding is the section's chunk table and every access goes through kv_chunk.glsl. Only the K/V
+    // types and the pipelines the K/V reaches (FA, set_rows and its fusions, the K-shift rope and copies, the FA prepasses).
+    {
+        struct kvc_type { const char * name; const char * t; const char * size; const char * align; };
+        const kvc_type kvc_types[] = {
+            {"f32", "float", "4", "4"}, {"f16", "float16_t", "2", "2"}, {"bf16", "uint16_t", "2", "2"},
+            {"q4_0", "block_q4_0", "18", "2"}, {"q4_1", "block_q4_1", "20", "4"}, {"q5_0", "block_q5_0", "22", "2"},
+            {"q5_1", "block_q5_1", "24", "4"}, {"q8_0", "block_q8_0", "34", "2"}, {"iq4_nl", "block_iq4_nl", "18", "2"},
+        };
+        auto kvc_src = [](const char * t, const char * size, const char * align, const char * binding = "0") {
+            return std::map<std::string, std::string>{{"KV_CHUNKED", "1"}, {"KVC_SRC_BINDING", binding}, {"KVC_SRC_T", t}, {"KVC_SRC_SIZE", size}, {"KVC_SRC_ALIGN", align}};
+        };
+        auto kvc_dst = [](const char * t, const char * size, const char * align, const char * binding) {
+            return std::map<std::string, std::string>{{"KV_CHUNKED", "1"}, {"KVC_DST_BINDING", binding}, {"KVC_DST_T", t}, {"KVC_DST_SIZE", size}, {"KVC_DST_ALIGN", align}};
+        };
+
+        // the K/V write (set_rows into a chunked destination)
+        for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
+            for (const auto & d : kvc_types) {
+                const std::string dst = d.name;
+                const auto dd = kvc_dst(d.t, d.size, d.align, "2");
+                string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32_kvc", "copy_to_quant.comp", merge_maps(dd, {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
+                string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64_kvc", "copy_to_quant.comp", merge_maps(dd, {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
+            }
+        }
+        // copies from and to a quantized K/V (the K shift of a quantized K)
+        for (const auto & d : kvc_types) {
+            const std::string t = d.name;
+            if (t == "f32" || t == "f16" || t == "bf16") {
+                continue;
+            }
+            string_to_spv("cpy_f32_" + t + "_kvc", "copy_to_quant.comp", merge_maps(kvc_dst(d.t, d.size, d.align, "1"), {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
+            string_to_spv("cpy_" + t + "_f32_kvc", "copy_from_quant.comp", merge_maps(kvc_src(d.t, d.size, d.align), {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
+        }
+        // plain copies with a chunked source (_kvc) or destination (_kvcd): the f16/bf16/f32 K/V prepasses and casts
+        for (const char * file : {"copy.comp", "contig_copy.comp"}) {
+            const std::string pre = std::string(file) == "copy.comp" ? "cpy_" : "contig_cpy_";
+            string_to_spv(pre + "16_kvc",  file, merge_maps(kvc_src("uint16_t", "2", "2"), {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}}));
+            string_to_spv(pre + "32_kvc",  file, merge_maps(kvc_src("uint", "4", "4"), {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
+            string_to_spv(pre + "f16_f32_kvc", file, merge_maps(kvc_src("float16_t", "2", "2"), {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}}));
+            string_to_spv(pre + "bf16_f32_kvc", file, merge_maps(kvc_src("uint16_t", "2", "2"), {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}}));
+            string_to_spv(pre + "16_kvcd", file, merge_maps(kvc_dst("uint16_t", "2", "2", "1"), {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}}));
+            string_to_spv(pre + "32_kvcd", file, merge_maps(kvc_dst("uint", "4", "4", "1"), {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
+            string_to_spv(pre + "f32_f16_kvcd", file, merge_maps(kvc_dst("float16_t", "2", "2", "1"), {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}}));
+            string_to_spv(pre + "f32_bf16_kvcd", file, merge_maps(kvc_dst("uint16_t", "2", "2", "1"), {{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}}));
+        }
+        // the FA prepass of a quantized K/V
+        string_to_spv("dequant_q8_0_transpose_kvc", "dequant_q8_0.comp", merge_maps(kvc_src("block_q8_0", "34", "2"), {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"DATA_A_Q8_0", "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
+        // rope: in place on a chunked K (the K shift, _kvc) and into a chunked K (the ROPE + VIEW + SET_ROWS fusion, _kvcd)
+        for (const char * mode : {"norm", "neox", "multi"}) {
+            const std::string file = std::string("rope_") + mode + ".comp";
+            const std::string pre  = std::string("rope_") + mode;
+            string_to_spv(pre + "_f32_kvc", file, merge_maps(merge_maps(kvc_src("float", "4", "4"), kvc_dst("float", "4", "4", "3")), {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}}));
+            string_to_spv(pre + "_f16_kvc", file, merge_maps(merge_maps(kvc_src("float16_t", "2", "2"), kvc_dst("float16_t", "2", "2", "3")), {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}}));
+            string_to_spv(pre + "_f32_kvcd", file, merge_maps(kvc_dst("float", "4", "4", "3"), {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}}));
+            string_to_spv(pre + "_f32_f16_kvcd", file, merge_maps(kvc_dst("float16_t", "2", "2", "3"), {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}}));
+        }
+        // rms_norm fusions that write the K/V
+        for (bool use_subgroups : {false, true}) {
+            const std::string suffix = use_subgroups ? "_subgroup" : "";
+            const auto rms_dict = merge_maps({{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}}, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", use_subgroups ? "1" : "0"}});
+            string_to_spv("rms_norm_set_rows_f32_f32" + suffix + "_kvcd", "rms_norm.comp", merge_maps(merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}), kvc_dst("float", "4", "4", "2")));
+            string_to_spv("rms_norm_set_rows_f32_f16" + suffix + "_kvcd", "rms_norm.comp", merge_maps(merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict), kvc_dst("float16_t", "2", "2", "2")));
+            string_to_spv("rms_norm_mul_rope_f32_f32" + suffix + "_kvcd", "rms_norm.comp", merge_maps(merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}), kvc_dst("float", "4", "4", "5")));
+            string_to_spv("rms_norm_mul_rope_f32_f16" + suffix + "_kvcd", "rms_norm.comp", merge_maps(merge_maps(rms_dict, {{"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}), kvc_dst("float16_t", "2", "2", "5")));
+        }
+        // flash attention with chunked K and V (scalar, dot2, int8 and coopmat1; coopmat2 has none, DECISIONS.md)
+        for (const bool fp16 : {false, true}) {
+            std::map<std::string, std::string> fa_dict;
+            if (fp16) {
+                fa_dict = {{"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"}, {"FLOAT16", "1"}, {"FLOAT_TYPE_MAX", "float16_t(65504.0)"}};
+            } else {
+                fa_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}};
+            }
+            for (const bool f16acc : {false, true}) {
+                auto d = fa_dict;
+                d["ACC_TYPE"]   = fp16 && f16acc ? "float16_t" : "float";
+                d["ACC_TYPEV2"] = fp16 && f16acc ? "f16vec2" : "vec2";
+                d["ACC_TYPEV4"] = fp16 && f16acc ? "f16vec4" : "vec4";
+                d["DATA_A_IQ4_NL"] = "1";
+                d["KV_CHUNKED"] = "1";
+                if (fp16 && f16acc) {
+                    d["ACC_TYPE_MAX"] = "float16_t(65504.0)";
+                }
+                const auto qd = merge_maps(d, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                if (fp16) {
+                    string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp", merge_maps(qd, {{"COOPMAT", "1"}}), fp16, true, false, f16acc, "_kvc");
+                }
+#endif
+                string_to_spv("flash_attn_f32_f16", "flash_attn.comp", qd, fp16, false, false, f16acc, "_kvc");
+                if (fp16) {
+                    string_to_spv("flash_attn_f32_f16_dot2", "flash_attn.comp", merge_maps(qd, {{"DOT2_F16", "1"}}), fp16, false, false, f16acc, "_kvc");
+                }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+                string_to_spv("flash_attn_f32_f16", "flash_attn.comp", merge_maps(qd, {{"MMQ", "1"}, {"FA_MMQ_MIXED", "1"}}), fp16, false, false, f16acc, "_int8_kvc");
+#endif
+            }
+        }
+    }
+
     for (auto &c : compiles) {
         c.wait();
     }

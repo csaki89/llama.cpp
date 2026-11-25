@@ -28,6 +28,14 @@ layout (binding = 2) writeonly buffer Q {A_TYPE data_q[];};
 layout (binding = 1) writeonly buffer Q {A_TYPE data_q[];};
 #endif
 
+// the destination block (chunked K/V: through the chunk table, kv_chunk.glsl)
+#include "kv_chunk.glsl"
+#if defined(KVC_DST_BINDING)
+#define KVC_Q(I) KVC_DST_AT(I)
+#else
+#define KVC_Q(I) data_q[I]
+#endif
+
 #if defined(DATA_A_Q4_0)
 void quantize(uint dst_idx, uint src_idx)
 {
@@ -45,7 +53,7 @@ void quantize(uint dst_idx, uint src_idx)
     const float d  = vmax / -8;
     const float id = (d != 0.0) ? 1.0/d : 0.0;
 
-    data_q[dst_idx].d = float16_t(d);
+    KVC_Q(dst_idx).d = float16_t(d);
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q4_0/2; ++j) {
         const float x0 = float(data_s[src_idx + 0              + j])*id;
@@ -54,7 +62,7 @@ void quantize(uint dst_idx, uint src_idx)
         const uint xi0 = min(15, int(x0 + 8.5));
         const uint xi1 = min(15, int(x1 + 8.5));
 
-        data_q[dst_idx].qs[j]  = uint8_t(xi0 | (xi1 << 4));
+        KVC_Q(dst_idx).qs[j]  = uint8_t(xi0 | (xi1 << 4));
     }
 }
 #endif
@@ -75,8 +83,8 @@ void quantize(uint dst_idx, uint src_idx)
     const float d  = (vmax - vmin) / ((1 << 4) - 1);
     const float id = (d != 0.0) ? 1.0/d : 0.0;
 
-    data_q[dst_idx].d = float16_t(d);
-    data_q[dst_idx].m = float16_t(vmin);
+    KVC_Q(dst_idx).d = float16_t(d);
+    KVC_Q(dst_idx).m = float16_t(vmin);
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q4_1/2; ++j) {
         const float x0 = (float(data_s[src_idx + 0              + j]) - vmin)*id;
@@ -85,7 +93,7 @@ void quantize(uint dst_idx, uint src_idx)
         const uint xi0 = min(15, int(x0 + 0.5));
         const uint xi1 = min(15, int(x1 + 0.5));
 
-        data_q[dst_idx].qs[j]  = uint8_t(xi0 | (xi1 << 4));
+        KVC_Q(dst_idx).qs[j]  = uint8_t(xi0 | (xi1 << 4));
     }
 }
 #endif
@@ -107,7 +115,7 @@ void quantize(uint dst_idx, uint src_idx)
     const float d  = vmax / -16;
     const float id = (d != 0.0) ? 1.0/d : 0.0;
 
-    data_q[dst_idx].d = float16_t(d);
+    KVC_Q(dst_idx).d = float16_t(d);
 
     uint32_t qh = 0;
     [[unroll]] for (int j = 0; j < QUANT_K_Q5_0/2; ++j) {
@@ -117,12 +125,12 @@ void quantize(uint dst_idx, uint src_idx)
         const uint xi0 = min(31, int(x0 + 16.5));
         const uint xi1 = min(31, int(x1 + 16.5));
 
-        data_q[dst_idx].qs[j]  = uint8_t((xi0 & 0xf) | ((xi1 & 0xf) << 4));
+        KVC_Q(dst_idx).qs[j]  = uint8_t((xi0 & 0xf) | ((xi1 & 0xf) << 4));
         qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
         qh |= ((xi1 & 0x10u) >> 4) << (j + QUANT_K_Q5_0/2);
     }
-    data_q[dst_idx].qh[0] = uint16_t(qh & 0xFFFF);
-    data_q[dst_idx].qh[1] = uint16_t(qh >> 16);
+    KVC_Q(dst_idx).qh[0] = uint16_t(qh & 0xFFFF);
+    KVC_Q(dst_idx).qh[1] = uint16_t(qh >> 16);
 }
 #endif
 
@@ -141,8 +149,8 @@ void quantize(uint dst_idx, uint src_idx)
     const float d  = (max - min) / 31;
     const float id = (d != 0) ? 1.0/d : 0.0;
 
-    data_q[dst_idx].d = float16_t(d);
-    data_q[dst_idx].m = float16_t(min);
+    KVC_Q(dst_idx).d = float16_t(d);
+    KVC_Q(dst_idx).m = float16_t(min);
 
     uint32_t qh = 0;
     [[unroll]] for (int j = 0; j < QUANT_K_Q5_1/2; ++j) {
@@ -152,11 +160,11 @@ void quantize(uint dst_idx, uint src_idx)
         const uint xi0 = uint(x0 + 0.5);
         const uint xi1 = uint(x1 + 0.5);
 
-        data_q[dst_idx].qs[j]  = uint8_t((xi0 & 0xf) | ((xi1 & 0xf) << 4));
+        KVC_Q(dst_idx).qs[j]  = uint8_t((xi0 & 0xf) | ((xi1 & 0xf) << 4));
         qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
         qh |= ((xi1 & 0x10u) >> 4) << (j + QUANT_K_Q5_1/2);
     }
-    data_q[dst_idx].qh = qh;
+    KVC_Q(dst_idx).qh = qh;
 }
 #endif
 
@@ -173,12 +181,12 @@ void quantize(uint dst_idx, uint src_idx)
     const float d = amax / ((1 << 7) - 1);
     const float id = (d != 0.0) ? 1.0/d : 0.0;
 
-    data_q[dst_idx].d = float16_t(d);
+    KVC_Q(dst_idx).d = float16_t(d);
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q8_0; ++j) {
         const float x0 = float(data_s[src_idx + j])*id;
 
-        data_q[dst_idx].qs[j] = int8_t(round(x0));
+        KVC_Q(dst_idx).qs[j] = int8_t(round(x0));
     }
 }
 #endif
@@ -194,15 +202,15 @@ void quantize(uint dst_idx, uint src_idx)
 
     const float d = sum_abs / QUANT_K_Q1_0;
 
-    data_q[dst_idx].d = float16_t(d);
+    KVC_Q(dst_idx).d = float16_t(d);
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q1_0 / 8; ++j) {
-        data_q[dst_idx].qs[j] = uint8_t(0);
+        KVC_Q(dst_idx).qs[j] = uint8_t(0);
     }
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q1_0; ++j) {
         if (float(data_s[src_idx + j]) >= 0.0) {
-            data_q[dst_idx].qs[j / 8] |= uint8_t(1 << (j % 8));
+            KVC_Q(dst_idx).qs[j / 8] |= uint8_t(1 << (j % 8));
         }
     }
 }
@@ -226,14 +234,14 @@ void quantize(uint dst_idx, uint src_idx)
     const float d = amax;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
 
-    data_q[dst_idx].d = float16_t(d);
+    KVC_Q(dst_idx).d = float16_t(d);
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q2_0 / 4; ++j) {
         const uint q0 = quantize_q2_0(float(data_s[src_idx + 4*j    ]) * id);
         const uint q1 = quantize_q2_0(float(data_s[src_idx + 4*j + 1]) * id);
         const uint q2 = quantize_q2_0(float(data_s[src_idx + 4*j + 2]) * id);
         const uint q3 = quantize_q2_0(float(data_s[src_idx + 4*j + 3]) * id);
-        data_q[dst_idx].qs[j] = uint8_t(q0 | (q1 << 2u) | (q2 << 4u) | (q3 << 6u));
+        KVC_Q(dst_idx).qs[j] = uint8_t(q0 | (q1 << 2u) | (q2 << 4u) | (q3 << 6u));
     }
 }
 #endif
@@ -272,7 +280,7 @@ void quantize(uint dst_idx, uint src_idx)
         const float x1 = float(data_s[src_idx + QUANT_K_IQ4_NL/2 + j])*id;
         const uint xi0 = best_index(x0);
         const uint xi1 = best_index(x1);
-        data_q[dst_idx].qs[j] = uint8_t(xi0 | (xi1 << 4));
+        KVC_Q(dst_idx).qs[j] = uint8_t(xi0 | (xi1 << 4));
         const float v0 = kvalues_iq4nl[xi0];
         const float v1 = kvalues_iq4nl[xi1];
         const float w0 = float(data_s[src_idx + 0                + j])*float(data_s[src_idx + 0                + j]);
@@ -281,7 +289,7 @@ void quantize(uint dst_idx, uint src_idx)
         sumq2 += w0*v0*v0 + w1*v1*v1;
     }
 
-    data_q[dst_idx].d = float16_t(sumq2 > 0 ? sumqx/sumq2 : d);
+    KVC_Q(dst_idx).d = float16_t(sumq2 > 0 ? sumqx/sumq2 : d);
 
 }
 #endif
@@ -289,14 +297,14 @@ void quantize(uint dst_idx, uint src_idx)
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 void quantize(uint dst_idx, uint src_idx)
 {
-    data_q[dst_idx] = A_TYPE(float(data_s[src_idx]));
+    KVC_Q(dst_idx) = A_TYPE(float(data_s[src_idx]));
 }
 #endif
 
 #if defined(DATA_A_BF16)
 void quantize(uint dst_idx, uint src_idx)
 {
-    data_q[dst_idx] = A_TYPE(fp32_to_bf16(float(data_s[src_idx])));
+    KVC_Q(dst_idx) = A_TYPE(fp32_to_bf16(float(data_s[src_idx])));
 }
 #endif
 

@@ -7,6 +7,14 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A {block_q8_0 data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
+// the source block (chunked K/V: through the chunk table, kv_chunk.glsl)
+#include "kv_chunk.glsl"
+#if defined(KVC_SRC_BINDING)
+#define KVC_SRC(I) KVC_SRC_AT(I)
+#else
+#define KVC_SRC(I) data_a[I]
+#endif
+
 void main() {
     const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
 
@@ -31,12 +39,12 @@ void main() {
     const uint b_idx = 1024*i + 32*ir + 16*il;
 #endif
 
-    const float d = float(data_a[ib].d);
+    const float d = float(KVC_SRC(ib).d);
 
     const uint q_idx = 16*il;
 
     [[unroll]] for (uint l = 0; l < 16; l += 2) {
-        data_b[b_idx + l    ] = D_TYPE(d * data_a[ib].qs[q_idx + l    ]);
-        data_b[b_idx + l + 1] = D_TYPE(d * data_a[ib].qs[q_idx + l + 1]);
+        data_b[b_idx + l    ] = D_TYPE(d * KVC_SRC(ib).qs[q_idx + l    ]);
+        data_b[b_idx + l + 1] = D_TYPE(d * KVC_SRC(ib).qs[q_idx + l + 1]);
     }
 }

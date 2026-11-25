@@ -2,6 +2,19 @@
 
 #include "types.glsl"
 #include "generic_unary_head.glsl"
+#include "kv_chunk.glsl"
+#if defined(KVC_SRC_BINDING)
+// a chunked K/V source: the dequant functions read its blocks through the chunk table (kv_chunk.glsl)
+#define KVC_A(I) KVC_SRC_AT(I)
+#if defined(A_TYPE_PACKED16)
+KVC_REF(kvc_a16_ref, A_TYPE_PACKED16, KVC_SRC_ALIGN)
+#define KVC_A16(I) KVC_AT(kvc_a16_ref, kvc_src, I, KVC_SRC_SIZE)
+#endif
+#if defined(A_TYPE_PACKED32)
+KVC_REF(kvc_a32_ref, A_TYPE_PACKED32, KVC_SRC_ALIGN)
+#define KVC_A32(I) KVC_AT(kvc_a32_ref, kvc_src, I, KVC_SRC_SIZE)
+#endif
+#endif
 #include "dequant_funcs.glsl"
 
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)

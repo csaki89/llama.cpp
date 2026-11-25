@@ -39,6 +39,17 @@ layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
 layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
+// FA_K4/FA_V4(i): vec4 i of K/V (chunked K/V: through the chunk tables, flash_attn_dequant.glsl)
+#if defined(KV_CHUNKED)
+KVC_REF(kvc_kv4, FLOAT_TYPEV4, 8)
+layout (buffer_reference, std430, buffer_reference_align = 8) readonly buffer kvc_kv4_arr { FLOAT_TYPEV4 d[]; };
+#define FA_K4(I) KVC_AT(kvc_kv4, kvc_k, I, 8)
+#define FA_V4(I) KVC_AT(kvc_kv4, kvc_v, I, 8)
+#else
+#define FA_K4(I) data_kv4[I]
+#define FA_V4(I) data_vv4[I]
+#endif
+
 shared float tmpsh[row_split];
 
 const uint32_t qstride = HSK_pad / 4 + 2;
@@ -252,7 +263,7 @@ void main() {
                         } else
 #endif
                         {
-                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kcol * k_stride / 4 + d]);
+                            K_Tf = FLOAT_TYPEV4(FA_K4(k_offset / 4 + kcol * k_stride / 4 + d));
                         }
                     }
 
@@ -297,7 +308,7 @@ void main() {
                             } else
 #endif
                             {
-                                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kcol * k_stride / 4 + d * 16 / 4 + col_vec]);
+                                K_Tf = FLOAT_TYPEV4(FA_K4(k_offset / 4 + kcol * k_stride / 4 + d * 16 / 4 + col_vec));
                             }
                         }
 
@@ -312,7 +323,12 @@ void main() {
                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
             } else {
                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
+#if defined(KV_CHUNKED)
+                // the MatBc rows of the tile are in one chunk (a chunk is a multiple of 256 rows)
+                coopMatLoad(KMat, kvc_kv4_arr(KVC_ADDR(kvc_k, coord * 8u)).d, 0, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+#else
                 coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
             } else {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
@@ -426,7 +442,7 @@ void main() {
                         } else
 #endif
                         {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + v_row * v_stride / 4 + d]);
+                            V_Tf = FLOAT_TYPEV4(FA_V4(v_offset / 4 + v_row * v_stride / 4 + d));
                         }
                     }
 
@@ -478,7 +494,7 @@ void main() {
                         } else
 #endif
                         {
-                            kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                            kvsh[row * vsh_stride + col] = FA_V4((v_offset + v_row * v_stride + v_col) / 4);
                         }
                     } else {
                         kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
@@ -499,7 +515,11 @@ void main() {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+#if defined(KV_CHUNKED)
+                        coopMatLoad(QMat, kvc_kv4_arr(KVC_ADDR(kvc_v, v_tile_offset * 8u)).d, 0, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+#else
                         coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+#endif
                     } else {
                         const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
                         coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);

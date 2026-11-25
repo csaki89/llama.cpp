@@ -34,7 +34,7 @@ bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t low
 
 // shaders
 void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
-vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc);
+vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, bool kvc = false);
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc, bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type);
 uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_device_architecture &arch);
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
@@ -236,8 +236,20 @@ size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buf
 void ggml_backend_vk_free(ggml_backend_t backend);
 ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size);
 ggml_backend_reg_t ggml_backend_vk_reg();
-// sparse growable buffers (dual-buffer fork, dynamic KV), ggml-vulkan-buffers.cpp
-void * ggml_vk_sparse_proc_address(const char * name);
+// chunked K/V buffers (dual-buffer fork, dynamic KV), ggml-vulkan-buffers.cpp
+void * ggml_vk_kvc_proc_address(const char * name);
+// a piece of a buffer range: the Vulkan buffer (a chunk of a chunked section), the offset in it, the bytes and the offset in the range
+struct vk_kvc_piece {
+    vk_buffer buf;
+    size_t    off;
+    size_t    len;
+    size_t    done;
+};
+bool ggml_vk_buffer_chunked(ggml_backend_buffer_t buffer);
+bool ggml_vk_tensor_chunked(const ggml_tensor * t);
+std::vector<vk_kvc_piece> ggml_vk_buffer_pieces(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+void ggml_vk_buffer_copy_pieces(ggml_backend_buffer_t dst, size_t dst_offset, ggml_backend_buffer_t src, size_t src_offset, size_t size);
+vk_subbuffer ggml_vk_kvc_subbuffer(const ggml_tensor * t, size_t base);
 
 // comm
 #if !defined(_WIN32)

@@ -12,6 +12,15 @@ layout (binding = 2) readonly buffer Z {float rope_data_ff[];};
 layout (binding = 3) writeonly buffer D {ROPE_D_TYPE rope_data_d[];};
 layout (binding = 4) readonly buffer I {uvec2 rope_data_i[];}; // indices for set_rows
 
+// the source and destination elements (chunked K/V: through the chunk table, kv_chunk.glsl)
+#include "kv_chunk.glsl"
+#if defined(KVC_SRC_BINDING)
+#define ROPE_A(I) KVC_SRC_AT(I)
+#endif
+#if defined(KVC_DST_BINDING)
+#define ROPE_D(I) KVC_DST_AT(I)
+#endif
+
 
 layout (push_constant) uniform parameter {
     rope_params pc;
