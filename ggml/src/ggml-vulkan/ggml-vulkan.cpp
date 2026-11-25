@@ -13791,6 +13791,7 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     }
 
     ggml_vk_cleanup(ctx);
+    ggml_vk_kfd_compute_release(ctx->device);
 
     delete ctx;
     delete backend;
@@ -16038,6 +16039,8 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
+    // dual-buffer fork: the compute power state of an AMD GPU while a backend lives on it (ggml-vulkan-kfd.cpp)
+    ggml_vk_kfd_compute_acquire(ctx->device);
     {
         std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
         vk_ctx_live.insert(ctx);
