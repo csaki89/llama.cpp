@@ -140,6 +140,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         }
 
         buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
+        buf->memory_type_index = memory_type_idx;
         try {
             vk::ImportMemoryHostPointerInfoEXT import_info;
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
@@ -164,6 +165,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                 try {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                    buf->memory_type_index = *mtype_it;
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
@@ -328,6 +330,33 @@ void * ggml_vk_host_malloc(size_t size) {
         return nullptr;
     }
 
+    // dual-buffer fork: the CPU computes from these buffers (the dual-buffer original-format copies, the weights that cannot
+    // be repacked, the flex copies, the CPU compute and output buffers): without a cached host memory type (write-combined or
+    // uncached memory, slow to read) they are plain process RAM instead, which the GPU gets through the staging buffer
+    // (as an unpinned host pointer); with one (RADV, ANV, NVIDIA) nothing changes
+    if (!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached)) {
+        ggml_vk_log_host_memory(buf, "Vulkan_Host buffers (not used: no cached host memory type)");
+        ggml_vk_destroy_buffer(buf);
+        const size_t align      = std::max<size_t>(4096, TENSOR_ALIGNMENT);
+        const size_t alloc_size = (size + align - 1) / align * align;
+        void * ptr = portable_aligned_malloc(align, alloc_size);
+        if (ptr == nullptr) {
+            return nullptr;
+        }
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            GGML_LOG_WARN("ggml_vulkan: Vulkan_Host buffers: plain process RAM (cached for the CPU); the GPU reads them through the staging buffer\n");
+        });
+        vk_host_allocation entry;
+        entry.base = ptr;
+        entry.size = alloc_size;
+        entry.ram  = true;
+        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+        vk_instance.host_allocations.push_back(std::move(entry));
+        return ptr;
+    }
+    ggml_vk_log_host_memory(buf, "Vulkan_Host buffers (dual-buffer and flex copies, CPU compute and output buffers)");
+
     vk_host_allocation entry;
     entry.base             = buf->ptr;
     entry.size             = size;
@@ -359,7 +388,7 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    if (vk_instance.multi_device || entry.ram) {
         portable_aligned_free(entry.base);
     }
 }
@@ -412,6 +441,7 @@ void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t si
         ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        ggml_vk_log_host_memory(ctx->sync_staging, "staging buffer (readbacks)");
     }
 }
 

@@ -343,6 +343,42 @@ bool ggml_vk_low_latency_sync() {
     return on;
 }
 
+// dual-buffer fork: one line per use and memory type of the host memory the CPU reads (the Vulkan_Host buffers, the staging
+// buffers): the memory type, its flags and heap, and whether CPU reads are cached
+void ggml_vk_log_host_memory(const vk_buffer & buf, const char * what) {
+    if (!buf || buf->memory_type_index == UINT32_MAX) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::set<std::pair<std::string, uint32_t>> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert({ std::string(buf->device->name) + "/" + what, buf->memory_type_index }).second) {
+        return;
+    }
+    const vk::PhysicalDeviceMemoryProperties mp = buf->device->physical_device.getMemoryProperties();
+    const vk::MemoryType & mt = mp.memoryTypes[buf->memory_type_index];
+    const vk::MemoryHeap & mh = mp.memoryHeaps[mt.heapIndex];
+    std::string flags;
+    auto flag = [&](vk::MemoryPropertyFlagBits b, const char * n) {
+        if (mt.propertyFlags & b) {
+            flags += flags.empty() ? n : std::string("|") + n;
+        }
+    };
+    flag(vk::MemoryPropertyFlagBits::eDeviceLocal,  "DEVICE_LOCAL");
+    flag(vk::MemoryPropertyFlagBits::eHostVisible,  "HOST_VISIBLE");
+    flag(vk::MemoryPropertyFlagBits::eHostCoherent, "HOST_COHERENT");
+    flag(vk::MemoryPropertyFlagBits::eHostCached,   "HOST_CACHED");
+    const bool cached = (bool) (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostCached);
+    const char * fmt = "ggml_vulkan: %s: %s: memory type %u (%s), heap %u (%.0f MiB%s): %s\n";
+    const char * how = cached ? "cached for the CPU" : "NOT cached for the CPU (write-combined or uncached: slow CPU reads)";
+    const char * dev = (mh.flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? ", device-local" : ", system memory";
+    if (cached) {
+        GGML_LOG_INFO(fmt, buf->device->name.c_str(), what, buf->memory_type_index, flags.c_str(), mt.heapIndex, mh.size / 1048576.0, dev, how);
+    } else {
+        GGML_LOG_WARN(fmt, buf->device->name.c_str(), what, buf->memory_type_index, flags.c_str(), mt.heapIndex, mh.size / 1048576.0, dev, how);
+    }
+}
+
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
@@ -421,9 +457,14 @@ ggml_vk_timing_scope::~ggml_vk_timing_scope() {
     } else if (now - t_print >= 2000000) {
         const double s = (now - t_print) / 1e6;
         auto mean = [&](int c) { return n[c] ? (double) t[c] / n[c] : 0.0; };
-        GGML_LOG_INFO("ggml_vulkan: sched timing: per second: %.0f graph recordings %.1f us, %.0f synchronizes %.1f us, %.0f sync reads %.1f us (%.0f from the read-ahead), %.0f sync writes %.1f us\n",
-            n[GGML_VK_T_GRAPH] / s, mean(GGML_VK_T_GRAPH), n[GGML_VK_T_SYNC] / s, mean(GGML_VK_T_SYNC),
-            n[GGML_VK_T_READ] / s, mean(GGML_VK_T_READ), n[GGML_VK_T_RA_HIT] / s, n[GGML_VK_T_WRITE] / s, mean(GGML_VK_T_WRITE));
+        auto ms = [&](int c) { return t[c] / 1000.0 / s; };
+        GGML_LOG_INFO("ggml_vulkan: sched timing: per second: %.0f graph recordings %.1f us, %.0f replays %.1f us, %.0f synchronizes %.1f us "
+            "(%.0f submissions %.1f us, %.0f GPU waits %.1f us), %.0f sync reads %.1f us (%.0f from the read-ahead), %.0f sync writes %.1f us; "
+            "ms per second: recording %.2f, replay %.2f, submission %.2f, GPU wait %.2f, sync reads %.2f, sync writes %.2f\n",
+            n[GGML_VK_T_GRAPH] / s, mean(GGML_VK_T_GRAPH), n[GGML_VK_T_REPLAY] / s, mean(GGML_VK_T_REPLAY), n[GGML_VK_T_SYNC] / s, mean(GGML_VK_T_SYNC),
+            n[GGML_VK_T_SUBMIT] / s, mean(GGML_VK_T_SUBMIT), n[GGML_VK_T_WAIT] / s, mean(GGML_VK_T_WAIT),
+            n[GGML_VK_T_READ] / s, mean(GGML_VK_T_READ), n[GGML_VK_T_RA_HIT] / s, n[GGML_VK_T_WRITE] / s, mean(GGML_VK_T_WRITE),
+            ms(GGML_VK_T_GRAPH), ms(GGML_VK_T_REPLAY), ms(GGML_VK_T_SUBMIT), ms(GGML_VK_T_WAIT), ms(GGML_VK_T_READ), ms(GGML_VK_T_WRITE));
         for (int c = 0; c < GGML_VK_T_COUNT; c++) {
             n[c] = t[c] = 0;
         }
@@ -491,6 +532,7 @@ static bool ggml_vk_readahead_record(ggml_backend_vk_context * ctx, vk_context &
         ra.staging = ggml_vk_create_buffer_check(ctx->device, std::max<size_t>(total, 1u << 16),
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        ggml_vk_log_host_memory(ra.staging, "read-ahead staging buffer");
     }
     ggml_vk_sync_buffers(nullptr, compute_ctx);
     size_t off = 0;
@@ -13383,8 +13425,14 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
-    ctx->pipeline_descriptor_set_requirements = 0;
-    ctx->descriptor_set_idx = 0;
+    // dual-buffer fork: the descriptor sets below replay_desc_reserved belong to the replay entries (vk_replay)
+    ctx->pipeline_descriptor_set_requirements = ctx->replay_desc_reserved;
+    ctx->descriptor_set_idx = ctx->replay_desc_reserved;
+    ctx->replay_window++;
+    if (!ctx->replay_retired.empty()) {
+        ctx->device->device.freeCommandBuffers(ctx->replay_pool, ctx->replay_retired);
+        ctx->replay_retired.clear();
+    }
 }
 
 void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
@@ -13431,6 +13479,14 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_set_bindings.clear();
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
+    // dual-buffer fork: vk_replay (all done: synchronized above)
+    ctx->replay.clear();
+    ctx->replay_retired.clear();
+    ctx->replay_desc_reserved = 0;
+    if (ctx->replay_pool) {
+        ctx->device->device.destroyCommandPool(ctx->replay_pool);
+        ctx->replay_pool = nullptr;
+    }
     if (ctx->device->async_use_transfer_queue) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
 
@@ -13998,7 +14054,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         } else if (ggml_vk_low_latency_sync() && !(ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value)) {
             // dual-buffer fork: the pending commands carry the fence themselves (no empty submission for it): one submission
             // and one wait, as a HIP stream synchronize after its async copies
-            ggml_vk_submit(compute_ctx, ctx->fence);
+            {
+                ggml_vk_timing_scope timing(GGML_VK_T_SUBMIT);
+                ggml_vk_submit(compute_ctx, ctx->fence);
+            }
             readahead_epoch = ggml_vk_tl_submit_epoch;
             fence_submitted = true;
         } else {
@@ -14030,6 +14089,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
+            ggml_vk_timing_scope timing(GGML_VK_T_WAIT);
             ggml_vk_wait_for_fence(ctx);
         }
         if (readahead_eligible && fence_submitted) {
@@ -14809,6 +14869,129 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// dual-buffer fork: vk_replay. In a GPU/CPU split generation every token runs the same small split graphs; HIP launches their
+// kernels while the GPU already runs the first ones, Vulkan records the whole command buffer first (tens of microseconds per
+// graph, the GPU idle meanwhile). A small graph (the defer_last_submit condition: one submission) that comes again with the
+// same signature is recorded once into a command buffer of its own (not one-time-submit, its own descriptor sets) and then
+// put into the submission as it is, between the copies recorded before it and the readback recorded after it (a barrier on
+// both sides). Any destroyed device buffer (a handle may come back for a new buffer) drops all entries.
+// GGML_VK_GRAPH_REPLAY=0 turns it off (test aid).
+static bool ggml_vk_replay_enabled() {
+    static const bool on = ggml_vk_low_latency_sync() && (!getenv("GGML_VK_GRAPH_REPLAY") || atoi(getenv("GGML_VK_GRAPH_REPLAY")) != 0);
+    return on;
+}
+
+// what the recorded commands depend on: per node its identity, op, parameters, flags, use count, type, shape, strides, buffer
+// and address, and the same of its sources (the fusions, the barriers, the pipelines, the push constants and the bindings
+// all follow from these)
+static void ggml_vk_replay_signature(const ggml_cgraph * cgraph, std::vector<uint64_t> & sig) {
+    sig.clear();
+    sig.push_back((uint64_t) cgraph->n_nodes);
+    auto add_tensor = [&](const ggml_tensor * t) {
+        sig.push_back((uint64_t) (uintptr_t) t);
+        sig.push_back((uint64_t) t->type | ((uint64_t) t->op << 16) | ((uint64_t) (uint32_t) t->flags << 32));
+        sig.push_back((uint64_t) (uintptr_t) t->data);
+        sig.push_back((uint64_t) (uintptr_t) t->buffer);
+        sig.push_back((uint64_t) (uintptr_t) t->view_src);
+        sig.push_back((uint64_t) t->view_offs);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            sig.push_back((uint64_t) t->ne[d]);
+            sig.push_back((uint64_t) t->nb[d]);
+        }
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        add_tensor(node);
+        sig.push_back((uint64_t) (int64_t) ggml_node_get_use_count(cgraph, i));
+        uint64_t p[GGML_MAX_OP_PARAMS / sizeof(uint64_t)];
+        memcpy(p, node->op_params, sizeof(p));
+        sig.insert(sig.end(), p, p + GGML_MAX_OP_PARAMS / sizeof(uint64_t));
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s]) {
+                sig.push_back(0x5352430000000000ULL | (uint64_t) s);
+                add_tensor(node->src[s]);
+            }
+        }
+    }
+}
+
+// drop all entries (their command buffers are freed at the next graph cleanup: one may be in the open submission)
+static void ggml_vk_replay_drop(ggml_backend_vk_context * ctx) {
+    for (auto & it : ctx->replay) {
+        if (it.second->cb.buf) {
+            ctx->replay_retired.push_back(it.second->cb.buf);
+        }
+    }
+    ctx->replay.clear();
+    ctx->replay_desc_reserved = 0;
+}
+
+// put a recorded graph into the open submission: the copies recorded so far end their command buffer, the entry follows, a new
+// command buffer (barrier first) takes what comes after (the readback at the split boundary)
+static void ggml_vk_replay_put(ggml_backend_vk_context * ctx, vk_replay_entry & e) {
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_ctx_end(compute_ctx);
+    compute_ctx->seqs.push_back({ vk_submission{} });
+    compute_ctx->seqs.back()[0].buffer = &e.cb;
+    ggml_vk_ctx_begin(ctx->device, compute_ctx);
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+    e.window = ctx->replay_window;
+}
+
+// start recording a graph into the entry's command buffer (it becomes the open command buffer of the compute context)
+static vk_context ggml_vk_replay_begin(ggml_backend_vk_context * ctx, vk_replay_entry & e) {
+    if (!ctx->replay_pool) {
+        vk::CommandPoolCreateInfo ci(vk::CommandPoolCreateFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer),
+                                     ctx->device->compute_queue->queue_family_index);
+        ctx->replay_pool = ctx->device->device.createCommandPool(ci);
+    }
+    if (!e.cb.buf) {
+        vk::CommandBufferAllocateInfo ai(ctx->replay_pool, vk::CommandBufferLevel::ePrimary, 1);
+        e.cb.buf = ctx->device->device.allocateCommandBuffers(ai).front();
+    }
+    e.valid = false;
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_ctx_end(compute_ctx);
+    e.cb.buf.reset();
+    e.cb.buf.begin(vk::CommandBufferBeginInfo{});
+    compute_ctx->seqs.push_back({ vk_submission{} });
+    compute_ctx->s = compute_ctx->seqs.back().data();
+    compute_ctx->s->buffer = &e.cb;
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+    e.window = ctx->replay_window;
+    e.desc_begin = ctx->descriptor_set_idx;
+    return compute_ctx;
+}
+
+// after the graph: keep the entry if the whole graph went into its command buffer and nothing else happened meanwhile (no
+// submission: it would have closed the command buffer, no buffer destroyed, no host copies recorded); otherwise the commands
+// run once as recorded
+static void ggml_vk_replay_end(ggml_backend_vk_context * ctx, vk_replay_entry & e, vk_context & rctx, size_t seqs0, size_t host_ops0,
+                               uint64_t destroy0, uint64_t total_flops) {
+    vk_context cur = ctx->compute_ctx.lock();
+    const size_t host_ops = rctx->in_memcpys.size() + rctx->out_memcpys.size() + rctx->memsets.size();
+    const bool ok = cur == rctx && rctx->s != nullptr && rctx->s->buffer == &e.cb && rctx->seqs.size() == seqs0 &&
+                    host_ops == host_ops0 && ctx->device->buffer_destroy_count.load(std::memory_order_acquire) == destroy0;
+    if (!ok) {
+        e.fails++;
+        e.seen = 0;
+        return;
+    }
+    ggml_vk_ctx_end(rctx);
+    e.valid       = true;
+    e.desc_end    = ctx->descriptor_set_idx;
+    e.total_flops = total_flops;
+    ctx->replay_desc_reserved = std::max(ctx->replay_desc_reserved, e.desc_end);
+    ggml_vk_ctx_begin(ctx->device, rctx);
+    ggml_vk_sync_buffers(ctx, rctx);
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -14918,6 +15101,47 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->defer_last_submit = ggml_vk_low_latency_sync() && flops_per_submit == 0 && !vk_perf_logger_enabled &&
                              !ctx->device->serialize_submissions && ctx->device->support_async;
+
+    // dual-buffer fork: vk_replay
+    vk_replay_entry * replay_rec = nullptr;
+    vk_context replay_ctx;
+    size_t replay_seqs = 0, replay_host_ops = 0;
+    uint64_t replay_destroy = 0;
+    if (ctx->defer_last_submit && ggml_vk_replay_enabled() && !vk_instance.debug_utils_support) {
+        const uint64_t dc = ctx->device->buffer_destroy_count.load(std::memory_order_acquire);
+        if (dc != ctx->replay_destroy_count || ctx->replay.size() > 1024) {
+            ggml_vk_replay_drop(ctx);
+            ctx->replay_destroy_count = dc;
+        }
+        std::unique_ptr<vk_replay_entry> & e = ctx->replay[cgraph];
+        if (!e) {
+            e = std::make_unique<vk_replay_entry>();
+        }
+        thread_local std::vector<uint64_t> sig;
+        ggml_vk_replay_signature(cgraph, sig);
+        if (e->window != ctx->replay_window && e->fails < 2) {
+            if (e->valid && e->sig == sig) {
+                ggml_vk_replay_put(ctx, *e);
+                ctx->last_total_flops = e->total_flops;
+                timing.cat = GGML_VK_T_REPLAY;
+                return GGML_STATUS_SUCCESS;
+            }
+            if (e->sig == sig) {
+                e->seen++;
+            } else {
+                e->sig   = sig;
+                e->seen  = 1;
+                e->valid = false;
+            }
+            if (e->seen >= 2) {
+                replay_rec      = e.get();
+                replay_ctx      = ggml_vk_replay_begin(ctx, *e);
+                replay_seqs     = replay_ctx->seqs.size();
+                replay_host_ops = replay_ctx->in_memcpys.size() + replay_ctx->out_memcpys.size() + replay_ctx->memsets.size();
+                replay_destroy  = dc;
+            }
+        }
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -15282,6 +15506,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
+    }
+
+    if (replay_rec) {
+        ggml_vk_replay_end(ctx, *replay_rec, replay_ctx, replay_seqs, replay_host_ops, replay_destroy, total_flops);
     }
 
     ctx->last_total_flops = total_flops;

@@ -1097,6 +1097,7 @@ struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
     vk::MemoryPropertyFlags memory_property_flags;
+    uint32_t memory_type_index = UINT32_MAX; // dual-buffer fork: for the host memory log line (ggml_vk_log_host_memory)
     void * ptr;
     size_t size = 0;
     size_t host_counted = 0; // in ggml_vk_host_alloc_bytes
@@ -1286,6 +1287,19 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// dual-buffer fork: vk_replay: the command buffer of a small graph (a split graph of a generation step) recorded once and
+// submitted again while the graph stays the same (see ggml_vk_replay_signature); it owns its descriptor sets
+struct vk_replay_entry {
+    std::vector<uint64_t> sig;       // the graph's signature when recorded (or last seen)
+    uint32_t          seen = 0;      // consecutive computations with sig
+    uint32_t          fails = 0;     // recordings that could not be kept (the graph is then recorded as usual)
+    bool              valid = false; // cb holds the commands of sig
+    vk_command_buffer cb {};         // from the context's replay pool, not one-time-submit
+    uint64_t          window = 0;    // the synchronize window it was last put into (a command buffer goes in once per window)
+    uint32_t          desc_begin = 0, desc_end = 0;
+    uint64_t          total_flops = 0;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1340,6 +1354,14 @@ struct ggml_backend_vk_context {
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
+    // dual-buffer fork: vk_replay
+    std::unordered_map<const ggml_cgraph *, std::unique_ptr<vk_replay_entry>> replay;
+    std::vector<vk::CommandBuffer> replay_retired;  // freed at the next graph cleanup (they may still be pending)
+    vk::CommandPool replay_pool;
+    uint32_t replay_desc_reserved {};  // descriptor sets [0, replay_desc_reserved) belong to replay entries
+    uint64_t replay_destroy_count {};  // device buffer_destroy_count when the entries were recorded
+    uint64_t replay_window {1};        // counts the graph cleanups (one per synchronize)
+
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
 
@@ -1386,6 +1408,7 @@ struct ggml_backend_vk_buffer_context {
 struct vk_host_allocation {
     void *    base = nullptr;
     size_t    size = 0;
+    bool      ram  = false; // dual-buffer fork: plain process RAM without a device view (no cached host memory type), freed here
     vk_buffer views[GGML_VK_MAX_DEVICES];  // indexed by device->idx; null = not (yet) mapped here
 };
 
