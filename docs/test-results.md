@@ -95,7 +95,7 @@ Laptop, Qwen2.5-1.5B, `LLAMA_DUAL_BUFFER_FREE_MIB=6000`. "becslés" = a naplóbe
 A javítás előtti bináris `-ngl 99 -ot` mellett `CPU part ~0 MiB`-ot adott (a hiba reprodukálva). A NAS-os Ollama + MoE esetet ott kell újramérni.
 
 ## Háromzónás elhelyezés, 1. építőkocka: `--flex-layers` (rétegek áthelyezése futás közben)
-Laptop (Vulkan, Iris Xe iGPU), Qwen2.5-1.5B (28 réteg), `-ngl 14`, `--flex-layers 2` (a 26. és 27. réteg), hosszú prompt (1611 token), 200 generált token, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (2 ismétlés, a dual-buffer esetek 1). Kiváltás: `LLAMA_FLEX_TEST="<token>:<take|put>:<réteg>,..."`.
+Laptop (Vulkan, integrált Intel GPU), Qwen2.5-1.5B (28 réteg), `-ngl 14`, `--flex-layers 2` (a 26. és 27. réteg), hosszú prompt (1611 token), 200 generált token, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (2 ismétlés, a dual-buffer esetek 1). Kiváltás: `LLAMA_FLEX_TEST="<token>:<take|put>:<réteg>,..."`.
 
 ### Opció nélkül (baseline)
 `bench.sh`, 8 mód x 2 prompt x 3 ismétlés. Az utolsó 3 futás (`dual_noopoff`, hosszú prompt) nem futott le, mert a rendszer kevés memória miatt leállította a mérést; nem indítottam újra. A lefutott 45 futásban minden md5 és puffer egyezik a korábbiakkal: rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pufferek pl. repack `CPU=225,15 CPU_REPACK=308,18 Vulkan0=526,55`, host `Vulkan0=526,55 Vulkan_Host=533,33`, dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`. Opció nélkül a naplóban nincs `flex` sor.
@@ -153,7 +153,7 @@ Laptop, ugyanaz a beállítás (`-ngl 14`, `--flex-layers 2`, hosszú prompt 161
 `bench.sh -r 1` (8 mód x 2 prompt, 1 ismétlés; az md5 determinisztikus), a `a6dd34d00` kódon. Mind a 16 futás md5-je és puffere egyezik a korábbiakkal: rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`. Ezzel a korábban kimaradt `dual_noopoff` hosszú eset is ellenőrizve (`2be92339`). Opció nélkül a naplóban nincs `flex` sor, a KV-pufferek a megszokottak (rétegenkénti KV-puffer csak `--flex-layers` mellett keletkezik).
 
 ## A rugalmas sáv befejezése (sáv a határon, host-példány, DMA-másolás)
-Laptop (Vulkan, Iris Xe iGPU, közös memória), Qwen2.5-1.5B, `-ngl 14 --flex-layers 2` (a sáv most a **15. és 16.** réteg, a CPU-s rétegek mellett), hosszú prompt 1611 token, 200 generált token, `n_ctx` 32768, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (esetenként 1 futás; a mátrix a `ddfd52fd6`, a visszatételi idők az `aba2179ec` kódon).
+Laptop (Vulkan, integrált Intel GPU, közös memória), Qwen2.5-1.5B, `-ngl 14 --flex-layers 2` (a sáv most a **15. és 16.** réteg, a CPU-s rétegek mellett), hosszú prompt 1611 token, 200 generált token, `n_ctx` 32768, temperature 0. Szkript: `tools/dualbuf/flex-test.sh` (esetenként 1 futás; a mátrix a `ddfd52fd6`, a visszatételi idők az `aba2179ec` kódon).
 
 ### Opció nélkül
 `bench.sh -r 1` az `aba2179ec` kódon: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759` mindenhol; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pl. dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer viselkedése nem változott; a keret naplósorában új a `flex copies 0 MiB` mező.
@@ -214,7 +214,7 @@ Laptop (Vulkan, Iris Xe iGPU, közös memória), Qwen2.5-1.5B, `-ngl 14 --flex-l
 ROCm/HIP (HIP-gráfok a címváltozás után, PCIe-sebesség), dedikált GPU eszközmemória-lekérdezése, MoE, több context, iSWA/hibrid memória, `llama-server`, transzponált V (flash attention nélkül), a RAM-védelem kiváltása (`flex_no_host`, a sáv kikapcsolása) valódi RAM-hiánnyal.
 
 ## Automatikus háromzónás működés (`--auto-zones`)
-Laptop (Vulkan, Iris Xe iGPU), Qwen2.5-1.5B, `-c 32768`, `-fa auto -b 512 -ub 512`, temperature 0. A sáv kényszerítése a `--fit-target`-tel (`-fitt 6500`: a fit 6,5 GiB tartalékot hagy), a keret a `LLAMA_ZONES_HEADROOM_MIB`-bel. Szkriptek: `tools/dualbuf/zones-test.sh` (llama-server), a sebességsor kézi `llama-completion` futás.
+Laptop (Vulkan, integrált Intel GPU), Qwen2.5-1.5B, `-c 32768`, `-fa auto -b 512 -ub 512`, temperature 0. A sáv kényszerítése a `--fit-target`-tel (`-fitt 6500`: a fit 6,5 GiB tartalékot hagy), a keret a `LLAMA_ZONES_HEADROOM_MIB`-bel. Szkriptek: `tools/dualbuf/zones-test.sh` (llama-server), a sebességsor kézi `llama-completion` futás.
 
 ### Kikapcsolva
 `bench.sh -r 1` a `047a72477` kódon: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759`; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; pl. dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer viselkedése nem változott.
@@ -277,7 +277,7 @@ Ahol a rétegek helye a kérés alatt nem változik: `LLAMA_ZONES_HEADROOM_MIB=-
 VMM (CUDA/HIP, nem készült el), ROCm/HIP-gráfok a címváltozások után, dedikált GPU-n a keret pontossága, MoE (az automatikus sáv ott kimarad), több slot/sorozat (`-np` > 1), transzponált V (flash attention nélkül a dinamikus KV kikapcsol), a 12,8k-s sebességsor.
 
 ## Valódi használat: MoE, VMM, Flash Attention (`e86f222a5`)
-Laptop (Vulkan, Iris Xe iGPU). Modellek: Qwen2.5-1.5B (dense) és **granite-3.1-1b-a400m-instruct Q4_K_M** (MoE, 24 réteg, 32 szakértő, 784 MiB; nyilvános GGUF, bartowski).
+Laptop (Vulkan, integrált Intel GPU). Modellek: Qwen2.5-1.5B (dense) és **granite-3.1-1b-a400m-instruct Q4_K_M** (MoE, 24 réteg, 32 szakértő, 784 MiB; nyilvános GGUF, bartowski).
 
 ### Kikapcsolva
 `bench.sh -r 1`: mind a 16 futás md5-je és puffere egyezik a korábbiakkal (rövid `8e2d6759`; hosszú: repack/repack_noopoff/dual_noopoff `2be92339`, host `0063c4c5`, host_noopoff `df42ead7`, cpu_only `f773f5bc`, gpu_full `a8939715`, dual `35969901`; dual `CPU_REPACK=308,18 Vulkan0=526,55 Vulkan_Host=533,33`). A dual-buffer változatlan.

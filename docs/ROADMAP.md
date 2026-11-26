@@ -34,7 +34,7 @@ Becslés a qwen3-coder:30b-re (32K kontextus): 1. zóna ~5,7 GB, 2. zóna ~3 GB,
 
 
 #### A (c) változat NAS-os ellenőrzése (VMM-teszt)
-Környezet: RX 6700 (gfx1031), `HSA_OVERRIDE_GFX_VERSION=10.3.0`, ROCm 7.2.1, `rocm/dev-ubuntu-24.04:7.2.1`. A tesztprogramok (`vmm_test.cpp` ... `vmm_test4.cpp`) a NAS-on vannak, a repóban nincsenek.
+Környezet: RDNA2-es AMD GPU (gfx103x), `HSA_OVERRIDE_GFX_VERSION=10.3.0`, ROCm 7.2.1, `rocm/dev-ubuntu-24.04:7.2.1`. A tesztprogramok (`vmm_test.cpp` ... `vmm_test4.cpp`) a NAS-on vannak, a repóban nincsenek.
 
 Mért tények:
 - A VMM támogatott (`hipDeviceAttributeVirtualMemoryManagementSupported` = 1), a legkisebb egység 4 KiB.
@@ -52,7 +52,7 @@ Következmények a tervre:
 - A -4%-os eltérést a `hipMalloc` után a valódi megvalósításban is meg kell mérni.
 - Nyitott: a Vulkan megfelelője (sparse binding) nincs megvizsgálva; a VMM-teszt csak ROCm-ra vonatkozik.
 
-#### A VMM-laphiba vizsgálata (NAS, ROCm 7.2.1, gfx1030 + HSA_OVERRIDE 10.3.0, TrueNAS kernel 6.12.33)
+#### A VMM-laphiba vizsgálata (NAS, ROCm 7.2.1, gfx1030 + HSA_OVERRIDE 10.3.0, a NAS kernele, 6.12.33)
 Mért tények:
 - Ugyanaz a kód futásonként változóan működik vagy laphibát ad. A dmesg szerint a hiba pillanatában nincs bejegyzés a GPU laptáblájában (PERMISSION_FAULTS, MAPPING_ERROR, WALKER_ERROR mind 0), a `hipMemMap` és a `hipMemSetAccess` `hipSuccess`-szel tér vissza.
 - Önálló teszt (granularitás, igazítás, egy nagy címtartomány, abba egymás után darabok, minden darab teljes kitöltése kernellel és visszaolvasása): várakozás nélkül 2, 4, 64 és 256 MiB-os darabbal 0/3; a `hipMemMap` + `hipMemSetAccess` utáni 1, 10 és 100 ms várakozással minden méretnél 3/3.
@@ -69,7 +69,7 @@ Ok (forrásból): a `hipMemSetAccess` a ROCr-en át a DRM `GEM_VA` ioctl-t hívj
 - Korábbi önálló mérések ugyanezen a gépen: a laptábla-frissítés a leképezés után ~30-100 µs (10-30 µs vak várakozás a nagyobb darabokkal hibázik, 100 µs elég volt); a `hipDeviceSynchronize` nem segít; egy üres kernel + `hipStreamSynchronize` sem megbízható (csak ~20 µs késleltetésként hat, 64 és 256 MiB-os darabokkal 0/5). A korlát költségének nagyobb része a `hipFree` (üresjáratban `hipMalloc` 4 MiB ~78 µs, `hipFree` ~207 µs), és a `hipFree` a teljes eszközt szinkronizálja.
 - Következtetés: HIP-en az alapértelmezés a KFD-korlát várakozás nélkül; a vak várakozás csak hibakereső mód; a korlát `hipFree`-je a `commit` saját eszközszinkronja után fut (DECISIONS.md 40).
 
-#### Később: TrueNAS 27 / 6.18-as kernel / újabb ROCm (a TrueNAS 27.0 megjelenése után megvizsgálandó)
+#### Később: 6.18-as kernel / újabb ROCm (a NAS rendszerének következő kiadása után megvizsgálandó)
 - A 6.18-as kernel amdgpu `GEM_VA` hívása timeline syncobj-ot tud adni a laptábla-frissítés megvárására: ezzel a várakozás determinisztikus lehet, a KFD-korlát (egy friss 4 MiB-os foglalás és felszabadítás) nélkül. Ellenőrizendő, hogy a ROCr/HIP használja-e, vagy közvetlenül (libdrm) elérhető-e a mi kódunkból.
 - A `rocm/dev-ubuntu-24.04:latest` (HIP 7.16) a 6.12-es kernelen VMM nélkül működik, a VMM-úton viszont az első darabnál laphiba nélkül elakad. Az elakadás okát (a régi kernel és az új ROCr összjátéka, vagy a ROCr hibája) a 6.18-as kernellel újra meg kell nézni.
 - Teendő a megjelenés után: a `vmm-stress` (impl és pattern, minden mód) a 6.18-as kernelen a ROCm 7.2.1-es és az újabb ROCm-image-dzsel; ha a syncobj-os várakozás elérhető és megbízható, új szinkron mód (`syncobj`) és az alapértelmezés felülvizsgálata.
@@ -91,7 +91,7 @@ Ok (forrásból): a `hipMemSetAccess` a ROCr-en át a DRM `GEM_VA` ioctl-t hívj
 - **Több GPU tesztelése.** A host-puffer az első olyan eszközé, amelynek van (DECISIONS.md 5.). Többeszközös gépen ellenőrizendő: melyik eszköz kapja az offloadot, a tensor split és a host-puffer kapcsolata, a `--split-mode row` hatása.
 - **cgroup/NAS-ellenőrzés.** A cgroup-alapú RAM-keret (DECISIONS.md 13.) valódi konténerkorláttal (`docker --memory`) még nem lett kipróbálva.
 
-## 3. Tételek a NAS-os mérések alapján (Ollama 0.40.2, RX 6700, PCIe)
+## 3. Tételek a NAS-os mérések alapján (Ollama 0.40.2, RDNA2-es kártya, PCIe)
 - **A prompt-sebesség a PCIe-átvitelhez kötött.** Adagonként a duplikált súlyok teljes mérete átmegy a GPU-ra (qwen3-coder:30b: ~12 GB, ~516 tok/s; gpt-oss:120b: ~43 GB, ~140 tok/s). Mérendő: nagyobb adagméret (`num_batch` / `-ub 2048`) hatása a promptra és a VRAM-ra, mert a nagyobb adag több tokenre osztja el ugyanazt az átvitelt.
 - **Költségalapú op-offload döntés.** Csak akkor küldje át a súlyt, ha a másolás ideje kisebb, mint a CPU-n megspórolt számítás. MoE-nél egy 512 tokenes adagban szakértőnként átlagosan kb. 16 token jut, ami kevés az átvitel megtérüléséhez.
 - **Az op offload VRAM-igénye.** Az átküldött súlyoknak helyet kell foglalni a VRAM-ban (gpt-oss:120b: számítási puffer 607 MiB, repack módban 91 MiB). Lehetőség: a GPU közvetlenül olvassa a rögzített host-memóriát, másolás nélkül.

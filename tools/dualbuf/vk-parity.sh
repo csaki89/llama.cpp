@@ -1,8 +1,8 @@
 #!/bin/bash
 # Vulkan parity run: dual-buffer + auto zones (+ flex band from a reduced device budget), a long then a short request
 # usage: parity.sh <tag> [ENV=VAL ...]; EXTRA= extra llama-server args, CTX=, FIT= (MiB kept free, default 6500)
-BIN=${BIN:-/c/Users/bl/Documents/projects/llama-dualbuf/build/bin/llama-server.exe}
-M=${MODEL:-/c/Users/bl/Documents/projects/llama-dualbuf/models/qwen2.5-1.5b-instruct-q4_k_m.gguf}
+BIN=${BIN:-$(dirname "$0")/../../build/bin/llama-server.exe}
+M=${MODEL:-$(dirname "$0")/../../models/qwen2.5-1.5b-instruct-q4_k_m.gguf}
 P=18140; tag=$1; shift
 env "$@" $BIN -m $M --port $P -c ${CTX:-16384} -np 1 --load-mode none -fa on --no-webui --log-verbosity 4 --fit-target ${FIT:-6500} ${MODE:---auto-zones --dual-buffer} ${EXTRA:-} > srv-$tag.log 2>&1 & sp=$!
 until curl -s localhost:$P/health | grep -q ok; do sleep 0.5; kill -0 $sp 2>/dev/null || { echo died; tail -5 srv-$tag.log; exit 1; }; done

@@ -32,7 +32,7 @@ Részletek: `test-results.md`. Minden elfogadási feltétel teljesült:
 4. A `--dual-buffer --no-host` együtt: a dual-buffer nyer (DECISIONS.md 3.). Kell-e erről külön figyelmeztetés?
 
 ## NAS-on teendő (ROCm build és mérés)
-Cél: RX 6700 (gfx1031), TrueNAS, Docker. A build a `tools/dualbuf/Dockerfile`-lal és a `build-nas.sh`-val megy; a kártya gfx1031, de a kódot **gfx1030**-ra fordítjuk, és futtatáskor `HSA_OVERRIDE_GFX_VERSION=10.3.0` kell (az image-ben alapból be van állítva).
+Cél: RDNA2-es AMD GPU (gfx103x), Docker. A build a `tools/dualbuf/Dockerfile`-lal és a `build-nas.sh`-val megy; a kártya gfx103x, de a kódot **gfx1030**-ra fordítjuk, és futtatáskor `HSA_OVERRIDE_GFX_VERSION=10.3.0` kell (az image-ben alapból be van állítva).
 
 ### 1. Előfeltétel: a branch az origin-en
 A branchet neked kell pusholnod az `origin`-re (nekem csak kifejezett kérésre szabad). Az image a forkból klónozza a `dual-buffer` branchet (`https://github.com/csaki89/llama.cpp.git`). Ha a fork privát: `export GH_TOKEN=...` a build előtt (BuildKit secret, nem kerül az image-be).
@@ -48,8 +48,8 @@ tools/dualbuf/build-nas.sh                 # kimenet: llama-dualbuf:rocm
 
 ### 3. Indítás
 ```
-docker run --rm -it --device /dev/kfd --device /dev/dri/renderD129 --group-add video \
-  -v /mnt/nvme/ollama/models:/models:ro -v /mnt/nvme/dualbuf:/work llama-dualbuf:rocm
+docker run --rm -it --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video \
+  -v <MODELS_DIR>:/models:ro -v <WORK_DIR>:/work llama-dualbuf:rocm
 ```
 Az image-ben: `env | grep ^LLAMA_` legyen üres (a `bench.sh` törli és jelzi őket). Gyors próba: `llama-completion --list-devices` (ROCm0 látszik) és `-m ... -ngl 99 -n 16 -p hi`.
 
@@ -58,7 +58,7 @@ Az Ollama GGUF-ja a `blobs/sha256-...` fájl. Megkeresése a manifestből:
 M=/models/manifests/registry.ollama.ai/library/qwen3-vl/8b      # modell/tag szerint
 BLOB=/models/blobs/$(jq -r '.layers[]|select(.mediaType|endswith("image.model"))|.digest' $M | tr : -)
 ```
-Figyelem: az Ollama saját motoros modelljeinél (különösen a `qwen3-vl`) a GGUF tenzornevei eltérhetnek a llama.cpp-étől; ha a betöltés hibázik, a modell szokásos GGUF-ját kell használni `/mnt/nvme/dualbuf`-ból. A `qwen3-vl` multimodális: a mérés csak a szöveges részt használja (`mmproj` nélkül).
+Figyelem: az Ollama saját motoros modelljeinél (különösen a `qwen3-vl`) a GGUF tenzornevei eltérhetnek a llama.cpp-étől; ha a betöltés hibázik, a modell szokásos GGUF-ját kell használni `<WORK_DIR>`-ból. A `qwen3-vl` multimodális: a mérés csak a szöveges részt használja (`mmproj` nélkül).
 
 ### 4. Mérés (egy futás = egy modell, a teljes módlista)
 A `bench.sh` a `modes.conf` módjait méri végig: `repack`, `host`, `host_noopoff`, `repack_noopoff`, `dual`, `dual_noopoff`, `cpu_only`, `gpu_full`. Kapcsolók: `-m MODELL`, `-g NGL`, `-n GENERÁLT_TOKENEK`, `-r ISMÉTLÉS` (alap 3), `-o KIMENETI_MAPPA`. A fix beállítások: `--load-mode none -fa auto -b 512 -ub 512 --log-verbosity 4`. Az eredmény `OUT/results.tsv`, összegzés: `tools/dualbuf/summarize.sh`.
@@ -67,7 +67,7 @@ A `bench.sh` a `modes.conf` módjait méri végig: `repack`, `host`, `host_noopo
 ```
 for g in 30 18 6; do bench.sh -m $BLOB_QWEN3VL -g $g -n 300 -o /work/qwen3vl-ngl$g; done
 ```
-**Qwen2.5-1.5B** (NGL 14; a GGUF-ot másold a `/mnt/nvme/dualbuf`-ba):
+**Qwen2.5-1.5B** (NGL 14; a GGUF-ot másold a `<WORK_DIR>`-ba):
 ```
 bench.sh -m /work/qwen2.5-1.5b-instruct-q4_k_m.gguf -g 14 -n 200 -o /work/qwen25-ngl14
 ```
@@ -88,7 +88,7 @@ A laptopon (Vulkan, iGPU, közös memória) a másolási idők nem mutatják a P
 Mérendő (qwen3-vl:8b vagy qwen2.5-1.5b, majd qwen3-coder:30b; `--flex-layers 2..4`):
 - **Egyezés:** egy végig levett réteg (`0:take`) kimenete bájtra egyezzen a `-ngl (N-1) --dual-buffer` futással (laptopon teljesül); opció nélkül a `bench.sh` md5-jei változatlanok.
 - **Felszabaduló VRAM:** a `common_memory_breakdown_print` ROCm0 sorában a model és a context oszlop rétegenként a réteg súlyaival és K/V-jével csökken; **dedikált GPU-n az eszközmemória-lekérdezés is** (`flex_move ... device free memory`), mert az iGPU-n ez nem mozdult.
-- **Másolási sebesség a PCIe-n:** a K/V GPU -> CPU (`copy+sync`) és CPU -> GPU, a súlyok visszatétele a host-példányból és a fájlból (`LLAMA_FLEX_TEST_FILE=1`), rövid (`-c 4096`) és hosszú (`-c 32768`) kontextussal, kitöltött prompttal. Elvárás: a másolás a PCIe sávszélesség közelében (a Xeon E5 v4 PCIe 3.0 x16, ~12 GB/s), a foglalás külön látszik (`alloc`). A régi út összehasonlításhoz: `LLAMA_FLEX_TEST_COPY_LEGACY=1`.
+- **Másolási sebesség a PCIe-n:** a K/V GPU -> CPU (`copy+sync`) és CPU -> GPU, a súlyok visszatétele a host-példányból és a fájlból (`LLAMA_FLEX_TEST_FILE=1`), rövid (`-c 4096`) és hosszú (`-c 32768`) kontextussal, kitöltött prompttal. Elvárás: a másolás a PCIe sávszélesség közelében (a PCIe 3.0 x16, ~12 GB/s), a foglalás külön látszik (`alloc`). A régi út összehasonlításhoz: `LLAMA_FLEX_TEST_COPY_LEGACY=1`.
 - **Prompt-sebesség** 0, 1, 2 levett réteggel, host-példánnyal és nélküle (`LLAMA_FLEX_TEST_HOST=0`); a generálás a levett rétegekkel a `-ngl (N-k) --dual-buffer` szintjén.
 - **Gráfhasítások:** `LLAMA_FLEX_TEST_RESERVE=1` mellett a `sched_reserve: graph (pp ..., tg ...) ... splits = A / B` sorok; a generálási (B) érték levett rétegekkel se nőjön.
 

@@ -15,6 +15,6 @@ done
 DOCKER_BUILDKIT=1 docker build "${args[@]}" -t "$TAG" -f "$HERE/Dockerfile" "$HERE"
 cat <<MSG
 built: $TAG
-run:   docker run --rm -it --device /dev/kfd --device /dev/dri/renderD129 --group-add video \
-         -v /mnt/nvme/ollama/models:/models:ro -v /mnt/nvme/dualbuf:/work $TAG
+run:   docker run --rm -it --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video \
+         -v <MODELS_DIR>:/models:ro -v <WORK_DIR>:/work $TAG
 MSG

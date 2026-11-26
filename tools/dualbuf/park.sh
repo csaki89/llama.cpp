@@ -1,7 +1,7 @@
 #!/bin/bash
 # in-process park/unpark: answers before/while/after, timings and the measured device free memory
-BIN=${BIN:-/c/Users/bl/Documents/projects/llama-dualbuf/build/bin/llama-server.exe}
-M=${MODEL:-/c/Users/bl/Documents/projects/llama-dualbuf/models/qwen2.5-1.5b-instruct-q4_k_m.gguf}
+BIN=${BIN:-$(dirname "$0")/../../build/bin/llama-server.exe}
+M=${MODEL:-$(dirname "$0")/../../models/qwen2.5-1.5b-instruct-q4_k_m.gguf}
 P=18131; tag=${1:-park}; shift
 env "$@" $BIN -m $M --port $P -c ${CTX:-8192} -np 1 --load-mode none --auto-zones --park -fa on --no-webui --log-verbosity 4 ${EXTRA:-} > srv-$tag.log 2>&1 & sp=$!
 until curl -s localhost:$P/health | grep -q ok; do sleep 0.5; kill -0 $sp 2>/dev/null || { echo died; tail -5 srv-$tag.log; exit 1; }; done

@@ -1,9 +1,9 @@
-# NAS image (TrueNAS, Docker, AMD RX 6700 = gfx1031): HIP build of the dual-buffer branch.
+# NAS image (Docker, an RDNA2 AMD GPU, gfx103x): HIP build of the dual-buffer branch.
 # Build with tools/dualbuf/build-nas.sh. Binaries: /opt/llama.cpp/build/bin (llama-completion, llama-server, ...).
 ARG ROCM_TAG=7.0-complete
 FROM rocm/dev-ubuntu-24.04:${ROCM_TAG}
 
-# gfx1030 code runs on the gfx1031 card with HSA_OVERRIDE_GFX_VERSION=10.3.0
+# gfx1030 code runs on a gfx103x card with HSA_OVERRIDE_GFX_VERSION=10.3.0
 ARG GPU_TARGET=gfx1030
 ARG REPO_URL=https://github.com/csaki89/llama.cpp.git
 ARG BRANCH=dual-buffer
@@ -25,7 +25,7 @@ RUN --mount=type=secret,id=gh_token \
     fi
 
 WORKDIR /opt/llama.cpp
-# Xeon E5-2673 v4 (Broadwell): AVX2/FMA/F16C/BMI2, no AVX512; AVX2 is needed for the Q4_K repack
+# the target CPU (Broadwell): AVX2/FMA/F16C/BMI2, no AVX512; AVX2 is needed for the Q4_K repack
 RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DGGML_HIP=ON -DAMDGPU_TARGETS=${GPU_TARGET} \
         -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \

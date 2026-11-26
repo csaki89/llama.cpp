@@ -3,7 +3,7 @@
 Cél: a NAS-on mért jelenség (CLAUDE.md, "Mért tények") mechanizmusának ellenőrzése a laptopon. Az iGPU ugyanazt a RAM-ot használja, mint a CPU, ezért a sebességarányok nem vihetők át a NAS-ra. A pufferek és a mechanizmus számítanak.
 
 ## Beállítás
-- Gép: i5-1145G7 (4 szál használva a 8-ból, alapértelmezett), Intel Iris Xe (Vulkan0), 15,7 GB RAM, Windows 11, natív MSVC build.
+- Gép: laptop-CPU (4 szál, alapértelmezett), integrált Intel GPU (Vulkan0), Windows 11, natív MSVC build.
 - Kód: a ggml-org/llama.cpp `master` `e14a77971` állapota, módosítás nélkül (a branch csak docs/tools/CLAUDE.md fájlokat tesz hozzá).
 - Modell: Qwen2.5-1.5B-Instruct Q4_K_M, 29 réteg (28 + kimeneti). Részleges offload: `-ngl 14`.
 - Közös kapcsolók: `--load-mode none --log-verbosity 4 -fa auto -b 512 -ub 512 --temp 0 --seed 1 -n 200 --ignore-eos -no-cnv`
@@ -45,10 +45,10 @@ A kimenet első ~200 karaktere: a rövid promptnál minden módban ugyanaz (" Th
 - Az iGPU és a CPU közös RAM-ot és közös hőkeretet használ, a mérés sorrendje (repack, host, ...) befolyásolhatja az eredményt.
 - A szkript első verziójában egy printf-hiba összeragasztotta a prompt nevét és a tokenszámot a TSV-ben. A szkriptet javítottam, a már lefutott mérés TSV-jét mechanikusan helyreállítottam (a nyers `.err`/`.out` fájlok érintetlenek, a számok nem változtak).
 
-## NAS-összevetés (ugyanaz a modell: Qwen2.5-1.5B Q4_K_M, ROCm, RX 6700)
+## NAS-összevetés (ugyanaz a modell: Qwen2.5-1.5B Q4_K_M, ROCm, RDNA2-es kártya)
 A NAS-os számokat a felhasználó adta meg, nem általam mért adatok. Prompt / generálás, tok/s, rövid / hosszú prompt.
 
-| | NAS (ROCm, RX 6700) | Laptop (Vulkan, Iris Xe) | NAS / laptop |
+| | NAS (ROCm, RDNA2-es kártya) | Laptop (Vulkan, integrált Intel GPU) | NAS / laptop |
 |---|---|---|---|
 | csak CPU, prompt | 466 / 482 | 97,2 / 83,9 | 4,8x / 5,7x |
 | csak CPU, generálás | 39,2 / 37,5 | 25,3 / 20,5 | 1,5x / 1,8x |
