@@ -72,6 +72,8 @@ void ggml_vk_log_host_memory(const vk_buffer & buf, const char * what);
 // dual-buffer fork: the compute power state of an AMD GPU (ggml-vulkan-kfd.cpp)
 void ggml_vk_kfd_compute_acquire(vk_device & device);
 void ggml_vk_kfd_compute_release(vk_device & device);
+void ggml_vk_kfd_buffer_alloc(vk_device & device);
+void ggml_vk_kfd_buffer_free(vk_device & device);
 bool ggml_vk_sync_copy_small(size_t size);
 vk_queue & ggml_vk_sync_copy_queue(vk_device & device, size_t size);
 void ggml_vk_sync_copy_wait(vk_device & device, size_t size, const char * what);

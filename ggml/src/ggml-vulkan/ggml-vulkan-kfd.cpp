@@ -8,8 +8,11 @@
 //
 // While a Vulkan backend lives on an AMD device that has a KFD node, this creates one empty compute queue on it through the
 // KFD interface itself (the stable uapi of /dev/kfd, no ROCm runtime: it works for any GPU the KFD supports, also one the ROCm
-// runtime does not), the same mechanism a ROCm process triggers; nothing is written to sysfs. The queue holds no work. It is
-// destroyed when the last backend on the device is freed (and by the kernel at process exit).
+// runtime does not), the same mechanism a ROCm process triggers; nothing is written to sysfs. The queue holds no work.
+// Loading a model creates and frees many short-lived backends (memory fitting, zone planning, async uploads), so the queue is
+// not tied to one backend: the first backend creates it and it is kept until the model is gone, i.e. no backend and no device
+// buffer is left on the device after both have lived at the same time (the weights or a compute buffer, and a backend); a
+// fitting pass with no_alloc (size 0) buffers is not that. At process exit (also a crash or a kill) the kernel destroys it.
 // GGML_VK_KFD_COMPUTE_PROFILE=0 turns it off.
 
 #include "ggml-vulkan-common.h"
@@ -43,8 +46,10 @@ struct kfd_bo {
 };
 
 struct kfd_dev_state {
-    int                 refs      = 0;
+    int                 refs      = 0;     // live backends on the device
+    int                 bufs      = 0;     // live device buffers (ggml_backend_vk_buffer_type_alloc_buffer) on the device
     bool                active    = false;
+    bool                armed     = false; // active, and a backend and a device buffer have lived at the same time (a model)
     bool                logged    = false; // the reason for no compute state was logged
     bool                vm        = false; // ACQUIRE_VM done (kept for the process lifetime: the KFD process lives with the mm)
     int                 drm_fd    = -1;
@@ -485,12 +490,32 @@ bool kfd_start(const vk_device & device, kfd_dev_state & st, std::string & why) 
 
 } // namespace
 
-// a backend on the device starts: the first one takes the compute power state
+// the model on the device is gone: give the compute power state back (once per model, not per short-lived backend)
+static void kfd_maybe_release(vk_device & device, kfd_dev_state & st) {
+    if (!st.active || !st.armed || st.refs > 0 || st.bufs > 0) {
+        return;
+    }
+    st.armed = false;
+#if defined(__linux__)
+    kfd_stop(st);
+    GGML_LOG_INFO("ggml_vulkan: %s: compute power state released (KFD compute queue destroyed)\n", device->name.c_str());
+#else
+    GGML_UNUSED(device);
+#endif
+}
+
+// a backend on the device starts: the first one takes the compute power state; the later ones (also those of a load after
+// all its earlier backends were freed) find it held
 void ggml_vk_kfd_compute_acquire(vk_device & device) {
     std::lock_guard<std::mutex> lock(g_mutex);
     kfd_dev_state & st = g_devs[device->idx];
-    if (++st.refs > 1) {
+    ++st.refs;
+    if (st.active) {
+        st.armed = st.armed || st.bufs > 0;
         return;
+    }
+    if (st.refs > 1) {
+        return; // tried for this set of backends already
     }
     std::string why;
     if (kfd_disabled()) {
@@ -501,7 +526,8 @@ void ggml_vk_kfd_compute_acquire(vk_device & device) {
 #if defined(__linux__)
         if (kfd_start(device, st, why)) {
             GGML_LOG_INFO("ggml_vulkan: %s: compute power state active: an empty KFD compute queue on the device (%s), as a ROCm process has; "
-                "GGML_VK_KFD_COMPUTE_PROFILE=0 turns it off\n", device->name.c_str(), st.where.c_str());
+                "kept until the model is unloaded; GGML_VK_KFD_COMPUTE_PROFILE=0 turns it off\n", device->name.c_str(), st.where.c_str());
+            st.armed = st.bufs > 0;
             return;
         }
 #else
@@ -523,14 +549,25 @@ void ggml_vk_kfd_compute_release(vk_device & device) {
     if (it == g_devs.end() || it->second.refs == 0) {
         return;
     }
-    kfd_dev_state & st = it->second;
-    if (--st.refs > 0) {
+    --it->second.refs;
+    kfd_maybe_release(device, it->second);
+}
+
+// a device buffer is allocated on the device (weights, a compute buffer)
+void ggml_vk_kfd_buffer_alloc(vk_device & device) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    kfd_dev_state & st = g_devs[device->idx];
+    ++st.bufs;
+    st.armed = st.armed || (st.active && st.refs > 0);
+}
+
+// a device buffer on the device is freed: the last one after the last backend means the model is gone
+void ggml_vk_kfd_buffer_free(vk_device & device) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devs.find(device->idx);
+    if (it == g_devs.end() || it->second.bufs == 0) {
         return;
     }
-#if defined(__linux__)
-    if (st.active) {
-        kfd_stop(st);
-        GGML_LOG_INFO("ggml_vulkan: %s: compute power state released (KFD compute queue destroyed)\n", device->name.c_str());
-    }
-#endif
+    --it->second.bufs;
+    kfd_maybe_release(device, it->second);
 }
