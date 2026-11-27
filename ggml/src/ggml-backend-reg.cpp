@@ -218,6 +218,31 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
+        // dual-buffer fork: while the HIP (ROCm) backend loads and its runtime starts, the render nodes listed in
+        // GGML_HIP_HIDE_RENDER_NODES are hidden from the process (GGML_HIDE_RENDER_NODES, read by the ggml-hide-dri
+        // preload library): the ROCm runtime does not open the other cards, the other backends still see them
+        struct hide_scope {
+            bool on = false;
+            explicit hide_scope(const fs::path & p) {
+#ifndef _WIN32
+                const char * list = getenv("GGML_HIP_HIDE_RENDER_NODES");
+                if (list && *list && path_str(p.filename()).find("hip") != std::string::npos) {
+                    setenv("GGML_HIDE_RENDER_NODES", list, 1);
+                    on = true;
+                }
+#else
+                GGML_UNUSED(p);
+#endif
+            }
+            ~hide_scope() {
+#ifndef _WIN32
+                if (on) {
+                    unsetenv("GGML_HIDE_RENDER_NODES");
+                }
+#endif
+            }
+        } hide(path);
+
         dl_handle_ptr handle { dl_load_library(path) };
         if (!handle) {
             if (!silent) {
