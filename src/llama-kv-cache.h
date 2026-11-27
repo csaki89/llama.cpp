@@ -269,6 +269,10 @@ public:
     // (growable sections again where possible); a full relayout at the current size, the used rows are copied
     bool park_kv(bool to_host);
 
+    // llama_move_device: parked, the K/V goes back to the new device instead of the old one (and the flex layers' K/V moves
+    // there); false if a layer is still on the old device
+    bool move_device(ggml_backend_dev_t from, ggml_backend_dev_t to);
+
     // dynamic KV (DESIGN-3zone.md 6.2): the cache grows in chunks up to max_size; false if this cache cannot (shared layers, transposed V, ...)
     bool set_dynamic(uint32_t max_size, size_t chunk_bytes);
     bool     is_dynamic()   const { return dyn_max > 0; }

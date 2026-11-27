@@ -407,8 +407,12 @@ public:
     bool park(bool to_park);
     bool is_parked() const { return parked; }
     size_t park_drop_demoted();
+    // llama_move_device: the model's GPU part to another GPU device of the process (parked first, back unparked there)
+    bool move_device(ggml_backend_dev_t to);
+    ggml_backend_dev_t active_device() const; // the model's GPU (parked from it while parked), NULL = none
 
 private:
+    bool park_from_file  = false; // the unpark of a move reads the GPU weights from the model file
     bool parked          = false;
     bool park_op_offload = true; // cparams.op_offload before the park
     bool park_demote_tried = false; // the demote of this park was tried (once, at the first decode while parked)

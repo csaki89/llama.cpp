@@ -20,6 +20,8 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <cctype>
+
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -192,6 +194,15 @@ struct zones_mem_parts {
     llama_kv_cache * kv = nullptr;
     std::vector<std::pair<const char *, llama_memory_i *>> fixed;
 };
+
+static bool strcasecmp_ascii(const char * a, const char * b) {
+    for (; *a && *b; ++a, ++b) {
+        if (std::tolower((unsigned char) *a) != std::tolower((unsigned char) *b)) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
 
 // the kernel's free VRAM of the card (amdgpu sysfs), below
 static bool zones_sysfs_free(size_t total, size_t & free_out);
@@ -5517,6 +5528,35 @@ bool llama_park(llama_context * ctx, bool park) {
     return ctx ? ctx->park(park) : false;
 }
 
+bool llama_move_device(llama_context * ctx, const char * device) {
+    if (!ctx || !device) {
+        return false;
+    }
+    // a device name (e.g. "Vulkan1") or a PCI bus id ("0000:03:00.0", ggml_backend_dev_props.device_id)
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(device);
+    for (size_t i = 0; !dev && i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(d, &props);
+        if (props.device_id && strcasecmp_ascii(props.device_id, device)) {
+            dev = d;
+        }
+    }
+    if (!dev) {
+        LLAMA_LOG_ERROR("%s: no device %s\n", __func__, device);
+        return false;
+    }
+    return ctx->move_device(dev);
+}
+
+const char * llama_active_device(const llama_context * ctx) {
+    ggml_backend_dev_t dev = ctx ? ctx->active_device() : nullptr;
+    return dev ? ggml_backend_dev_name(dev) : nullptr;
+}
+
 bool llama_is_parked(const llama_context * ctx) {
     return ctx ? ctx->is_parked() : false;
 }
@@ -5603,8 +5643,9 @@ bool llama_context::park(bool to_park) {
         parked = true;
         park_demote_tried = false;
     } else {
-        // weights back from the pinned copies (DMA), the flex layers to their placement before the park
-        ok = model.park_move(true, &w_bytes);
+        // weights back from the pinned copies (DMA), the flex layers to their placement before the park (after a move to
+        // another device: from the model file)
+        ok = model.park_move(true, &w_bytes, park_from_file);
         t1 = ggml_time_us();
         for (auto * kv : kvs) {
             ok = kv->park_kv(false) && ok;
@@ -5636,6 +5677,154 @@ bool llama_context::park(bool to_park) {
         kv_bytes / 1048576.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, drv0 / 1048576.0, drv1 / 1048576.0,
         sys0 ? std::to_string(sys0 >> 20).c_str() : "-", sys1 ? std::to_string(sys1 >> 20).c_str() : "-");
     zones_log_state(to_park ? "parked" : "unparked");
+    return ok;
+}
+
+ggml_backend_dev_t llama_context::active_device() const {
+    for (const auto & d : model.devices) {
+        if (d.dev && ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return d.dev;
+        }
+    }
+    return nullptr;
+}
+
+bool llama_context::move_device(ggml_backend_dev_t to) {
+    if (!to || ggml_backend_dev_type(to) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        LLAMA_LOG_ERROR("%s: the target is not a GPU device\n", __func__);
+        return false;
+    }
+    ggml_backend_dev_t from = active_device();
+    if (model.devices.size() != 1 || !from) {
+        LLAMA_LOG_WARN("%s: the model is on %zu devices, only a model on one GPU moves\n", __func__, model.devices.size());
+        return false;
+    }
+    if (from == to) {
+        return park(false);
+    }
+    if (!model.park_available()) {
+        LLAMA_LOG_WARN("%s: the model has no park copies (load it with --park / llama_model_params.park), it does not move\n", __func__);
+        return false;
+    }
+    const auto parts = zones_parts(memory.get());
+    std::vector<llama_kv_cache *> kvs;
+    if (parts.kv) {
+        kvs.push_back(parts.kv);
+    }
+    const char * why = nullptr;
+    for (const auto & [name, part] : parts.fixed) {
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(part)) {
+            kvs.push_back(kv);
+        } else {
+            why = name;
+        }
+    }
+    if (cparams.ctx_other) {
+        why = "the memory shared with another context";
+    } else if (moe_cache) {
+        why = "the MoE cache";
+    } else if (buf_layer_inp_dev) {
+        why = "the layer input device buffer";
+    } else if (!sampling.samplers.empty()) {
+        why = "the backend samplers";
+    } else if (memory && !parts.kv && parts.fixed.empty()) {
+        why = "this memory type";
+    }
+    if (why) {
+        LLAMA_LOG_WARN("%s: %s cannot move to another device, the model stays on %s\n", __func__, why, ggml_backend_dev_name(from));
+        return false;
+    }
+    ggml_backend_t backend_to = ggml_backend_dev_init(to, nullptr);
+    if (!backend_to) {
+        LLAMA_LOG_ERROR("%s: failed to initialize the %s backend\n", __func__, ggml_backend_dev_name(to));
+        return false;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const bool was_parked = parked;
+    // off the old device: the weights to their host copies, the K/V to the host
+    if (!parked && !park(true)) {
+        ggml_backend_free(backend_to);
+        return false;
+    }
+    const int64_t t1 = ggml_time_us();
+    for (auto * kv : kvs) {
+        if (!kv->move_device(from, to)) {
+            for (auto * k : kvs) {
+                k->move_device(to, from);
+            }
+            ggml_backend_free(backend_to);
+            return false;
+        }
+    }
+    // the model is shared read-only with the context; its placement changes here, under the parked state
+    if (!const_cast<llama_model &>(model).move_device(from, to)) {
+        for (auto * kv : kvs) {
+            kv->move_device(to, from);
+        }
+        ggml_backend_free(backend_to);
+        return false;
+    }
+
+    // the new device's backend takes the old one's place (the scheduler that uses the old one goes first); the CPU backend's
+    // buffer (the intermediate state) and the output buffer use the new device's host buffer
+    synchronize();
+    sched.reset();
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    for (auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == from) {
+            b.reset(backend_to); // frees the old device's backend
+            backend_to = nullptr;
+            break;
+        }
+    }
+    if (backend_to) {
+        backends.emplace_back(backend_to);
+    }
+    set_n_threads_fns.clear();
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (fn) {
+                set_n_threads_fns.emplace_back(backend.get(), fn);
+            }
+        }
+    }
+    set_abort_callback(abort_callback, abort_callback_data);
+    backend_buft.clear();
+    backend_ptrs.clear();
+    backend_buf_exp_size.clear();
+    for (auto & backend : backends) {
+        auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (auto * host_buft = ggml_backend_dev_host_buffer_type(to)) {
+                buft = host_buft;
+            }
+        }
+        backend_buft.push_back(buft);
+        backend_ptrs.push_back(backend.get());
+        backend_buf_exp_size.push_back(0);
+    }
+    buf_output.reset();
+    logits.data = nullptr;
+    embd.data   = nullptr;
+    embd_nextn.data = nullptr;
+    output_reserve(n_seq_max());
+    sched_need_reserve = true;
+    const int64_t t2 = ggml_time_us();
+
+    // back on the new device: the GPU weights from the model file, the K/V from the host (the zones are measured there again)
+    park_from_file = true;
+    const bool ok = park(false);
+    park_from_file = false;
+    LLAMA_LOG_INFO("%s: %s -> %s%s: %s %.1f ms, retarget %.1f ms, unpark %.1f ms (the GPU weights from the model file)\n", __func__,
+        ggml_backend_dev_name(from), ggml_backend_dev_name(to), ok ? "" : " (the unpark failed: the model stays parked)",
+        was_parked ? "was parked," : "park", (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
     return ok;
 }
 

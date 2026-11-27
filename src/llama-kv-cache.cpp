@@ -3978,6 +3978,29 @@ void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32
     kv->get_prev_tokens(ubatch, n, res);
 }
 
+bool llama_kv_cache::move_device(ggml_backend_dev_t from, ggml_backend_dev_t to) {
+    for (const auto & layer : layers) {
+        ggml_backend_buffer_t buf = layer.k->buffer;
+        if (buf && !ggml_backend_buffer_is_host(buf) && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) == from) {
+            LLAMA_LOG_ERROR("%s: the K/V of layer %u is on %s: the model must be parked first\n", __func__, layer.il, ggml_backend_dev_name(from));
+            return false;
+        }
+    }
+    ggml_backend_buffer_type_t buft_to = ggml_backend_dev_buffer_type(to);
+    for (auto & b : park_bufts) {
+        if (b && ggml_backend_buft_get_device(b) == from) {
+            b = buft_to;
+        }
+    }
+    for (auto & [il, fk] : flex_kv_layers) {
+        if (fk.buft_gpu && ggml_backend_buft_get_device(fk.buft_gpu) == from) {
+            fk.buft_gpu = buft_to;
+            fk.spare.reset(); // the old device's host buffer
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::park_kv(bool to_host) {
     if (layers.empty()) {
         return true;

@@ -996,7 +996,12 @@ struct llama_model {
     // llama_park: the model has park copies (llama_model_params.park); move every weight group off the device (to_gpu = false,
     // the placement before is kept) or back to it; bytes: the weights moved
     bool park_available() const;
-    bool park_move(bool to_gpu, size_t * bytes = nullptr) const;
+    // from_file (to_gpu only): the GPU weights are read from the model file, not uploaded from the host copies
+    bool park_move(bool to_gpu, size_t * bytes = nullptr, bool from_file = false) const;
+    // llama_move_device: the parked model's GPU part goes to another device of the process: the groups' GPU buffer type and
+    // the layers' device change, the host copies made for the old device (dual-buffer copies of the CPU layers, park copies,
+    // zone 2 host copies) move to the new device's host buffer; false (nothing changed) if a weight is not in a parked group
+    bool move_device(ggml_backend_dev_t from, ggml_backend_dev_t to);
     bool park_was_on_gpu(int il) const; // a flex layer was on the device before the park
     // parked and running on the CPU: the park copies repacked for the CPU (a demote, if the RAM allows), kept until dropped;
     // returns the bytes repacked now (0: nothing to do, or no room: the CPU computes from the pinned copies)

@@ -115,6 +115,7 @@ struct server_routes {
     server_http_context::handler_t post_park;   // dual-buffer fork: llama_park
     server_http_context::handler_t post_unpark;
     server_http_context::handler_t post_park_drop;
+    server_http_context::handler_t post_move;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

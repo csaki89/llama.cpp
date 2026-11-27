@@ -591,8 +591,23 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("openvino", silent, dir_path);
     ggml_backend_load_best("cpu", silent, dir_path);
     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
+    // (dual-buffer fork: a list of backends, separated like PATH: ';' on Windows, ':' elsewhere, loaded in that order)
     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
     if (backend_path) {
-        ggml_backend_load(backend_path);
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
+        std::string paths(backend_path);
+        size_t start = 0;
+        while (start <= paths.size()) {
+            const size_t end = std::min(paths.find(sep, start), paths.size());
+            const std::string path = paths.substr(start, end - start);
+            if (!path.empty()) {
+                ggml_backend_load(path.c_str());
+            }
+            start = end + 1;
+        }
     }
 }

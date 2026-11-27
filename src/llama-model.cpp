@@ -2742,7 +2742,7 @@ bool llama_model::park_available() const {
     return false;
 }
 
-bool llama_model::park_move(bool to_gpu, size_t * bytes) const {
+bool llama_model::park_move(bool to_gpu, size_t * bytes, bool from_file) const {
     // park: every group (flex layers and park copies) off the device, the placement before it is kept; unpark: back to it
     // (the park copies are host buffers: the upload is a DMA from pinned memory)
     size_t moved = 0;
@@ -2772,11 +2772,11 @@ bool llama_model::park_move(bool to_gpu, size_t * bytes) const {
             const bool exps = it == pimpl->park_prev.end() || it->second.second;
             if (rest && !fl.on_gpu) {
                 moved += flex_layer_bytes(il, has_exps ? LLAMA_FLEX_REST : LLAMA_FLEX_ALL);
-                ok = flex_move_part(il, false, true, false) && ok;
+                ok = flex_move_part(il, false, true, from_file) && ok;
             }
             if (has_exps && exps && !fl.exps_on_gpu) {
                 moved += flex_layer_bytes(il, LLAMA_FLEX_EXPS);
-                ok = flex_move_part(il, true, true, false) && ok;
+                ok = flex_move_part(il, true, true, from_file) && ok;
             }
         }
     }
@@ -2906,6 +2906,141 @@ size_t llama_model::park_drop_demoted() const {
 bool llama_model::park_was_on_gpu(int il) const {
     const auto it = pimpl->park_prev.find(il);
     return it == pimpl->park_prev.end() || it->second.first;
+}
+
+bool llama_model::move_device(ggml_backend_dev_t from, ggml_backend_dev_t to) {
+    if (!from || !to || from == to) {
+        return from == to;
+    }
+    ggml_backend_buffer_type_t gpu_from = ggml_backend_dev_buffer_type(from);
+    ggml_backend_buffer_type_t gpu_to   = ggml_backend_dev_buffer_type(to);
+    // every group is off the device (parked) and in the device's own buffer type, and no other weight is on the device
+    for (const auto & [il, fl] : pimpl->flex) {
+        if (fl.buf_idx == SIZE_MAX) {
+            continue;
+        }
+        if (fl.on_gpu || (fl.buf_idx_exps != SIZE_MAX && fl.exps_on_gpu)) {
+            LLAMA_LOG_ERROR("%s: group %d is on %s: the model must be parked first\n", __func__, il, ggml_backend_dev_name(from));
+            return false;
+        }
+        for (const auto & p : fl.pairs) {
+            if (p.buft != gpu_from && ggml_backend_buft_get_device(p.buft) == from) {
+                LLAMA_LOG_ERROR("%s: %s is in the buffer type %s, it cannot move\n", __func__, ggml_get_name(p.gpu), ggml_backend_buft_name(p.buft));
+                return false;
+            }
+        }
+    }
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (const auto & b : bufs) {
+            ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(b.get());
+            if (!ggml_backend_buft_is_host(bt) && ggml_backend_buft_get_device(bt) == from) {
+                LLAMA_LOG_ERROR("%s: a weight buffer outside the park groups is on %s (%s, %.2f MiB), the model cannot move\n", __func__,
+                    ggml_backend_dev_name(from), ggml_backend_buft_name(bt), ggml_backend_buffer_get_size(b.get()) / 1048576.0);
+                return false;
+            }
+        }
+    }
+
+    // the GPU side: the groups go up into the new device's buffer type, the layers compute there
+    for (auto & [il, fl] : pimpl->flex) {
+        for (auto & p : fl.pairs) {
+            if (p.buft == gpu_from) {
+                p.buft = gpu_to;
+            }
+        }
+    }
+    if (pimpl->gpu_buft_list.find(to) == pimpl->gpu_buft_list.end()) {
+        pimpl->gpu_buft_list.emplace(to, make_gpu_buft_list(to, split_mode(), tensor_split()));
+    }
+    buft_list_t * list_to = &pimpl->gpu_buft_list.at(to);
+    auto retarget = [&](impl::layer_dev & ld) {
+        if (ld.dev == from) {
+            ld.dev       = to;
+            ld.buft_list = list_to;
+        }
+    };
+    retarget(pimpl->dev_input);
+    retarget(pimpl->dev_output);
+    for (auto & ld : pimpl->dev_layer) {
+        retarget(ld);
+    }
+    for (auto & d : devices) {
+        if (d.dev == from) {
+            d.dev = to;
+        }
+    }
+
+    // the host copies made for the old device go to the new device's host buffer (a plain RAM buffer if it has none); the
+    // storage of the pairs is swapped between their tensors, so every tensor pointing into a buffer is moved with it
+    ggml_backend_buffer_type_t host_from = ggml_backend_dev_host_buffer_type(from);
+    ggml_backend_buffer_type_t host_to   = ggml_backend_dev_host_buffer_type(to);
+    if (!host_to) {
+        host_to = ggml_backend_cpu_buffer_type();
+    }
+    size_t moved = 0, kept = 0;
+    const int64_t t0 = ggml_time_us();
+    if (host_from && host_from != host_to) {
+        std::vector<ggml_tensor *> all;
+        auto add_ctx = [&](ggml_context * ctx) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                all.push_back(t);
+            }
+        };
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            add_ctx(ctx.get());
+        }
+        for (auto & [il, fl] : pimpl->flex) {
+            for (auto & c : fl.demote_ctxs) {
+                add_ctx(c.get());
+            }
+        }
+        const size_t align_to = ggml_backend_buft_get_alignment(host_to);
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (auto & b : bufs) {
+                if (ggml_backend_buffer_get_type(b.get()) != host_from) {
+                    continue;
+                }
+                uint8_t *    base = (uint8_t *) ggml_backend_buffer_get_base(b.get());
+                const size_t size = ggml_backend_buffer_get_size(b.get());
+                std::vector<ggml_tensor *> in;
+                bool aligned = true;
+                for (ggml_tensor * t : all) {
+                    const uint8_t * d = (const uint8_t *) t->data;
+                    if (base && t->buffer && d >= base && d < base + size) {
+                        in.push_back(t);
+                        aligned = aligned && (size_t) (d - base) % align_to == 0;
+                    }
+                }
+                // a multi buffer (no base) or a layout the new buffer type cannot keep: the copies stay where they are (they
+                // still work, the uploads then go through a staging copy)
+                if (!base || size == 0 || !aligned || size > ggml_backend_buft_get_max_size(host_to)) {
+                    kept += size;
+                    continue;
+                }
+                ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(host_to, size);
+                if (!nb) {
+                    LLAMA_LOG_WARN("%s: allocating %.2f MiB in %s failed, the host copies stay in %s\n", __func__, size / 1048576.0,
+                        ggml_backend_buft_name(host_to), ggml_backend_buft_name(host_from));
+                    kept += size;
+                    continue;
+                }
+                ggml_backend_buffer_set_usage(nb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                uint8_t * nbase = (uint8_t *) ggml_backend_buffer_get_base(nb);
+                memcpy(nbase, base, size);
+                for (ggml_tensor * t : in) {
+                    t->data   = nbase + ((uint8_t *) t->data - base);
+                    t->buffer = nb;
+                }
+                b.reset(nb); // the old buffer is freed
+                moved += size;
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: the GPU part moves from %s to %s; host copies %.2f MiB moved from %s to %s in %.1f ms%s\n", __func__,
+        ggml_backend_dev_name(from), ggml_backend_dev_name(to), moved / 1048576.0, host_from ? ggml_backend_buft_name(host_from) : "-",
+        ggml_backend_buft_name(host_to), (ggml_time_us() - t0) / 1000.0,
+        kept > 0 ? format(", %.2f MiB stay (a multi buffer or another alignment)", kept / 1048576.0).c_str() : "");
+    return true;
 }
 
 bool llama_model::flex_move(int il, bool to_gpu, bool from_file, int part) const {

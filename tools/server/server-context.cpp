@@ -3193,6 +3193,7 @@ private:
             case SERVER_TASK_TYPE_PARK:
             case SERVER_TASK_TYPE_UNPARK:
             case SERVER_TASK_TYPE_PARK_DROP:
+            case SERVER_TASK_TYPE_MOVE:
                 {
                     // only between requests: a park moves every weight and the K/V
                     bool busy = false;
@@ -3209,6 +3210,39 @@ private:
                     if (task.type == SERVER_TASK_TYPE_PARK_DROP) {
                         res->success = true;
                         res->demoted = llama_park_drop_demoted(ctx_tgt);
+                    } else if (task.type == SERVER_TASK_TYPE_MOVE) {
+                        // the GPU part to another device of the process; a draft model stays on its device: no move then
+                        const char * before = llama_active_device(ctx_tgt);
+                        const std::string from = before ? before : "";
+                        res->from = from;
+                        if (ctx_dft) {
+                            res->message = "a draft model is loaded, the model does not move";
+                        } else {
+                            res->success = llama_move_device(ctx_tgt, task.device.c_str());
+                            if (!res->success) {
+                                res->message = "the move failed, see the server log";
+                            }
+                        }
+                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
+                        res->host_uncharged = llama_backend_host_uncharged();
+                        const char * now = llama_active_device(ctx_tgt);
+                        // the projector follows the model to its new device
+                        if (res->success && now && from != now && mctx && mparams_park_set && mparams_park.use_gpu) {
+                            mtmd_context_params p = mparams_park;
+                            p.device = ggml_backend_dev_by_name(now);
+                            mtmd_free(mctx);
+                            mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
+                            for (auto & slot : slots) {
+                                slot.mctx = mctx;
+                            }
+                            if (!mctx) {
+                                SRV_ERR("move: loading the projector on %s failed\n", now);
+                                res->success = false;
+                                res->message = "the projector did not load on the new device";
+                            } else {
+                                SRV_INF("move: the projector is on %s now\n", now);
+                            }
+                        }
                     } else {
                         const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
                         res->success = llama_park(ctx_tgt, to_park);
@@ -3244,6 +3278,9 @@ private:
                     }
                     res->parked  = llama_is_parked(ctx_tgt);
                     res->t_ms    = (ggml_time_us() - t0) / 1000.0;
+                    if (const char * dev = llama_active_device(ctx_tgt)) {
+                        res->device = dev;
+                    }
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_METRICS:
@@ -5959,6 +5996,36 @@ void server_routes::init_routes() {
     this->post_park      = park_handler(SERVER_TASK_TYPE_PARK);
     this->post_unpark    = park_handler(SERVER_TASK_TYPE_UNPARK);
     this->post_park_drop = park_handler(SERVER_TASK_TYPE_PARK_DROP);
+    this->post_move = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        std::string device;
+        try {
+            device = json::parse(req.body).value("device", "");
+        } catch (const std::exception &) {
+        }
+        if (device.empty()) {
+            res->error(format_error_response("POST /move needs {\"device\": \"<name or PCI bus id>\"}", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        {
+            server_task task(SERVER_TASK_TYPE_MOVE);
+            task.id     = rd.get_new_id();
+            task.device = device;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();

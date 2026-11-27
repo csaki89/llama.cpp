@@ -35,6 +35,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_PARK,   // dual-buffer fork: llama_park (POST /park), when no slot is processing
     SERVER_TASK_TYPE_UNPARK, // POST /unpark
     SERVER_TASK_TYPE_PARK_DROP, // POST /park/drop: free the demoted (repacked) copies
+    SERVER_TASK_TYPE_MOVE,      // POST /move: llama_move_device (the GPU part to another device of the process)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -193,6 +194,9 @@ struct server_task {
     std::vector<raw_buffer> cli_files;
 
     server_task_type type;
+
+    // used by SERVER_TASK_TYPE_MOVE (dual-buffer fork): the target device, a name or a PCI bus id
+    std::string device;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
     struct slot_action {
@@ -659,9 +663,22 @@ struct server_task_result_park : server_task_result {
     double t_ms    = 0.0;
     size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
     size_t host_uncharged = 0; // driver host memory the memory cgroup does not see (llama_backend_host_uncharged)
+    std::string device;  // the GPU device the model is on (or parked from)
+    std::string from;    // a move: the device it was on before
+    std::string message; // why a move did not happen
 
     virtual json to_json() override {
-        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
+        json j = { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
+        if (!device.empty()) {
+            j["device"] = device;
+        }
+        if (!from.empty()) {
+            j["from"] = from;
+        }
+        if (!message.empty()) {
+            j["message"] = message;
+        }
+        return j;
     }
 };
 

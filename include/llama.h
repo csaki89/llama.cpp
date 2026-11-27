@@ -854,6 +854,14 @@ extern "C" {
     // Returns false if the model has no park copies or a step failed (an unpark that failed leaves the model parked).
     LLAMA_API bool llama_park(struct llama_context * ctx, bool park);
     LLAMA_API bool llama_is_parked(const struct llama_context * ctx);
+    // Move (needs the park copies): the model's GPU part goes to another GPU device of this process, given by name ("Vulkan1")
+    // or PCI bus id ("0000:03:00.0"): parked first if it is not, the K/V goes over through the host, the host copies move to the
+    // new device's host buffer, the old device's backend is freed, and the GPU weights load from the model file onto the new
+    // device (the zones are measured there again). The CPU layers stay. Returns false if the model cannot move (it stays
+    // where it was) or the unpark on the new device failed (it stays parked there).
+    LLAMA_API bool llama_move_device(struct llama_context * ctx, const char * device);
+    // the GPU device the model is on (or parked from), NULL = none
+    LLAMA_API const char * llama_active_device(const struct llama_context * ctx);
     // Parked, the first decode repacks the park copies for the CPU (a demote, if the RAM allows); the repacked copies stay
     // (parked and unparked) until dropped here. Returns the bytes freed / held.
     LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
